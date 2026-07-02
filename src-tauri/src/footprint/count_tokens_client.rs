@@ -95,6 +95,47 @@ impl CountTokensClient for AnthropicCountTokensClient {
     }
 }
 
+/// Test double used across this module's tests and by `footprint::compute`'s
+/// and `ClaudeCodeAdapter`'s tests -- tracks call count so callers can assert
+/// the token cache actually prevented a repeat call.
+#[cfg(test)]
+pub struct FakeCountTokensClient {
+    outcome: FakeOutcome,
+    call_count: std::cell::RefCell<u32>,
+}
+
+#[cfg(test)]
+enum FakeOutcome {
+    Succeed(u32),
+    Fail,
+}
+
+#[cfg(test)]
+impl FakeCountTokensClient {
+    pub fn always_returns(tokens: u32) -> Self {
+        Self { outcome: FakeOutcome::Succeed(tokens), call_count: std::cell::RefCell::new(0) }
+    }
+
+    pub fn always_fails() -> Self {
+        Self { outcome: FakeOutcome::Fail, call_count: std::cell::RefCell::new(0) }
+    }
+
+    pub fn call_count(&self) -> u32 {
+        *self.call_count.borrow()
+    }
+}
+
+#[cfg(test)]
+impl CountTokensClient for FakeCountTokensClient {
+    fn count_tokens(&self, _text: &str, _model_id: &str, _api_key: &str) -> Result<u32, CountTokensError> {
+        *self.call_count.borrow_mut() += 1;
+        match self.outcome {
+            FakeOutcome::Succeed(n) => Ok(n),
+            FakeOutcome::Fail => Err(CountTokensError::Request("simulated failure".to_string())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
