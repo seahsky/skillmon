@@ -19,6 +19,10 @@ pub struct ClaudeCodeAdapter {
 pub struct DiscoveryResult {
     pub skills: Vec<DiscoveredSkill>,
     pub warnings: Vec<DiscoveryWarning>,
+    /// The repo whose transcript was most recently written to, if any known
+    /// repo exists. Only this repo's project skills are live (DESIGN.md UX
+    /// decision #5); other repos' project skills are still discovered.
+    pub active_repo_path: Option<PathBuf>,
 }
 
 impl ClaudeCodeAdapter {
@@ -34,13 +38,21 @@ impl ClaudeCodeAdapter {
         result.skills.extend(personal_skills);
         result.warnings.extend(personal_warnings);
 
-        for (_repo, repo_skills, repo_warnings) in discover_project_skills(&self.claude_home) {
-            result.skills.extend(repo_skills);
+        // Computed once, up front, so both the project loop and the plugin
+        // loop below can gate liveness against the same active repo.
+        let active_repo_path = find_active_repo(&self.claude_home).map(|r| r.repo_path);
+        result.active_repo_path = active_repo_path.clone();
+
+        for (repo, repo_skills, repo_warnings) in discover_project_skills(&self.claude_home) {
+            // A project skill is only live when its repo is the active one;
+            // non-active repos' project skills are still discovered, just
+            // not counted as co-resident (DESIGN.md UX decision #5).
+            let live = active_repo_path.as_deref() == Some(repo.repo_path.as_path());
+            result
+                .skills
+                .extend(repo_skills.into_iter().map(|s| DiscoveredSkill { live, ..s }));
             result.warnings.extend(repo_warnings);
         }
-
-        let active_repo = find_active_repo(&self.claude_home);
-        let active_repo_path = active_repo.as_ref().map(|r| r.repo_path.as_path());
 
         // A plugin key can have multiple install records (one per scope: user/project/local),
         // but every scope's files live in the same shared cache -- there is no repo-local
@@ -54,7 +66,11 @@ impl ClaudeCodeAdapter {
         }
 
         for record in unique_records.values() {
-            let live = is_plugin_live(&record.plugin_at_marketplace, &self.claude_home, active_repo_path);
+            let live = is_plugin_live(
+                &record.plugin_at_marketplace,
+                &self.claude_home,
+                active_repo_path.as_deref(),
+            );
             let (plugin_skills, plugin_warnings) = discover_plugin_skills(record);
             result
                 .skills
@@ -209,5 +225,57 @@ mod tests {
             .collect();
         assert_eq!(matches.len(), 1, "expected exactly one discovered skill, got {matches:?}");
         assert!(matches[0].live);
+    }
+
+    #[test]
+    fn project_skill_liveness_is_gated_by_active_repo() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+
+        // Older known repo, written first.
+        let older_repo = tmp.path().join("older-repo");
+        let older_project_dir = claude_home.join("projects").join("-tmp-older-repo");
+        fs::create_dir_all(&older_project_dir).unwrap();
+        fs::write(
+            older_project_dir.join("s.jsonl"),
+            format!(r#"{{"cwd":"{}","sessionId":"1"}}"#, older_repo.display()),
+        )
+        .unwrap();
+        write_skill(&older_repo.join(".claude").join("skills").join("older-skill"), "older-skill");
+
+        sleep(Duration::from_millis(20));
+
+        // Newer known repo, written after -- this is the active one.
+        let newer_repo = tmp.path().join("newer-repo");
+        let newer_project_dir = claude_home.join("projects").join("-tmp-newer-repo");
+        fs::create_dir_all(&newer_project_dir).unwrap();
+        fs::write(
+            newer_project_dir.join("s.jsonl"),
+            format!(r#"{{"cwd":"{}","sessionId":"1"}}"#, newer_repo.display()),
+        )
+        .unwrap();
+        write_skill(&newer_repo.join(".claude").join("skills").join("newer-skill"), "newer-skill");
+
+        let adapter = ClaudeCodeAdapter::new(claude_home);
+        let result = adapter.discover_skills();
+
+        assert_eq!(result.active_repo_path.as_deref(), Some(newer_repo.as_path()));
+
+        let older_skill = result
+            .skills
+            .iter()
+            .find(|s| matches!(&s.id, SkillId::Project { name, .. } if name == "older-skill"))
+            .unwrap();
+        assert!(!older_skill.live, "non-active repo's project skill must still be discovered but not live");
+
+        let newer_skill = result
+            .skills
+            .iter()
+            .find(|s| matches!(&s.id, SkillId::Project { name, .. } if name == "newer-skill"))
+            .unwrap();
+        assert!(newer_skill.live, "active repo's project skill must be live");
     }
 }
