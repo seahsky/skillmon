@@ -54,6 +54,18 @@ pub struct DiscoveryWarning {
     pub reason: String,
 }
 
+/// Harness-neutral: any `HarnessAdapter::discover_skills` implementation
+/// returns this shape, not just the Claude Code one (ADR 0002).
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryResult {
+    pub skills: Vec<DiscoveredSkill>,
+    pub warnings: Vec<DiscoveryWarning>,
+    /// The repo whose transcript was most recently written to, if any known
+    /// repo exists. Only this repo's project skills are live (DESIGN.md UX
+    /// decision #5); other repos' project skills are still discovered.
+    pub active_repo_path: Option<PathBuf>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
