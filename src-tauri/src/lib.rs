@@ -2,6 +2,8 @@
 // Menu-bar (macOS) / system-tray (Windows) app. Domain language: ../CONTEXT.md.
 // Architecture and decisions: ../../docs/DESIGN.md, ../../docs/adr/.
 
+mod domain;
+
 use tauri::Manager;
 
 // TODO(skillmon): replace this demo command with the real IPC surface
