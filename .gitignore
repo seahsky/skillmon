@@ -1,0 +1,39 @@
+# --- Rust / Cargo (Tauri core) ---
+/src-tauri/target/
+**/*.rs.bk
+*.pdb
+
+# --- Tauri generated ---
+/src-tauri/gen/
+
+# --- Node / SvelteKit frontend ---
+node_modules/
+dist/
+dist-ssr/
+build/
+.svelte-kit/
+*.local
+
+# --- Env / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Tauri updater signing key (NEVER commit the private key) ---
+*.key
+*.pem
+.tauri/
+
+# --- Logs ---
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Editors / IDEs ---
+.idea/
+.vscode/*
+!.vscode/extensions.json

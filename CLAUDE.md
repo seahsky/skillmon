@@ -9,21 +9,21 @@ This file is a starting point; grow it a line at a time as the code lands and as
 
 ## Status
 
-Planning complete, no source yet.
-Everything under Commands and Structure is **planned** until the Tauri project is scaffolded — don't treat these paths as existing.
+Scaffolded. Tauri v2 + SvelteKit-TS app builds; core tray + five plugins (positioner, global-shortcut, notification, autostart, single-instance) are wired in `src-tauri/src/lib.rs`. The default `greet` command and demo page are still present — feature work has not started. Requires Rust ≥ 1.89 (the notification plugin's `notify-rust` dep).
 
-## Commands (planned)
+## Commands
 
-- Dev: `pnpm tauri dev`
-- Build: `pnpm tauri build`
-- Rust core tests: `cargo test` in `src-tauri/`; one test: `cargo test <name> -- --exact`
-- Frontend tests: `pnpm test` (Vitest); one file: `pnpm test <file>`
+- Dev: `pnpm tauri dev` (launches the tray app)
+- Build frontend only: `pnpm build`; typecheck: `pnpm check`
+- Build/bundle app: `pnpm tauri build`
+- Rust core: `cargo build --manifest-path src-tauri/Cargo.toml`; tests: `cargo test --manifest-path src-tauri/Cargo.toml` (one: append `<name> -- --exact`)
+- No JS test runner yet — add one (Vitest) when the UI grows logic worth testing.
 
-## Structure (planned)
+## Structure
 
-- `src-tauri/` — Rust core: harness adapter, skill discovery, footprint counter, transcript attribution, mutation ops, `rusqlite` persistence, file watcher.
-- `src/` — Svelte + TS tray panel: skill list, three-layer footprint columns, usage column, sort/group, disable/uninstall actions.
-- `CONTEXT-MAP.md` → `src-tauri/CONTEXT.md` glossary · `docs/DESIGN.md` design · `docs/adr/` decisions.
+- `src-tauri/` — Rust core (Cargo crate `skillmon`, lib `skillmon_lib`): `src/lib.rs` is the entry point. Will hold the harness adapter, skill discovery, footprint counter, transcript attribution, mutation ops, `rusqlite` persistence, file watcher. Capabilities in `src-tauri/capabilities/`.
+- `src/` — SvelteKit-TS frontend (adapter-static, SPA): `src/routes/` pages, `src/app.html`. Becomes the tray panel: skill list, three-layer footprint columns, usage column, sort/group, disable/uninstall.
+- `CONTEXT-MAP.md` → `src-tauri/CONTEXT.md` glossary · `docs/DESIGN.md` design · `docs/adr/` decisions (0001–0013).
 
 ## Project rules
 
@@ -33,9 +33,9 @@ Everything under Commands and Structure is **planned** until the Tauri project i
 - **Token counting (ADR 0005/0006).** Dedup transcript token rows by `message.id`, never by record `uuid` (overcounts up to 11×). Parse transcripts incrementally via byte-offset checkpoints. Cache footprint by `(content hash, model_id)`; trust native `attributionSkill`/`attributionPlugin` before reconstructing.
 - **Discovery.** Personal skills are discovered depth-1 only; many entries are symlinks managed by other tools — detect and record the target, don't assume skillmon owns them.
 
-## Verification (planned)
+## Verification
 
-A change is done when `cargo test` and `pnpm test` pass **and** the affected flow is exercised against a real `~/.claude` fixture, not just unit tests: footprint matches `count_tokens`, and mutations round-trip (disable→enable, uninstall→restore).
+A change is done when `cargo build`/`cargo test` and `pnpm check` pass **and** the affected flow is exercised against a real `~/.claude` fixture, not just unit tests: footprint matches `count_tokens`, and mutations round-trip (disable→enable, uninstall→restore). Once a JS test runner exists, `pnpm test` joins this gate.
 
 ## Agent skills
 
