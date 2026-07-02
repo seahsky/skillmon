@@ -84,6 +84,30 @@ _Avoid_: skill body, body cost
 **On-demand layer**:
 Bundled reference files that load only if the body tells the agent to read them; reported as a ceiling, never in the headline. Measured as raw file bytes, not whatever tool-specific wrapper the agent happens to read them through (e.g. Read's line-numbered output) — which wrapper applies is a runtime choice, not a fact about the skill, so the ceiling deliberately doesn't chase it.
 
+**Token source**:
+Whether a layer's count is `Exact` (a live `count_tokens` call, cache-hit or fresh) or `Estimate` (calibrated `tiktoken`, used whenever no API key is present or a `count_tokens` call fails — the two collapse to the same fallback path, since either way exact wasn't available). Orthogonal to text confidence, which only the always-on layer carries.
+_Avoid_: exactness, confidence (reserved for text confidence below)
+
+**Text confidence**:
+Only meaningful for the always-on layer: `Native` (the literal transcript-rendered line, ADR 0016) or `Reconstructed` (built from raw frontmatter because no transcript has ever included the skill yet). Independent of token source — a reconstructed line can still be counted exactly.
+_Avoid_: accuracy
+
+**Token cache**:
+The content-addressed store keyed by `sha256(canonical content)` alone (ADR 0006). One row per hash holds the always-computed `tiktoken` count plus, once available, the exact `count_tokens` value and the reference model it was measured against. A skill's per-layer footprint is a lookup of that layer's current text hash, not a row keyed by skill or layer — identical content (e.g. two skills sharing a reference file) shares one row for free, and an edit's new hash is simply a fresh cache miss with no explicit invalidation step.
+_Avoid_: footprint table, token store
+
+**Calibration factor**:
+`Σ exact_tokens / Σ tiktoken_tokens`, summed over every token-cache row that currently has an exact value for the reference model. Used to scale a raw `tiktoken` count into the estimate tier once at least one exact sample exists; absent any exact sample, the estimate tier is uncalibrated (raw `tiktoken`, no multiplier) rather than silently using a factor of 1 as if it meant something.
+_Avoid_: correction factor, multiplier
+
+**Reference model**:
+The single, fixed model `count_tokens` is always called against — skillmon's internal choice, never a user-facing setting (ADR 0018). Kept on the token-cache row only so a future change to skillmon's own default invalidates stale exact values instead of mixing them with new ones.
+_Avoid_: model setting, target model
+
+**Console API key**:
+A user-supplied Anthropic Console `ANTHROPIC_API_KEY`, entered explicitly into skillmon, that unlocks the exact tier. Stored in the OS keychain, never on disk in plaintext or otherwise (ADR 0020). Never Claude Code's own OAuth credential — that's off-limits on principle, not just unreliability (ADR 0006).
+_Avoid_: token (ambiguous with footprint tokens), credential
+
 **Attributed usage**:
 Tokens spent in sessions while a skill was active.
 A proxy for causation, not a bill — read as "tokens during this skill," never "tokens used by it."
