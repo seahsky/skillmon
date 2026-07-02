@@ -3,6 +3,7 @@
 // Architecture and decisions: ../../docs/DESIGN.md, ../../docs/adr/.
 
 mod domain;
+mod adapters;
 
 use tauri::Manager;
 
