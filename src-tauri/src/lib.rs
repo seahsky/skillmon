@@ -2,7 +2,10 @@
 // Menu-bar (macOS) / system-tray (Windows) app. Domain language: ../CONTEXT.md.
 // Architecture and decisions: ../../docs/DESIGN.md, ../../docs/adr/.
 
+// consumed by a future footprint-counter plan; no Tauri command wires this in yet
+#[allow(dead_code)]
 mod domain;
+#[allow(dead_code)]
 mod adapters;
 
 use tauri::Manager;
