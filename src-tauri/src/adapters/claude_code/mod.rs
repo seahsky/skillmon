@@ -1,4 +1,5 @@
 pub mod discovery;
+pub mod footprint_text;
 pub mod frontmatter;
 pub mod paths;
 pub mod settings;

@@ -24,3 +24,10 @@ Only when no transcript has ever included the skill (just installed, no session 
 
 - **Always reconstruct from raw frontmatter via a hand-maintained template** — simplest, but already wrong (misses decorations, uses the wrong name field) and would drift silently if the render template changes; kept only as the no-transcript-yet fallback.
 - **Read the real rendered text from a live transcript, falling back to reconstruction only for never-yet-seen skills** — chosen.
+
+## Update (implementing the footprint counter plan)
+
+Implementing the extraction against real transcripts on this machine found the attachment record is more structured than assumed here: `attachment.type == "skill_listing"`, and alongside `content` it carries a `names` array — the exact directory names, in the same order they appear in `content`. Two things this changes about the extraction mechanism (the decision above — read from transcript, reconstruct only as fallback — is unchanged):
+
+- Anchor extraction on `names[i]` sequentially (find `- {names[i]}` at or after the cursor left by `names[i-1]`'s match, next name's start is this entry's end) rather than a bare `\n- ` scan. On today's real data the two approaches agree, but the `\n- ` heuristic would break silently on a future skill whose own description contains a markdown sub-list; the `names` array doesn't have that failure mode.
+- Not every entry is `- {name}: {description}` — a skill with no frontmatter `description` renders as a bare `- {name}` with no colon and no trailing text (observed: `plan-tune`, `qa-only`, `review`, several others in the real listing). Extraction must not assume a colon is always present.
