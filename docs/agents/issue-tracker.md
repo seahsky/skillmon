@@ -2,7 +2,7 @@
 
 Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all operations.
 
-> **Not wired up yet.** skillmon has no git remote. Before any `gh` command will work, create the repo on GitHub and add the remote (`git init`, `gh repo create`, `git remote add origin …`). Until then, the skills that publish to the tracker cannot run.
+> Repo: **https://github.com/seahsky/skillmon** (public). The `gh` commands below operate on it directly (`gh` infers the repo from the `origin` remote).
 
 ## Conventions
 

@@ -42,7 +42,7 @@ A change is done when `cargo build`/`cargo test` and `pnpm check` pass **and** t
 ### Issue tracker
 
 GitHub Issues via the `gh` CLI; PRs are not a triage surface.
-No git remote exists yet — create the GitHub repo and add the remote before the `gh`-based skills can run.
+Repo: `seahsky/skillmon` (public); the five triage labels exist.
 See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
