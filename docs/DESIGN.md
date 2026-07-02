@@ -17,10 +17,10 @@ The product answers two questions a heavy skill user cannot answer today.
 
 skillmon is a Tauri v2 app: a Rust core holds all domain logic, and a web UI renders the tray dropdown/flyout.
 
-- **Rust core** — skill discovery, deterministic footprint counting, transcript parsing and usage attribution, mutation operations (disable/uninstall/plugin removal), persistence, file-watching, and threshold evaluation for toasts.
+- **Rust core** — skill discovery, footprint counting, transcript parsing and usage attribution, mutation operations (disable/uninstall/plugin removal), persistence, file-watching (registry surfaces drive rescans, content hash drives recompute, transcript freshness is checked lazily on panel open — ADR 0019), and threshold evaluation for toasts.
 - **Web UI (Svelte + TypeScript)** — the menu-bar/tray panel: the installed-skill list, footprint and usage columns, the ascending/descending sort control, and the disable/uninstall actions.
 - **Harness-adapter trait** — a Rust trait that abstracts everything agent-specific: where skills live, how to read a skill's footprint, how to parse transcripts, and how to mutate enable/disable state. v1 ships exactly one implementation, the Claude Code adapter.
-- **Data layer** — SQLite via `rusqlite` (bundled) inside the core for typed synchronous access, plus a content-hash → exact-token-count cache so footprint counting is offline in steady state.
+- **Data layer** — SQLite via `rusqlite` (bundled) inside the core for typed synchronous access, plus a content-hash → token-count cache (tagged exact or estimated, per ADR 0006) so footprint counting is offline in steady state.
 
 ## The domain: Claude Code skills
 
@@ -29,19 +29,20 @@ Skills reach a machine three ways, and the distinction drives the whole UI.
 
 - **Personal skills** — `~/.claude/skills/<name>/SKILL.md`, discovered depth-1 only (immediate children of the scan root). There is no native enable/disable flag for these.
 - **Project skills** — `<repo>/.claude/skills/<name>/SKILL.md`, scoped to one repository and only co-resident in context when you are working in that repo.
-- **Plugin skills** — `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/skills/<name>/SKILL.md`. Plugin-locked: you cannot remove one skill, only the whole plugin. A plugin's own `plugin.json` may relocate its skills dir (for example `./.claude/skills`), so lock detection must read that field, not assume `skills/`.
+- **Plugin skills** — installed at the path recorded in the plugin's `installed_plugins.json` record (`installPath`), never reconstructed from `cache/<marketplace>/<plugin>/<version>/` — a version directory can literally be named `unknown`. Plugin-locked: you cannot remove one skill, only the whole plugin. A plugin's own `plugin.json` may relocate its skills dir (for example `./.claude/skills`), so lock detection must read that field, not assume `skills/`.
 
-Plugin state is registry-driven.
+Plugin state is registry-driven, and enablement is repo-scoped, not a single global flag (ADR 0015).
 
-- `~/.claude/plugins/installed_plugins.json` (schema `version: 2`) maps `"<plugin>@<marketplace>"` to install records (scope, installPath, version, installedAt, gitCommitSha).
-- `~/.claude/settings.json → enabledPlugins["<plugin>@<marketplace>"]` toggles a plugin on or off; a disabled plugin contributes zero live footprint.
+- `~/.claude/plugins/installed_plugins.json` (schema `version: 2`) maps `"<plugin>@<marketplace>"` to an **array** of install records (scope, installPath, version, installedAt, gitCommitSha) — one plugin can be installed at more than one scope. `scope` here is install provenance; every scope's files live in the same shared cache, there is no repo-local cache directory.
+- A plugin is **live** if `enabledPlugins["<plugin>@<marketplace>"]` is `true` in any of: `~/.claude/settings.json` (global), the active repo's `<repo>/.claude/settings.json` (project, git-committed), or the active repo's `<repo>/.claude/settings.local.json` (local, gitignored). Project- and local-scoped entries are gated by the same "active repo" concept as project skills. A plugin that is live nowhere applicable contributes zero live footprint.
 - Marketplaces live in `known_marketplaces.json` and, for user-added ones, `settings.json → extraKnownMarketplaces`. The two registries are not 1:1, and built-in marketplaces must never be removed.
 
 ## The two metrics
 
-**Context footprint** (headline, deterministic) is the exact token size of a skill's content as it enters context.
-It splits into three layers: always-on (frontmatter `name` + `description`, charged every request the skill is enabled), on-invoke (the SKILL.md body, loaded once when the Skill tool fires), and on-demand (bundled references, loaded only if the body tells Claude to read them, shown as a ceiling and never folded into the headline).
-There is no exact offline Claude tokenizer for current models, so the exact number comes from the `count_tokens` REST endpoint, cached by content hash plus model id, with a calibrated `tiktoken` estimate as the only-when-a-file-changed offline fallback.
+**Context footprint** (headline) is the token size of a skill's content as it enters context — exact when the user has supplied their own Anthropic API key, a clearly labeled calibrated estimate otherwise (see below; ADR 0006).
+It splits into three layers, each measuring what actually enters context rather than assuming raw source bytes (ADR 0016, ADR 0017): always-on (the rendered skill-listing line Claude Code actually injects — read from a live transcript when one exists, since it can include more than the frontmatter `name` + `description`, e.g. a plugin's own custom decorations; reconstructed from raw frontmatter only for a skill no transcript has ever included), on-invoke (`"Base directory for this skill: {path}\n\n" + body`, a confirmed stable template computed directly, loaded once when the skill fires), and on-demand (bundled references, loaded only if the body tells Claude to read them, measured as raw bytes and shown as a ceiling — deliberately not chasing which tool-specific wrapper an agent might read them through — never folded into the headline).
+There is no exact offline Claude tokenizer for current models, and the only exact method — the `count_tokens` REST endpoint — requires a real Anthropic API key; Claude Code's own OAuth credential can never be reused for this, since Anthropic's Consumer Terms of Service restrict it to Claude Code and claude.ai (ADR 0006).
+So the exact number, cached by content hash plus model id, is available only to users who add a key; everyone else's headline is a calibrated `tiktoken` estimate, which is the real default, not a rare fallback, and is always labeled as such.
 
 **Attributed session usage** (secondary, fuzzy) is the tokens spent in sessions while a skill was holding the wheel.
 Claude Code already computes this natively — main-thread `assistant` records carry `attributionSkill` and `attributionPlugin` — so skillmon trusts those fields where present and reconstructs a skill stack only where they are absent (sub-agent files, pre-attribution builds).
@@ -83,7 +84,7 @@ Settled in the grilling pass.
 
 1. **Footprint display** — every row shows the full three-layer breakdown: always-on, on-invoke, and on-demand. No single blended number hides where the cost lives.
 2. **Sort & grouping** — default sort is always-on footprint descending; every layer column is click-to-sort. Flat list, plugin shown as a badge with an opt-in "group by plugin" toggle.
-3. **Attributed-usage labeling** — `~` prefix, muted, rendered below the exact footprint; tooltip "session tokens during this skill, not by it"; cache-read excluded from the number. Sub-agent tokens excluded by default, with an include toggle.
+3. **Attributed-usage labeling** — `~` prefix, muted, rendered below the footprint; tooltip "session tokens during this skill, not by it"; cache-read excluded from the number. Sub-agent tokens excluded by default, with an include toggle.
 4. **Toast model** — one global rolling-24h budget on attributed usage, on by default. Per-skill anomaly alerts (a skill running N× its trailing average) available but off by default. The toast names the metric as an estimate.
 5. **Project skills** — every repo's project skills are listed as collapsed per-repo inventory sections. The global always-on total counts personal + enabled-plugin skills + the **active repo's** project skills only (what is actually co-resident now); other repos' project skills are shown but not summed.
 6. **Uninstall history** — tombstone: the skill leaves the active list, its history is retained under a "removed" view, and reinstalling restores continuity.
