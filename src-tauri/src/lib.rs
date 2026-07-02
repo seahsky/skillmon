@@ -62,7 +62,7 @@ pub fn run() {
 
             // macOS: run as a menu-bar accessory (no Dock icon).
             #[cfg(target_os = "macos")]
-            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             // TODO(skillmon): apply vibrancy (macOS) / Mica (Windows 11), open the
             // rusqlite store, start the notify file watcher over ~/.claude, and

@@ -121,7 +121,7 @@ fn transcripts_by_recency(project_dirs: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
 
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
     entries.into_iter().map(|(path, _)| path).collect()
 }
 
