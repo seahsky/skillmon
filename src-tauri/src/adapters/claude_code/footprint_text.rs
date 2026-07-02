@@ -87,6 +87,24 @@ fn extract_bullet(content: &str, names: &[String], target: &str) -> Option<Strin
     Some(content[start..end].trim_end_matches('\n').to_string())
 }
 
+/// The on-invoke template, confirmed stable across both the `Skill` tool and
+/// slash-command invocation paths (ADR 0017) -- computed directly, no
+/// transcript lookup needed, unlike always-on.
+pub fn on_invoke_text(skill: &DiscoveredSkill) -> String {
+    format!("Base directory for this skill: {}\n\n{}", skill.dir_path.display(), skill.body)
+}
+
+/// Raw bytes of each bundled file (ADR 0017's ceiling, not a wrapper
+/// reconstruction). A file that isn't valid UTF-8 is skipped, not fatal --
+/// matches the discovery pipeline's fault-isolation posture.
+pub fn on_demand_file_texts(skill: &DiscoveredSkill) -> Vec<(PathBuf, String)> {
+    skill
+        .on_demand_files
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok().map(|content| (path.clone(), content)))
+        .collect()
+}
+
 fn transcripts_by_recency(project_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
 
@@ -233,5 +251,53 @@ mod tests {
         let result = always_on_text(&skill, &[project_dir]);
 
         assert_eq!(result.text, "- grilling: NEW wording");
+    }
+
+    #[test]
+    fn on_invoke_text_matches_the_exact_adr_0017_template() {
+        let mut skill = sample_skill("grilling", "Interview relentlessly.");
+        skill.dir_path = PathBuf::from("/Users/test/.claude/skills/grilling");
+        skill.body = "Interview me relentlessly about every aspect of this plan.".to_string();
+
+        let result = on_invoke_text(&skill);
+
+        assert_eq!(
+            result,
+            "Base directory for this skill: /Users/test/.claude/skills/grilling\n\nInterview me relentlessly about every aspect of this plan."
+        );
+    }
+
+    #[test]
+    fn on_demand_file_texts_reads_each_bundled_file_literally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_a = tmp.path().join("CONTEXT-FORMAT.md");
+        let file_b = tmp.path().join("ADR-FORMAT.md");
+        fs::write(&file_a, "context format doc").unwrap();
+        fs::write(&file_b, "adr format doc").unwrap();
+
+        let mut skill = sample_skill("domain-modeling", "models domains");
+        skill.on_demand_files = vec![file_a.clone(), file_b.clone()];
+
+        let result = on_demand_file_texts(&skill);
+
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&(file_a, "context format doc".to_string())));
+        assert!(result.contains(&(file_b, "adr format doc".to_string())));
+    }
+
+    #[test]
+    fn on_demand_file_texts_skips_a_non_utf8_file_without_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good_file = tmp.path().join("good.md");
+        let bad_file = tmp.path().join("bad.bin");
+        fs::write(&good_file, "readable text").unwrap();
+        fs::write(&bad_file, [0xff, 0xfe, 0x00, 0xff]).unwrap();
+
+        let mut skill = sample_skill("domain-modeling", "models domains");
+        skill.on_demand_files = vec![good_file.clone(), bad_file];
+
+        let result = on_demand_file_texts(&skill);
+
+        assert_eq!(result, vec![(good_file, "readable text".to_string())]);
     }
 }
