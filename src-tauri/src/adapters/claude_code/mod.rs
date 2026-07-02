@@ -59,7 +59,9 @@ impl ClaudeCodeAdapter {
         // cache directory (docs/DESIGN.md). Dedupe by `plugin_at_marketplace` before
         // discovering skills so a multi-scope install doesn't produce duplicate skill rows.
         let mut unique_records: HashMap<String, discovery::plugin::PluginInstallRecord> = HashMap::new();
-        for record in parse_installed_plugins(&self.claude_home) {
+        let (installed_plugin_records, installed_plugins_warnings) = parse_installed_plugins(&self.claude_home);
+        result.warnings.extend(installed_plugins_warnings);
+        for record in installed_plugin_records {
             unique_records
                 .entry(record.plugin_at_marketplace.clone())
                 .or_insert(record);

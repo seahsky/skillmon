@@ -30,12 +30,45 @@ pub struct PluginInstallRecord {
 /// Reads `installed_plugins.json` verbatim. Never reconstructs `installPath`
 /// from `cache/<marketplace>/<plugin>/<version>/` -- a real version
 /// directory can be named `unknown` (ADR 0014's neighbor decision).
-pub fn parse_installed_plugins(claude_home: &Path) -> Vec<PluginInstallRecord> {
+///
+/// A missing file is the normal "nothing installed yet" case and stays
+/// silent. A file that EXISTS but fails to read as UTF-8 or parse as JSON is
+/// registry corruption -- since a corrupt registry silently hides every
+/// installed plugin, that case is recorded as a `DiscoveryWarning` rather
+/// than degrading to an empty result with no signal.
+pub fn parse_installed_plugins(claude_home: &Path) -> (Vec<PluginInstallRecord>, Vec<DiscoveryWarning>) {
     let path = installed_plugins_path(claude_home);
-    let Ok(content) = fs::read_to_string(&path) else { return Vec::new() };
-    let Ok(parsed) = serde_json::from_str::<InstalledPluginsFile>(&content) else { return Vec::new() };
+    if !path.exists() {
+        return (Vec::new(), Vec::new());
+    }
 
-    parsed
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(err) => {
+            return (
+                Vec::new(),
+                vec![DiscoveryWarning {
+                    path,
+                    reason: format!("installed_plugins.json exists but could not be read: {err}"),
+                }],
+            );
+        }
+    };
+
+    let parsed = match serde_json::from_str::<InstalledPluginsFile>(&content) {
+        Ok(p) => p,
+        Err(err) => {
+            return (
+                Vec::new(),
+                vec![DiscoveryWarning {
+                    path,
+                    reason: format!("installed_plugins.json exists but could not be parsed: {err}"),
+                }],
+            );
+        }
+    };
+
+    let records = parsed
         .plugins
         .into_iter()
         .flat_map(|(key, records)| {
@@ -51,7 +84,9 @@ pub fn parse_installed_plugins(claude_home: &Path) -> Vec<PluginInstallRecord> {
                 })
             })
         })
-        .collect()
+        .collect();
+
+    (records, Vec::new())
 }
 
 fn split_plugin_key(key: &str) -> (String, String) {
@@ -140,9 +175,10 @@ mod tests {
             }"#,
         );
 
-        let records = parse_installed_plugins(claude_home);
+        let (records, warnings) = parse_installed_plugins(claude_home);
 
         assert_eq!(records.len(), 1);
+        assert!(warnings.is_empty());
         assert_eq!(records[0].plugin, "serena");
         assert_eq!(records[0].marketplace, "claude-plugins-official");
         assert_eq!(records[0].scope, InstallScope::User);
@@ -169,16 +205,32 @@ mod tests {
             }"#,
         );
 
-        let records = parse_installed_plugins(claude_home);
+        let (records, warnings) = parse_installed_plugins(claude_home);
         assert_eq!(records.len(), 2);
+        assert!(warnings.is_empty());
         assert!(records.iter().any(|r| r.scope == InstallScope::User));
         assert!(records.iter().any(|r| r.scope == InstallScope::Project));
     }
 
     #[test]
-    fn missing_registry_file_yields_no_records() {
+    fn missing_registry_file_yields_no_records_and_no_warnings() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(parse_installed_plugins(tmp.path()).is_empty());
+        let (records, warnings) = parse_installed_plugins(tmp.path());
+        assert!(records.is_empty());
+        assert!(warnings.is_empty(), "a missing registry file is the normal 'nothing installed' case");
+    }
+
+    #[test]
+    fn corrupt_registry_file_yields_no_records_but_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path();
+        write_installed_plugins(claude_home, "not valid json");
+
+        let (records, warnings) = parse_installed_plugins(claude_home);
+
+        assert!(records.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].reason.contains("could not be parsed"));
     }
 
     #[test]

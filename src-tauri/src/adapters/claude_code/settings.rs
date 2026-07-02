@@ -12,6 +12,14 @@ struct SettingsFile {
     enabled_plugins: HashMap<String, bool>,
 }
 
+// NOTE: silently degrades to an empty map on an unreadable/corrupt settings
+// file, unlike parse_installed_plugins's registry-corrupt case (which now
+// raises a DiscoveryWarning). is_plugin_live is called once per plugin
+// record from the assembly loop in mod.rs, so retrofitting a warnings
+// channel here would mean threading (and deduping) warnings across up to
+// three files per call, for every installed plugin -- a disproportionate
+// refactor for this fix. Left as a follow-up; a corrupt settings.json still
+// just makes plugins in that scope read as "not live" rather than crashing.
 fn read_enabled_plugins(path: &Path) -> HashMap<String, bool> {
     fs::read_to_string(path)
         .ok()
