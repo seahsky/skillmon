@@ -8,6 +8,7 @@ use discovery::plugin::{discover_plugin_skills, parse_installed_plugins};
 use discovery::project::discover_project_skills;
 use discovery::transcript::find_active_repo;
 use settings::is_plugin_live;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub struct ClaudeCodeAdapter {
@@ -41,9 +42,20 @@ impl ClaudeCodeAdapter {
         let active_repo = find_active_repo(&self.claude_home);
         let active_repo_path = active_repo.as_ref().map(|r| r.repo_path.as_path());
 
+        // A plugin key can have multiple install records (one per scope: user/project/local),
+        // but every scope's files live in the same shared cache -- there is no repo-local
+        // cache directory (docs/DESIGN.md). Dedupe by `plugin_at_marketplace` before
+        // discovering skills so a multi-scope install doesn't produce duplicate skill rows.
+        let mut unique_records: HashMap<String, discovery::plugin::PluginInstallRecord> = HashMap::new();
         for record in parse_installed_plugins(&self.claude_home) {
+            unique_records
+                .entry(record.plugin_at_marketplace.clone())
+                .or_insert(record);
+        }
+
+        for record in unique_records.values() {
             let live = is_plugin_live(&record.plugin_at_marketplace, &self.claude_home, active_repo_path);
-            let (plugin_skills, plugin_warnings) = discover_plugin_skills(&record);
+            let (plugin_skills, plugin_warnings) = discover_plugin_skills(record);
             result
                 .skills
                 .extend(plugin_skills.into_iter().map(|s| DiscoveredSkill { live, ..s }));
@@ -157,5 +169,45 @@ mod tests {
 
         assert_eq!(result.skills.len(), 1);
         assert!(!result.skills[0].live);
+    }
+
+    #[test]
+    fn multi_scope_plugin_install_records_are_discovered_only_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+
+        // A single shared cache directory -- both the "user" and "project" scope
+        // records below point at the same installPath, matching reality: every
+        // scope's files live in the same shared cache (docs/DESIGN.md).
+        let plugin_install = tmp.path().join("plugin-cache").join("multi-scope-plugin").join("1.0.0");
+        write_skill(&plugin_install.join("skills").join("multi-scope-skill"), "multi-scope-skill");
+        fs::create_dir_all(claude_home.join("plugins")).unwrap();
+        fs::write(
+            claude_home.join("plugins").join("installed_plugins.json"),
+            format!(
+                r#"{{"version": 2, "plugins": {{"multi-scope-plugin@test-market": [
+                    {{"scope": "user", "installPath": "{path}", "version": "1.0.0"}},
+                    {{"scope": "project", "installPath": "{path}", "version": "1.0.0"}}
+                ]}}}}"#,
+                path = plugin_install.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            claude_home.join("settings.json"),
+            r#"{"enabledPlugins": {"multi-scope-plugin@test-market": true}}"#,
+        )
+        .unwrap();
+
+        let adapter = ClaudeCodeAdapter::new(claude_home);
+        let result = adapter.discover_skills();
+
+        let matches: Vec<_> = result
+            .skills
+            .iter()
+            .filter(|s| matches!(&s.id, SkillId::Plugin { name, .. } if name == "multi-scope-skill"))
+            .collect();
+        assert_eq!(matches.len(), 1, "expected exactly one discovered skill, got {matches:?}");
+        assert!(matches[0].live);
     }
 }
