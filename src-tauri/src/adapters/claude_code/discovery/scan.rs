@@ -15,15 +15,38 @@ pub fn discover_skills_in_dir(
         Err(_) => return (skills, warnings),
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                warnings.push(DiscoveryWarning {
+                    path: dir.to_path_buf(),
+                    reason: format!("error reading directory entry: {err}"),
+                });
+                continue;
+            }
+        };
         let dir_path = entry.path();
 
         let metadata = match fs::symlink_metadata(&dir_path) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(err) => {
+                warnings.push(DiscoveryWarning {
+                    path: dir_path,
+                    reason: format!("cannot read metadata: {err}"),
+                });
+                continue;
+            }
         };
         let is_symlink = metadata.file_type().is_symlink();
         if !dir_path.is_dir() {
+            if is_symlink {
+                warnings.push(DiscoveryWarning {
+                    path: dir_path,
+                    reason: "symlink target is not a directory (broken or points at a non-directory)"
+                        .to_string(),
+                });
+            }
             continue;
         }
         let symlink_target = if is_symlink { fs::read_link(&dir_path).ok() } else { None };
@@ -180,6 +203,70 @@ mod tests {
         assert!(warnings.is_empty());
         assert!(skills[0].is_symlink);
         assert_eq!(skills[0].symlink_target.as_deref(), Some(real_dir.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_entry_metadata_produces_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let scan_root = tmp.path().join("scan-root");
+        let child = scan_root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("SKILL.md"), "---\nname: child\ndescription: d\n---\n\nBody.\n").unwrap();
+
+        // Read permission lets read_dir list entry names; dropping execute
+        // (search) permission on the parent blocks stat-by-path on those
+        // entries, so read_dir succeeds but symlink_metadata fails per-entry.
+        fs::set_permissions(&scan_root, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Root (and some CI sandboxes) bypasses this permission check
+        // entirely; skip rather than assert a false failure in that case.
+        if fs::symlink_metadata(&child).is_ok() {
+            fs::set_permissions(&scan_root, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!(
+                "skipping unreadable_entry_metadata_produces_warning: \
+                 metadata read succeeded despite missing execute bit (likely running as root)"
+            );
+            return;
+        }
+
+        let (skills, warnings) =
+            discover_skills_in_dir(&scan_root, |name| SkillId::Personal { name });
+
+        fs::set_permissions(&scan_root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(skills.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].reason.contains("cannot read metadata"));
+    }
+
+    #[test]
+    fn dangling_symlink_produces_warning_and_is_not_a_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan_root = tmp.path().join("scan-root");
+        fs::create_dir_all(&scan_root).unwrap();
+        symlink("/nonexistent/target", scan_root.join("dangling")).unwrap();
+
+        let (skills, warnings) = discover_skills_in_dir(&scan_root, |name| SkillId::Personal { name });
+
+        assert!(skills.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].reason.contains("symlink target is not a directory"));
+    }
+
+    #[test]
+    fn ordinary_non_directory_entry_is_silently_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A stray non-symlink file at depth-1 (e.g. .DS_Store) is not a skill dir
+        // but is not anomalous either - it must not produce a warning.
+        fs::write(tmp.path().join(".DS_Store"), b"junk").unwrap();
+
+        let (skills, warnings) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+
+        assert!(skills.is_empty());
+        assert!(warnings.is_empty());
     }
 
     #[test]
