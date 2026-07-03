@@ -9,15 +9,14 @@ This file is a starting point; grow it a line at a time as the code lands and as
 
 ## Status
 
-Rust core is well underway; no UI yet. Landed in the core: skill/plugin discovery, the three-layer footprint counter (content-hash SQLite cache, `tiktoken` estimate, optional exact `count_tokens` via a keychain-stored API key), the `HarnessAdapter` trait, a debounced registry file-watcher (ADR 0019), harness-neutral scan orchestration (`scan_all`, ADR 0021), and the `list_skills` Tauri command. The default `greet` command + demo page are still present. Requires Rust ≥ 1.89 (the notification plugin's `notify-rust` dep).
+Rust core is well underway; the first UI slice has landed. Landed in the core: skill/plugin discovery, the three-layer footprint counter (content-hash SQLite cache, `tiktoken` estimate, optional exact `count_tokens` via a keychain-stored API key), the `HarnessAdapter` trait, a debounced registry file-watcher (ADR 0019), harness-neutral scan orchestration (`scan_all`, ADR 0021), and the `list_skills` Tauri command. The tray panel (issue #1) now renders `list_skills` as a read-only three-layer list and refreshes on `registry-changed`; the `greet` command and demo page are gone. Pure UI logic lives in `src/lib/skills.ts` with Vitest coverage. Requires Rust ≥ 1.89 (the notification plugin's `notify-rust` dep).
 
 **Next up** is tracked as GitHub issues (`seahsky/skillmon`, label `ready-for-agent`):
 
-- [#1](https://github.com/seahsky/skillmon/issues/1) — tray panel rendering `list_skills` (the keystone; folds in removing the `greet` demo)
 - [#2](https://github.com/seahsky/skillmon/issues/2) — cut the ~120s cold tokenizer cost (re-validates ADR 0006)
 - [#3](https://github.com/seahsky/skillmon/issues/3) — cut the ~7s warm per-scan cost (incremental index)
-- [#4](https://github.com/seahsky/skillmon/issues/4) — API-key settings UI + set/delete commands (blocked by #1)
-- [#5](https://github.com/seahsky/skillmon/issues/5) — attributed usage, ADR 0005 (blocked by #1)
+- [#4](https://github.com/seahsky/skillmon/issues/4) — API-key settings UI + set/delete commands (was blocked by #1, now unblocked)
+- [#5](https://github.com/seahsky/skillmon/issues/5) — attributed usage, ADR 0005 (was blocked by #1, now unblocked)
 
 The post-mutation "restart Claude Code to apply" nudge is deferred until the disable/uninstall mutation ops are scoped.
 
@@ -27,7 +26,7 @@ The post-mutation "restart Claude Code to apply" nudge is deferred until the dis
 - Build frontend only: `pnpm build`; typecheck: `pnpm check`
 - Build/bundle app: `pnpm tauri build`
 - Rust core: `cargo build --manifest-path src-tauri/Cargo.toml`; tests: `cargo test --manifest-path src-tauri/Cargo.toml` (one: append `<name> -- --exact`)
-- No JS test runner yet — add one (Vitest) when the UI grows logic worth testing.
+- JS tests: `pnpm test` (Vitest, runs the pure `src/lib` modules via a standalone `vitest.config.ts`).
 
 ## Structure
 
@@ -46,7 +45,7 @@ The post-mutation "restart Claude Code to apply" nudge is deferred until the dis
 
 ## Verification
 
-A change is done when `cargo build`/`cargo test` and `pnpm check` pass **and** the affected flow is exercised against a real `~/.claude` fixture, not just unit tests: footprint matches `count_tokens`, and mutations round-trip (disable→enable, uninstall→restore). Once a JS test runner exists, `pnpm test` joins this gate.
+A change is done when `cargo build`/`cargo test`, `pnpm check`, and `pnpm test` pass **and** the affected flow is exercised against a real `~/.claude` fixture, not just unit tests: footprint matches `count_tokens`, and mutations round-trip (disable→enable, uninstall→restore).
 
 ## Agent skills
 
