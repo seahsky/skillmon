@@ -9,7 +9,17 @@ This file is a starting point; grow it a line at a time as the code lands and as
 
 ## Status
 
-Scaffolded. Tauri v2 + SvelteKit-TS app builds; core tray + five plugins (positioner, global-shortcut, notification, autostart, single-instance) are wired in `src-tauri/src/lib.rs`. The default `greet` command and demo page are still present — feature work has not started. Requires Rust ≥ 1.89 (the notification plugin's `notify-rust` dep).
+Rust core is well underway; no UI yet. Landed in the core: skill/plugin discovery, the three-layer footprint counter (content-hash SQLite cache, `tiktoken` estimate, optional exact `count_tokens` via a keychain-stored API key), the `HarnessAdapter` trait, a debounced registry file-watcher (ADR 0019), harness-neutral scan orchestration (`scan_all`, ADR 0021), and the `list_skills` Tauri command. The default `greet` command + demo page are still present. Requires Rust ≥ 1.89 (the notification plugin's `notify-rust` dep).
+
+**Next up** is tracked as GitHub issues (`seahsky/skillmon`, label `ready-for-agent`):
+
+- [#1](https://github.com/seahsky/skillmon/issues/1) — tray panel rendering `list_skills` (the keystone; folds in removing the `greet` demo)
+- [#2](https://github.com/seahsky/skillmon/issues/2) — cut the ~120s cold tokenizer cost (re-validates ADR 0006)
+- [#3](https://github.com/seahsky/skillmon/issues/3) — cut the ~7s warm per-scan cost (incremental index)
+- [#4](https://github.com/seahsky/skillmon/issues/4) — API-key settings UI + set/delete commands (blocked by #1)
+- [#5](https://github.com/seahsky/skillmon/issues/5) — attributed usage, ADR 0005 (blocked by #1)
+
+The post-mutation "restart Claude Code to apply" nudge is deferred until the disable/uninstall mutation ops are scoped.
 
 ## Commands
 
@@ -23,15 +33,16 @@ Scaffolded. Tauri v2 + SvelteKit-TS app builds; core tray + five plugins (positi
 
 - `src-tauri/` — Rust core (Cargo crate `skillmon`, lib `skillmon_lib`): `src/lib.rs` is the entry point. Will hold the harness adapter, skill discovery, footprint counter, transcript attribution, mutation ops, `rusqlite` persistence, file watcher. Capabilities in `src-tauri/capabilities/`.
 - `src/` — SvelteKit-TS frontend (adapter-static, SPA): `src/routes/` pages, `src/app.html`. Becomes the tray panel: skill list, three-layer footprint columns, usage column, sort/group, disable/uninstall.
-- `CONTEXT-MAP.md` → `src-tauri/CONTEXT.md` glossary · `docs/DESIGN.md` design · `docs/adr/` decisions (0001–0013).
+- `CONTEXT-MAP.md` → `src-tauri/CONTEXT.md` glossary · `docs/DESIGN.md` design · `docs/adr/` decisions (0001–0021).
 
 ## Project rules
 
 - **Adapter boundary (ADR 0002).** Every Claude-Code-specific path, file format, or CLI call lives inside the harness adapter — never in the UI or the generic core. A new fact about `~/.claude` layout goes in the adapter.
 - **Two honest metrics, never blended (ADR 0003).** Footprint is exact (from `count_tokens`); attributed usage is an estimate. Render usage with a `~`, demoted, labeled "tokens during this skill" — never as an exact figure or a bill. No dollar values anywhere.
 - **Mutations are reversible (ADR 0007).** Disable = quarantine move; uninstall = two-phase trash then purge; never hard-delete a skill dir. For plugins prefer the `claude plugin` CLI; snapshot before any direct JSON edit; respect `.in_use/<pid>` before deleting a plugin cache dir. Show the "restart Claude Code to apply" nudge after any change.
-- **Token counting (ADR 0005/0006).** Dedup transcript token rows by `message.id`, never by record `uuid` (overcounts up to 11×). Parse transcripts incrementally via byte-offset checkpoints. Cache footprint by `(content hash, model_id)`; trust native `attributionSkill`/`attributionPlugin` before reconstructing.
+- **Token counting (ADR 0005/0006).** Dedup transcript token rows by `message.id`, never by record `uuid` (overcounts up to 11×). Parse transcripts incrementally via byte-offset checkpoints. Cache footprint by content hash (`model_id` is a staleness column, not part of the key — ADR 0006/0018); trust native `attributionSkill`/`attributionPlugin` before reconstructing.
 - **Discovery.** Personal skills are discovered depth-1 only; many entries are symlinks managed by other tools — detect and record the target, don't assume skillmon owns them.
+- **No superpowers skills in this project.** The `superpowers` plugin is disabled for this repo in `.claude/settings.json`; do not invoke any `superpowers:*` skill here. Use Matt Pocock's skills for planning and domain modeling instead. Decisions are recorded as ADRs (`docs/adr/`); pending work is tracked as GitHub issues (label `ready-for-agent`), not in standalone plan files.
 
 ## Verification
 

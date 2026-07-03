@@ -31,3 +31,12 @@ Implementing the extraction against real transcripts on this machine found the a
 
 - Anchor extraction on `names[i]` sequentially (find `- {names[i]}` at or after the cursor left by `names[i-1]`'s match, next name's start is this entry's end) rather than a bare `\n- ` scan. On today's real data the two approaches agree, but the `\n- ` heuristic would break silently on a future skill whose own description contains a markdown sub-list; the `names` array doesn't have that failure mode.
 - Not every entry is `- {name}: {description}` — a skill with no frontmatter `description` renders as a bare `- {name}` with no colon and no trailing text (observed: `plan-tune`, `qa-only`, `review`, several others in the real listing). Extraction must not assume a colon is always present.
+
+## Update (transcript search scope depends on skill type)
+
+Which transcripts to search for a skill's rendered bullet depends on the skill's type, because a skill can only ever render in a session where it was co-resident:
+
+- **Personal skills and user-scoped plugin skills** search across *all* known repos' transcripts (most-recently-modified first), since they can appear in any repo's session.
+- **Project skills and project/local-scoped plugin skills** search *only their own repo's* transcripts, since that is the only place they can ever render.
+
+The repo set comes from `discovery::transcript::enumerate_known_repos`, and the active-repo gate is the same one ADR 0015 uses for plugin liveness. A skill absent from every transcript in its scope falls back to the reconstructed line above.
