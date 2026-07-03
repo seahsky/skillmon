@@ -25,10 +25,17 @@ pub struct Frontmatter {
 pub struct DiscoveredSkill {
     pub id: SkillId,
     pub dir_path: PathBuf,
+    /// Populated by discovery; read by the reversible mutation ops (ADR 0007)
+    /// in a later plan, not by discovery or footprint.
+    #[allow(dead_code)]
     pub skill_md_path: PathBuf,
     pub frontmatter: Frontmatter,
     pub body: String,
+    /// Populated by discovery; consumed by symlink-aware disable/uninstall
+    /// (ADR 0007) and a UI "managed elsewhere" badge in a later plan.
+    #[allow(dead_code)]
     pub is_symlink: bool,
+    #[allow(dead_code)]
     pub symlink_target: Option<PathBuf>,
     pub on_demand_files: Vec<PathBuf>,
     pub live: bool,
@@ -43,6 +50,8 @@ impl DiscoveredSkill {
         }
     }
 
+    /// Read by a UI "directory name ≠ declared name" badge in a later plan.
+    #[allow(dead_code)]
     pub fn name_mismatch(&self) -> bool {
         self.directory_name() != self.frontmatter.declared_name
     }

@@ -3,9 +3,11 @@ pub mod footprint_text;
 pub mod frontmatter;
 pub mod paths;
 pub mod settings;
+pub mod watcher;
 
 use crate::domain::footprint::{AlwaysOnFootprint, Footprint, LayerCount, TokenSource};
 use crate::domain::harness::HarnessAdapter;
+use crate::domain::report::{ScanReport, SkillReport};
 use crate::domain::skill::{DiscoveredSkill, DiscoveryResult, SkillId};
 use crate::footprint::api_key_store::ApiKeyStore;
 use crate::footprint::cache::TokenCache;
@@ -14,8 +16,9 @@ use crate::footprint::count_tokens_client::CountTokensClient;
 use discovery::plugin::{discover_plugin_skills, parse_installed_plugins};
 use discovery::project::discover_project_skills;
 use discovery::transcript::{enumerate_known_repos, find_active_repo, RepoInfo};
+use footprint_text::{always_on_text_from_index, transcript_refs_by_recency, AlwaysOnText, ListingIndex};
 use settings::is_plugin_live;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// ADR 0018: the single fixed model `count_tokens` is called against,
@@ -129,20 +132,26 @@ impl ClaudeCodeAdapter {
         result
     }
 
+    /// Single-skill footprint: reads transcripts directly for the always-on
+    /// text. Fine for a one-off recompute, but a full scan uses the batched
+    /// `scan_all` override instead, which reads each transcript once rather
+    /// than once per skill.
     pub fn compute_footprint(&self, skill: &DiscoveredSkill) -> Footprint {
         let known_repos = enumerate_known_repos(&self.claude_home);
         let search_dirs = self.always_on_search_dirs(skill, &known_repos);
-
         let always_on = footprint_text::always_on_text(skill, &search_dirs);
+        self.footprint_with_always_on(skill, always_on)
+    }
+
+    /// Counts the on-invoke and on-demand layers (which never touch
+    /// transcripts) and combines them with an already-resolved always-on text.
+    /// Shared by the single-skill and batched-scan paths so they can't drift.
+    fn footprint_with_always_on(&self, skill: &DiscoveredSkill, always_on: AlwaysOnText) -> Footprint {
         let always_on_count = self.count(&always_on.text);
-
-        let on_invoke_text = footprint_text::on_invoke_text(skill);
-        let on_invoke_count = self.count(&on_invoke_text);
-
+        let on_invoke_count = self.count(&footprint_text::on_invoke_text(skill));
         let on_demand_count = sum_layer_counts(
             footprint_text::on_demand_file_texts(skill).into_iter().map(|(_, text)| self.count(&text)),
         );
-
         Footprint {
             always_on: AlwaysOnFootprint { count: always_on_count, confidence: always_on.confidence },
             on_invoke: on_invoke_count,
@@ -153,6 +162,28 @@ impl ClaudeCodeAdapter {
     fn count(&self, text: &str) -> LayerCount {
         count_text(text, &self.cache, self.api_key_store.as_ref(), self.client.as_ref(), REFERENCE_MODEL_ID)
     }
+
+    /// Reconciles the registry watcher's path set against the repos currently
+    /// on disk (ADR 0019). Called once at startup and after every rescan, so
+    /// a repo that gained a `.claude/skills/` dir since launch starts being
+    /// watched. Keeps all `RepoInfo`/path knowledge inside the adapter (ADR
+    /// 0002) rather than leaking it to the composition root.
+    pub fn sync_watcher(&self, watcher: &mut watcher::RegistryWatcher) {
+        let known_repos = enumerate_known_repos(&self.claude_home);
+        let active_repo = find_active_repo(&self.claude_home);
+        watcher.sync(&self.claude_home, &known_repos, active_repo.as_ref());
+    }
+
+    /// How many cached exact counts were measured against a reference model
+    /// other than the current one (ADR 0018) -- i.e. skillmon bumped its
+    /// internal default since they were stored. A neutral count, not a
+    /// promise: `count_text` already declines to trust a stale exact and
+    /// re-counts it on the next `scan_all` when a key is present, so the
+    /// startup path uses this only to decide whether that recount is worth
+    /// kicking off eagerly. Never surfaces the model id itself (ADR 0018).
+    pub fn stale_exact_count(&self) -> usize {
+        self.cache.stale_exact_hashes(REFERENCE_MODEL_ID).len()
+    }
 }
 
 impl HarnessAdapter for ClaudeCodeAdapter {
@@ -162,6 +193,46 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 
     fn compute_footprint(&self, skill: &DiscoveredSkill) -> Footprint {
         ClaudeCodeAdapter::compute_footprint(self, skill)
+    }
+
+    /// Overrides the trait's naive per-skill default (which would re-read
+    /// every transcript once per skill -- tens of GB on a real machine) with a
+    /// batched pass: enumerate repos once, build the skill-listing index once
+    /// over exactly the discovered skill names, then resolve each skill's
+    /// always-on text from that index with the same type-scoped search dirs
+    /// the single-skill path uses. Result is identical, cost drops from
+    /// O(skills × transcripts) reads to O(transcripts).
+    fn scan_all(&self) -> ScanReport {
+        let discovery = ClaudeCodeAdapter::discover_skills(self);
+        let known_repos = enumerate_known_repos(&self.claude_home);
+
+        let all_project_dirs: Vec<PathBuf> = known_repos.iter().map(|r| r.project_dir.clone()).collect();
+        let wanted: HashSet<String> =
+            discovery.skills.iter().map(|s| s.directory_name().to_string()).collect();
+        let transcripts = transcript_refs_by_recency(&all_project_dirs);
+        let index = ListingIndex::build(&transcripts, &wanted);
+
+        let skills = discovery
+            .skills
+            .iter()
+            .map(|skill| {
+                let search_dirs = self.always_on_search_dirs(skill, &known_repos);
+                let always_on = always_on_text_from_index(skill, &index, &search_dirs);
+                let footprint = self.footprint_with_always_on(skill, always_on);
+                SkillReport::from_parts(skill, &footprint)
+            })
+            .collect();
+        let warnings = discovery
+            .warnings
+            .iter()
+            .map(|w| format!("{}: {}", w.path.display(), w.reason))
+            .collect();
+
+        ScanReport {
+            skills,
+            warnings,
+            active_repo_path: discovery.active_repo_path.map(|p| p.display().to_string()),
+        }
     }
 }
 
@@ -431,5 +502,156 @@ mod tests {
 
         assert_eq!(footprint.on_demand.source, TokenSource::Estimate);
         assert_eq!(footprint.on_demand.tokens, estimate_tokens("supplementary reference material"));
+    }
+
+    #[test]
+    fn scan_all_bundles_every_discovered_skill_with_its_footprint() {
+        use crate::domain::report::SkillKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        write_skill(&claude_home.join("skills").join("alpha"), "alpha");
+        write_skill(&claude_home.join("skills").join("beta"), "beta");
+
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        let report = adapter.scan_all();
+
+        assert_eq!(report.skills.len(), 2);
+        assert!(report.skills.iter().all(|s| s.kind == SkillKind::Personal));
+        let names: Vec<&str> = report.skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        // No key configured, so every layer is the estimate tier.
+        assert!(report.skills.iter().all(|s| !s.always_on.exact && !s.on_invoke.exact));
+    }
+
+    #[test]
+    fn batched_scan_all_resolves_native_always_on_like_the_per_skill_path() {
+        use crate::domain::footprint::TextConfidence;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+
+        let skill_dir = claude_home.join("skills").join("grilling");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: grilling\ndescription: Interview relentlessly.\n---\n\nBody.\n",
+        )
+        .unwrap();
+
+        // A transcript that both registers a known repo and rendered the skill's
+        // bullet, so the batched index path must return Native, not Reconstructed.
+        let project_dir = claude_home.join("projects").join("-tmp-repo");
+        fs::create_dir_all(&project_dir).unwrap();
+        let record = serde_json::json!({
+            "type": "attachment",
+            "cwd": "/tmp/some-repo",
+            "attachment": {
+                "type": "skill_listing",
+                "content": "- grilling: Interview the user relentlessly.\n- other: does other things",
+                "names": ["grilling", "other"],
+            }
+        });
+        fs::write(project_dir.join("s.jsonl"), format!("{record}\n")).unwrap();
+
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        let report = adapter.scan_all();
+
+        let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        assert!(grilling.always_on_native, "batched scan should source always-on from the transcript (Native)");
+
+        // And it agrees with the single-skill path's confidence + tokens.
+        let discovery = adapter.discover_skills();
+        let skill = discovery.skills.iter().find(|s| s.directory_name() == "grilling").unwrap();
+        let per_skill = adapter.compute_footprint(skill);
+        assert_eq!(per_skill.always_on.confidence, TextConfidence::Native);
+        assert_eq!(grilling.always_on.tokens, per_skill.always_on.count.tokens);
+    }
+
+    #[test]
+    fn stale_exact_count_is_zero_on_a_fresh_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        write_skill(&claude_home.join("skills").join("alpha"), "alpha");
+
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        adapter.scan_all();
+
+        // Nothing exact has ever been stored (no key), so nothing is stale.
+        assert_eq!(adapter.stale_exact_count(), 0);
+    }
+
+    /// Exercises the real production adapter (real keychain store, real HTTP
+    /// client, real `default_claude_home()`) against this machine's actual
+    /// `~/.claude` -- the CLAUDE.md verification bar for this flow. Not run by
+    /// the default suite (it depends on the developer's real home and, if a
+    /// key is configured, hits the network). Run by hand:
+    /// `cargo test --manifest-path src-tauri/Cargo.toml
+    /// adapters::claude_code::tests::scan_all_against_the_real_claude_home -- --ignored --exact --nocapture`
+    #[test]
+    #[ignore]
+    fn scan_all_against_the_real_claude_home() {
+        use crate::footprint::api_key_store::KeychainApiKeyStore;
+        use crate::footprint::count_tokens_client::AnthropicCountTokensClient;
+        use crate::footprint::cache::TokenCache;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = ClaudeCodeAdapter::new(
+            paths::default_claude_home(),
+            TokenCache::open(&tmp.path().join("footprint.sqlite")).unwrap(),
+            Box::new(KeychainApiKeyStore::new().unwrap()),
+            Box::new(AnthropicCountTokensClient::new()),
+        );
+
+        // Cold scan populates the content-hash cache; the second scan reuses
+        // it. Measured on a real 75-skill machine: cold ~120s (dominated by
+        // tiktoken encoding every skill's full body -- tiktoken_rs is
+        // fancy-regex-based and slow), warm ~7s. The persistent production
+        // cache (app data dir, not this test's temp file) amortizes the cold
+        // cost to once-ever per unique content (ADR 0006). Making the cold
+        // pass itself fast (a faster BPE crate, or parallel encoding vs ADR
+        // 0008's sync core) is a scoped follow-up, tracked in the plan.
+        use std::time::Instant;
+        let cold = Instant::now();
+        let report = adapter.scan_all();
+        let cold_elapsed = cold.elapsed();
+
+        let warm = Instant::now();
+        let _ = adapter.scan_all();
+        let warm_elapsed = warm.elapsed();
+
+        eprintln!(
+            "scanned {} skills; active repo: {:?}; {} warnings; {} stale exact counts",
+            report.skills.len(),
+            report.active_repo_path,
+            report.warnings.len(),
+            adapter.stale_exact_count(),
+        );
+        eprintln!("cold scan: {cold_elapsed:?}; warm (cached) scan: {warm_elapsed:?}");
+        assert!(
+            warm_elapsed < cold_elapsed,
+            "the content-hash cache must make a second scan faster than the first"
+        );
+        for skill in report.skills.iter().take(10) {
+            eprintln!(
+                "  [{:?}] {:<28} always_on={:>4} (exact={}, native={})  on_invoke={:>5}  on_demand={:>6}",
+                skill.kind,
+                skill.name,
+                skill.always_on.tokens,
+                skill.always_on.exact,
+                skill.always_on_native,
+                skill.on_invoke.tokens,
+                skill.on_demand.tokens,
+            );
+        }
+
+        // The bar: a real machine with skills installed returns a non-empty
+        // scan whose always-on layer actually measured something.
+        assert!(!report.skills.is_empty(), "expected the real ~/.claude to have at least one skill");
+        assert!(
+            report.skills.iter().any(|s| s.always_on.tokens > 0),
+            "expected at least one skill's always-on layer to count more than zero tokens"
+        );
     }
 }

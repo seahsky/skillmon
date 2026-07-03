@@ -20,7 +20,7 @@ pub enum CountTokensError {
 /// `POST /v1/messages/count_tokens`. A failed call is treated identically to
 /// "no key configured" by the caller (`footprint::compute`) -- both fall
 /// back to the calibrated estimate.
-pub trait CountTokensClient {
+pub trait CountTokensClient: Send {
     fn count_tokens(&self, text: &str, model_id: &str, api_key: &str) -> Result<u32, CountTokensError>;
 }
 

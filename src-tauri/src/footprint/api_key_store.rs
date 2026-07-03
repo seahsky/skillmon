@@ -10,11 +10,15 @@ pub struct ApiKeyStoreError(String);
 
 /// The Console API key that unlocks exact `count_tokens` counts (ADR 0006),
 /// stored in the OS keychain, never on disk (ADR 0020).
-pub trait ApiKeyStore {
+pub trait ApiKeyStore: Send {
     /// `None` covers both "no key configured" and "couldn't read the
     /// keychain" -- either way the caller falls back to the estimate tier.
     fn get(&self) -> Option<String>;
+    /// Wired to the API-key settings command (set/forget key) in a later
+    /// plan; only `get` is on the read path this plan exercises.
+    #[allow(dead_code)]
     fn set(&self, key: &str) -> Result<(), ApiKeyStoreError>;
+    #[allow(dead_code)]
     fn delete(&self) -> Result<(), ApiKeyStoreError>;
 }
 
@@ -100,5 +104,25 @@ mod tests {
         let store = FakeApiKeyStore::with_key("sk-ant-test-key");
         store.delete().unwrap();
         assert_eq!(store.get(), None);
+    }
+
+    /// Exercises the real OS keychain (ADR 0020). Not run by the default
+    /// suite -- CI/sandboxed environments have no keychain to write to.
+    /// Run by hand: `cargo test --manifest-path src-tauri/Cargo.toml
+    /// footprint::api_key_store::tests::keychain_store_round_trips_against_the_real_os_keychain -- --ignored --exact`
+    #[test]
+    #[ignore]
+    fn keychain_store_round_trips_against_the_real_os_keychain() {
+        let store = KeychainApiKeyStore::new().expect("keychain entry should be constructible");
+
+        // Clean slate in case a prior failed run left a key behind.
+        let _ = store.delete();
+        assert_eq!(store.get(), None, "expected no key before the test sets one");
+
+        store.set("sk-ant-verification-probe").expect("set should succeed");
+        assert_eq!(store.get(), Some("sk-ant-verification-probe".to_string()));
+
+        store.delete().expect("delete should succeed");
+        assert_eq!(store.get(), None, "expected no key after delete");
     }
 }

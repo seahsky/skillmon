@@ -1,6 +1,7 @@
 use crate::domain::footprint::TextConfidence;
 use crate::domain::skill::DiscoveredSkill;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -8,6 +9,128 @@ use std::time::SystemTime;
 pub struct AlwaysOnText {
     pub text: String,
     pub confidence: TextConfidence,
+}
+
+/// The literal substring a `skill_listing` attachment line always contains
+/// (`"type":"skill_listing"`, whatever the whitespace). Checked before the
+/// full `serde_json` parse so the vast majority of transcript lines -- which
+/// are ordinary messages, not skill listings -- are skipped for the price of
+/// a substring scan instead of a full JSON parse. On a real machine this is
+/// the difference between parsing ~1 line per transcript and parsing all
+/// 682 MB of them.
+const SKILL_LISTING_MARKER: &str = "skill_listing";
+
+/// A one-pass index of the most-recent rendered bullet per skill, so a full
+/// scan reads each transcript **once** instead of re-reading every transcript
+/// per skill (which on a real machine is O(skills × transcripts × bytes) --
+/// tens of GB of reads). Keyed `directory_name → project_dir → (mtime,
+/// bullet)`, keeping the most-recent bullet per `(name, repo)` so a lookup
+/// can be scoped to the repos a skill can actually render in (decision #7 /
+/// ADR 0016): personal and plugin skills look across every repo, a project
+/// skill only within its own.
+///
+/// It reads every in-scope transcript rather than stopping once each name is
+/// seen: a name's absence from a repo is not observable early, so an
+/// early-exit on global name coverage would silently drop a second repo's
+/// rendering of the same skill name (two repos each with their own `deploy`
+/// project skill) and break per-repo scoping. Reading each transcript at most
+/// once is already the decisive win; the further optimization is incremental
+/// byte-offset parsing (DESIGN.md), not a fragile early-exit.
+#[derive(Default)]
+pub struct ListingIndex {
+    by_name: HashMap<String, HashMap<PathBuf, (SystemTime, String)>>,
+}
+
+impl ListingIndex {
+    /// Single pass over `transcripts`, which **must** be ordered
+    /// most-recent-first: the first bullet seen for a `(name, repo)` is
+    /// therefore the most recent, so later hits for that pair are ignored.
+    /// Only `wanted` names are indexed, so an attachment listing 50 skills
+    /// costs work proportional to the ones actually discovered.
+    pub fn build(transcripts: &[TranscriptRef], wanted: &HashSet<String>) -> Self {
+        let mut index = ListingIndex::default();
+
+        for transcript in transcripts {
+            let Ok(content) = fs::read_to_string(&transcript.path) else { continue };
+            for line in content.lines() {
+                if !line.contains(SKILL_LISTING_MARKER) {
+                    continue;
+                }
+                let Ok(record) = serde_json::from_str::<AttachmentRecord>(line) else { continue };
+                let Some(listing) = record.attachment else { continue };
+                if listing.kind != "skill_listing" {
+                    continue;
+                }
+                for (name, bullet) in extract_all_bullets(&listing.content, &listing.names) {
+                    if !wanted.contains(&name) {
+                        continue;
+                    }
+                    let per_repo = index.by_name.entry(name).or_default();
+                    // First hit per (name, repo) wins because the input is
+                    // most-recent-first; don't overwrite with an older one.
+                    per_repo.entry(transcript.project_dir.clone()).or_insert_with(|| (transcript.mtime, bullet));
+                }
+            }
+        }
+
+        index
+    }
+
+    /// Most-recent bullet for `name` among the `allowed` project dirs. Callers
+    /// pass the skill-type-scoped dir list (`always_on_search_dirs`), so
+    /// personal/plugin skills effectively query globally and project skills
+    /// query only their own repo -- preserving the exact scoping the per-skill
+    /// path used.
+    pub fn resolve(&self, name: &str, allowed: &[PathBuf]) -> Option<&str> {
+        let per_repo = self.by_name.get(name)?;
+        allowed
+            .iter()
+            .filter_map(|dir| per_repo.get(dir))
+            .max_by_key(|(mtime, _)| *mtime)
+            .map(|(_, bullet)| bullet.as_str())
+    }
+}
+
+/// A transcript file paired with the project dir it belongs to and its mtime.
+pub struct TranscriptRef {
+    pub path: PathBuf,
+    pub project_dir: PathBuf,
+    pub mtime: SystemTime,
+}
+
+/// Always-on text for one skill resolved from a prebuilt `ListingIndex`
+/// instead of re-reading transcripts -- the batched-scan counterpart to
+/// `always_on_text`. Same native/reconstructed contract (ADR 0016).
+pub fn always_on_text_from_index(
+    skill: &DiscoveredSkill,
+    index: &ListingIndex,
+    search_project_dirs: &[PathBuf],
+) -> AlwaysOnText {
+    match index.resolve(skill.directory_name(), search_project_dirs) {
+        Some(bullet) => AlwaysOnText { text: bullet.to_string(), confidence: TextConfidence::Native },
+        None => AlwaysOnText { text: reconstruct_bullet(skill), confidence: TextConfidence::Reconstructed },
+    }
+}
+
+/// Gathers every `.jsonl` under `project_dirs`, paired with its project dir
+/// and mtime, ordered most-recent-first -- the input `ListingIndex::build`
+/// expects.
+pub fn transcript_refs_by_recency(project_dirs: &[PathBuf]) -> Vec<TranscriptRef> {
+    let mut refs: Vec<TranscriptRef> = Vec::new();
+    for dir in project_dirs {
+        let Ok(read_dir) = fs::read_dir(dir) else { continue };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                refs.push(TranscriptRef { path, project_dir: dir.clone(), mtime });
+            }
+        }
+    }
+    refs.sort_by_key(|r| std::cmp::Reverse(r.mtime));
+    refs
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +167,9 @@ fn find_rendered_bullet(directory_name: &str, search_project_dirs: &[PathBuf]) -
     for transcript_path in transcripts_by_recency(search_project_dirs) {
         let Ok(content) = fs::read_to_string(&transcript_path) else { continue };
         for line in content.lines() {
+            if !line.contains(SKILL_LISTING_MARKER) {
+                continue;
+            }
             let Ok(record) = serde_json::from_str::<AttachmentRecord>(line) else { continue };
             let Some(listing) = record.attachment else { continue };
             if listing.kind != "skill_listing" {
@@ -85,6 +211,35 @@ fn extract_bullet(content: &str, names: &[String], target: &str) -> Option<Strin
     let start = target_start?;
     let end = target_end.unwrap_or(content.len());
     Some(content[start..end].trim_end_matches('\n').to_string())
+}
+
+/// Extracts every skill's bullet from one `skill_listing` attachment in a
+/// single pass, rather than re-scanning `content` once per target name. Same
+/// anchoring as `extract_bullet` (each bullet spans from its `- {name}`
+/// marker to the next present marker), just yielding all of them at once for
+/// the index builder.
+fn extract_all_bullets(content: &str, names: &[String]) -> Vec<(String, String)> {
+    let mut starts: Vec<Option<usize>> = Vec::with_capacity(names.len());
+    let mut cursor = 0;
+    for name in names {
+        let marker = format!("- {name}");
+        match content[cursor..].find(&marker) {
+            Some(off) => {
+                let start = cursor + off;
+                starts.push(Some(start));
+                cursor = start + marker.len();
+            }
+            None => starts.push(None),
+        }
+    }
+
+    let mut bullets = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let Some(start) = starts[i] else { continue };
+        let end = starts[i + 1..].iter().flatten().next().copied().unwrap_or(content.len());
+        bullets.push((name.clone(), content[start..end].trim_end_matches('\n').to_string()));
+    }
+    bullets
 }
 
 /// The on-invoke template, confirmed stable across both the `Skill` tool and
@@ -283,6 +438,133 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result.contains(&(file_a, "context format doc".to_string())));
         assert!(result.contains(&(file_b, "adr format doc".to_string())));
+    }
+
+    fn wanted(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn extract_all_bullets_returns_every_named_bullet_in_one_pass() {
+        let content = "- alpha: does alpha\nsecond line\n- beta\n- gamma: does gamma";
+        let names = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+
+        let bullets = extract_all_bullets(content, &names);
+
+        assert_eq!(
+            bullets,
+            vec![
+                ("alpha".to_string(), "- alpha: does alpha\nsecond line".to_string()),
+                ("beta".to_string(), "- beta".to_string()),
+                ("gamma".to_string(), "- gamma: does gamma".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn index_resolves_a_wanted_skill_from_a_single_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("repo-a");
+        write_skill_listing_transcript(
+            &project_dir,
+            "s.jsonl",
+            &["grilling", "domain-modeling"],
+            "- grilling: Interview relentlessly.\n- domain-modeling: Build the model.",
+        );
+
+        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let index = ListingIndex::build(&refs, &wanted(&["grilling"]));
+
+        assert_eq!(index.resolve("grilling", &[project_dir]), Some("- grilling: Interview relentlessly."));
+    }
+
+    #[test]
+    fn index_keeps_the_most_recent_bullet_when_a_skill_appears_in_two_transcripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("repo-a");
+        write_skill_listing_transcript(&project_dir, "older.jsonl", &["grilling"], "- grilling: OLD wording");
+        sleep(Duration::from_millis(20));
+        write_skill_listing_transcript(&project_dir, "newer.jsonl", &["grilling"], "- grilling: NEW wording");
+
+        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let index = ListingIndex::build(&refs, &wanted(&["grilling"]));
+
+        assert_eq!(index.resolve("grilling", &[project_dir]), Some("- grilling: NEW wording"));
+    }
+
+    #[test]
+    fn index_resolve_is_scoped_to_the_allowed_project_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_a = tmp.path().join("repo-a");
+        let repo_b = tmp.path().join("repo-b");
+        write_skill_listing_transcript(&repo_a, "s.jsonl", &["deploy"], "- deploy: repo A wording");
+        write_skill_listing_transcript(&repo_b, "s.jsonl", &["deploy"], "- deploy: repo B wording");
+
+        let refs = transcript_refs_by_recency(&[repo_a.clone(), repo_b.clone()]);
+        let index = ListingIndex::build(&refs, &wanted(&["deploy"]));
+
+        // A project skill scoped to repo A only sees repo A's rendering.
+        assert_eq!(index.resolve("deploy", std::slice::from_ref(&repo_a)), Some("- deploy: repo A wording"));
+        assert_eq!(index.resolve("deploy", std::slice::from_ref(&repo_b)), Some("- deploy: repo B wording"));
+        // A personal skill scoped to both sees one of them (most-recent wins).
+        assert!(index.resolve("deploy", &[repo_a, repo_b]).is_some());
+    }
+
+    #[test]
+    fn index_records_a_shared_name_in_every_repo_it_renders_in() {
+        // Two repos each have their own project skill named `deploy`. The index
+        // must record both repos' renderings -- not stop after the first --
+        // so each repo's project skill resolves to its own bullet. This is the
+        // per-repo-scoping guarantee an early-exit on global name coverage
+        // would silently break.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_a = tmp.path().join("repo-a");
+        let repo_b = tmp.path().join("repo-b");
+        // repo-b's session is the most recent globally.
+        write_skill_listing_transcript(&repo_a, "s.jsonl", &["deploy"], "- deploy: repo A wording");
+        sleep(Duration::from_millis(20));
+        write_skill_listing_transcript(&repo_b, "s.jsonl", &["deploy"], "- deploy: repo B wording");
+
+        let refs = transcript_refs_by_recency(&[repo_a.clone(), repo_b.clone()]);
+        let index = ListingIndex::build(&refs, &wanted(&["deploy"]));
+
+        assert_eq!(index.resolve("deploy", &[repo_a]), Some("- deploy: repo A wording"));
+        assert_eq!(index.resolve("deploy", &[repo_b]), Some("- deploy: repo B wording"));
+    }
+
+    #[test]
+    fn index_returns_none_for_a_skill_absent_from_every_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("repo-a");
+        write_skill_listing_transcript(&project_dir, "s.jsonl", &["other"], "- other: something");
+
+        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let index = ListingIndex::build(&refs, &wanted(&["grilling"]));
+
+        assert_eq!(index.resolve("grilling", &[project_dir]), None);
+    }
+
+    #[test]
+    fn always_on_text_from_index_matches_the_per_skill_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("repo-a");
+        write_skill_listing_transcript(
+            &project_dir,
+            "s.jsonl",
+            &["grilling"],
+            "- grilling: Interview relentlessly.",
+        );
+
+        let skill = sample_skill("grilling", "fallback, unused");
+        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let index = ListingIndex::build(&refs, &wanted(&["grilling"]));
+
+        let via_index = always_on_text_from_index(&skill, &index, std::slice::from_ref(&project_dir));
+        let via_scan = always_on_text(&skill, &[project_dir]);
+
+        assert_eq!(via_index.text, via_scan.text);
+        assert_eq!(via_index.confidence, TextConfidence::Native);
+        assert_eq!(via_scan.confidence, TextConfidence::Native);
     }
 
     #[test]

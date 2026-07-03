@@ -18,6 +18,9 @@ impl TokenCache {
         Self::init(Connection::open(path)?)
     }
 
+    /// Test-only: every caller lives in a `#[cfg(test)]` block, so this is
+    /// compiled out of the shipping binary rather than flagged dead there.
+    #[cfg(test)]
     pub fn open_in_memory() -> SqliteResult<Self> {
         Self::init(Connection::open_in_memory()?)
     }
@@ -132,6 +135,24 @@ impl TokenCache {
             .optional()
             .expect("calibration lookup should not fail")
     }
+
+    /// Hashes whose cached exact value was measured against a reference
+    /// model other than `current_model_id` (ADR 0018 -- skillmon bumped its
+    /// internal default). Hashes with no exact value at all are not stale,
+    /// they're simply un-upgraded estimates.
+    pub fn stale_exact_hashes(&self, current_model_id: &str) -> Vec<String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT content_hash FROM token_cache
+                 WHERE exact_model_id IS NOT NULL AND exact_model_id != ?1",
+            )
+            .expect("stale_exact_hashes prepare should not fail");
+        stmt.query_map(params![current_model_id], |row| row.get(0))
+            .expect("stale_exact_hashes query should not fail")
+            .collect::<SqliteResult<Vec<String>>>()
+            .expect("stale_exact_hashes row mapping should not fail")
+    }
 }
 
 #[cfg(test)]
@@ -197,5 +218,31 @@ mod tests {
         let factor = cache.calibration_factor("model-a").unwrap();
         // (120 + 220) / (100 + 200) = 340 / 300
         assert!((factor - (340.0 / 300.0)).abs() < 1e-9, "expected ~1.1333, got {factor}");
+    }
+
+    #[test]
+    fn stale_exact_hashes_is_empty_when_no_rows_have_an_exact_value() {
+        let cache = TokenCache::open_in_memory().unwrap();
+        cache.put_tiktoken("hash-a", 100);
+        assert!(cache.stale_exact_hashes("model-current").is_empty());
+    }
+
+    #[test]
+    fn stale_exact_hashes_is_empty_when_every_exact_row_matches_the_current_model() {
+        let cache = TokenCache::open_in_memory().unwrap();
+        cache.put_tiktoken("hash-a", 100);
+        cache.put_exact("hash-a", 120, "model-current");
+        assert!(cache.stale_exact_hashes("model-current").is_empty());
+    }
+
+    #[test]
+    fn stale_exact_hashes_returns_rows_measured_against_a_different_model() {
+        let cache = TokenCache::open_in_memory().unwrap();
+        cache.put_tiktoken("hash-a", 100);
+        cache.put_exact("hash-a", 120, "model-old");
+        cache.put_tiktoken("hash-b", 200);
+        cache.put_exact("hash-b", 240, "model-current");
+
+        assert_eq!(cache.stale_exact_hashes("model-current"), vec!["hash-a".to_string()]);
     }
 }

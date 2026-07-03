@@ -2,21 +2,60 @@
 // Menu-bar (macOS) / system-tray (Windows) app. Domain language: ../CONTEXT.md.
 // Architecture and decisions: ../../docs/DESIGN.md, ../../docs/adr/.
 
-// no Tauri command wires these in yet
-#[allow(dead_code)]
-mod domain;
-#[allow(dead_code)]
 mod adapters;
-#[allow(dead_code)]
+mod domain;
 mod footprint;
 
-use tauri::Manager;
+use std::sync::{Arc, Mutex};
 
-// TODO(skillmon): replace this demo command with the real IPC surface
-// (list_skills, footprint, attributed_usage, disable/enable, uninstall, remove_plugin).
+use tauri::{Emitter, Manager};
+
+use adapters::claude_code::paths::default_claude_home;
+use adapters::claude_code::watcher::RegistryWatcher;
+use adapters::claude_code::ClaudeCodeAdapter;
+use domain::harness::HarnessAdapter;
+use domain::report::ScanReport;
+use footprint::api_key_store::KeychainApiKeyStore;
+use footprint::cache::TokenCache;
+use footprint::count_tokens_client::AnthropicCountTokensClient;
+
+/// The scan orchestration is synchronous (ADR 0008) and can block on file
+/// I/O or a `count_tokens` call, so it lives behind a `Mutex` and is only
+/// ever touched from the blocking pool. `Arc<Mutex<_>>` is the `Send + Sync`
+/// shape Tauri's managed state requires; `TokenCache`'s `rusqlite`
+/// connection is `Send` but not `Sync`, which is exactly why the `Mutex` is
+/// mandatory, not merely convenient.
+type SharedAdapter = Arc<Mutex<ClaudeCodeAdapter>>;
+type SharedWatcher = Arc<Mutex<RegistryWatcher>>;
+
+// TODO(skillmon): remaining IPC surface (attributed_usage, disable/enable,
+// uninstall, remove_plugin, API-key set/delete) lands with later plans.
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+/// Discover every skill and compute its three-layer footprint (ADR 0019's
+/// scan). The synchronous core runs on the blocking pool via
+/// `spawn_blocking` (footprint-counter plan decision #4) so this async
+/// command never stalls the runtime on I/O or a network call. Each scan also
+/// re-syncs the registry watcher, so a repo that appeared since the last
+/// scan starts being watched without waiting for a restart.
+#[tauri::command]
+async fn list_skills(
+    adapter: tauri::State<'_, SharedAdapter>,
+    watcher: tauri::State<'_, SharedWatcher>,
+) -> Result<ScanReport, String> {
+    let adapter = adapter.inner().clone();
+    let watcher = watcher.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let adapter = adapter.lock().expect("adapter mutex poisoned");
+        let report = adapter.scan_all();
+        adapter.sync_watcher(&mut watcher.lock().expect("watcher mutex poisoned"));
+        report
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -64,12 +103,57 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            // TODO(skillmon): apply vibrancy (macOS) / Mica (Windows 11), open the
-            // rusqlite store, start the notify file watcher over ~/.claude, and
-            // manage a shared reqwest client for count_tokens.
+            // Composition root: build the one adapter the whole app shares.
+            // The footprint cache is a single SQLite file in the app data dir
+            // (ADR 0008); the API key comes from the OS keychain (ADR 0020);
+            // count_tokens goes to the real Anthropic endpoint (ADR 0006).
+            let data_dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&data_dir)?;
+            let cache = TokenCache::open(&data_dir.join("footprint.sqlite"))?;
+            let adapter = ClaudeCodeAdapter::new(
+                default_claude_home(),
+                cache,
+                Box::new(KeychainApiKeyStore::new()?),
+                Box::new(AnthropicCountTokensClient::new()),
+            );
+
+            // ADR 0018/0019: exact counts measured against a superseded
+            // reference model are recounted on the next scan (compute
+            // self-heals a stale model). Report the count at startup so a
+            // model bump is observable rather than silent.
+            let stale = adapter.stale_exact_count();
+            if stale > 0 {
+                eprintln!(
+                    "[skillmon] {stale} cached exact footprint(s) predate the current reference model; \
+                     they will be recounted on the next scan"
+                );
+            }
+
+            let adapter: SharedAdapter = Arc::new(Mutex::new(adapter));
+
+            // Registry watcher (ADR 0019): a debounced change to any watched
+            // surface emits `registry-changed`; the UI listens and re-invokes
+            // `list_skills`. Enablement is read at session start, so this is a
+            // "your skill list may be stale" nudge, not a live-state mirror.
+            let app_handle = app.handle().clone();
+            let watcher = RegistryWatcher::new(move || {
+                let _ = app_handle.emit("registry-changed", ());
+            })?;
+            let watcher: SharedWatcher = Arc::new(Mutex::new(watcher));
+
+            // Watch the static global surfaces plus any repos already known at
+            // launch. Later scans re-sync to pick up repos that appear after.
+            adapter
+                .lock()
+                .expect("adapter mutex poisoned")
+                .sync_watcher(&mut watcher.lock().expect("watcher mutex poisoned"));
+
+            app.manage(adapter);
+            app.manage(watcher);
+
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![greet, list_skills])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

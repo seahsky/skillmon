@@ -23,6 +23,9 @@ pub struct PluginInstallRecord {
     pub plugin_at_marketplace: String,
     pub plugin: String,
     pub marketplace: String,
+    /// Install provenance; read by plugin mutation ops (disable/enable per
+    /// scope) in a later plan, not by discovery or footprint.
+    #[allow(dead_code)]
     pub scope: InstallScope,
     pub install_path: PathBuf,
 }
