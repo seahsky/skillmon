@@ -30,10 +30,6 @@ type SharedWatcher = Arc<Mutex<RegistryWatcher>>;
 
 // TODO(skillmon): remaining IPC surface (attributed_usage, disable/enable,
 // uninstall, remove_plugin, API-key set/delete) lands with later plans.
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
 
 /// Discover every skill and compute its three-layer footprint (ADR 0019's
 /// scan). The synchronous core runs on the blocking pool via
@@ -153,7 +149,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet, list_skills])
+        .invoke_handler(tauri::generate_handler![list_skills])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
