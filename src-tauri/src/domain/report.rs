@@ -94,6 +94,11 @@ pub struct ScanReport {
     pub skills: Vec<SkillReport>,
     pub warnings: Vec<String>,
     pub active_repo_path: Option<String>,
+    /// Whether an API key is configured, so the panel shows the right settings
+    /// state and, since the badges already reflect exact-vs-estimate, the whole
+    /// key-presence UI flips from one `list_skills` payload (issue #4). Only a
+    /// boolean crosses the IPC boundary; the key itself never does.
+    pub api_key_present: bool,
 }
 
 #[cfg(test)]
@@ -180,9 +185,11 @@ mod tests {
             skills: vec![],
             warnings: vec!["a warning".to_string()],
             active_repo_path: Some("/repo".to_string()),
+            api_key_present: true,
         };
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["activeRepoPath"], "/repo");
         assert_eq!(json["warnings"][0], "a warning");
+        assert_eq!(json["apiKeyPresent"], true);
     }
 }

@@ -24,8 +24,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// ADR 0018: the single fixed model `count_tokens` is called against,
-/// internal-only, never surfaced to the user.
-const REFERENCE_MODEL_ID: &str = "claude-sonnet-5";
+/// internal-only, never surfaced to the user. `pub(crate)` so the `set_api_key`
+/// command's validation probe (issue #4) uses the same model the counter does.
+pub(crate) const REFERENCE_MODEL_ID: &str = "claude-sonnet-5";
 
 pub struct ClaudeCodeAdapter {
     pub claude_home: PathBuf,
@@ -252,7 +253,12 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             skills,
             warnings,
             active_repo_path: discovery.active_repo_path.map(|p| p.display().to_string()),
+            api_key_present: self.api_key_present(),
         }
+    }
+
+    fn api_key_present(&self) -> bool {
+        self.api_key_store.get().is_some()
     }
 }
 
@@ -600,6 +606,36 @@ mod tests {
 
         // Nothing exact has ever been stored (no key), so nothing is stale.
         assert_eq!(adapter.stale_exact_count(), 0);
+    }
+
+    #[test]
+    fn scan_all_reports_no_api_key_when_none_is_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_home).unwrap();
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+
+        assert!(!adapter.scan_all().api_key_present);
+    }
+
+    #[test]
+    fn scan_all_reports_an_api_key_when_one_is_configured() {
+        use crate::footprint::api_key_store::FakeApiKeyStore;
+        use crate::footprint::cache::TokenCache;
+        use crate::footprint::count_tokens_client::FakeCountTokensClient;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_home).unwrap();
+        let adapter = ClaudeCodeAdapter::new(
+            claude_home,
+            TokenCache::open_in_memory().unwrap(),
+            SqliteListingCache::open_in_memory().unwrap(),
+            Box::new(FakeApiKeyStore::with_key("sk-ant-test")),
+            Box::new(FakeCountTokensClient::always_returns(0)),
+        );
+
+        assert!(adapter.scan_all().api_key_present);
     }
 
     /// Exercises the real production adapter (real keychain store, real HTTP

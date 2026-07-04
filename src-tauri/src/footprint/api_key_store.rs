@@ -14,11 +14,12 @@ pub trait ApiKeyStore: Send {
     /// `None` covers both "no key configured" and "couldn't read the
     /// keychain" -- either way the caller falls back to the estimate tier.
     fn get(&self) -> Option<String>;
-    /// Wired to the API-key settings command (set/forget key) in a later
-    /// plan; only `get` is on the read path this plan exercises.
-    #[allow(dead_code)]
+    /// Persist the key to the OS keychain. Driven by the `set_api_key`
+    /// command (issue #4), which validates the key with a `count_tokens`
+    /// probe before calling this, so a rejected key is never written.
     fn set(&self, key: &str) -> Result<(), ApiKeyStoreError>;
-    #[allow(dead_code)]
+    /// Forget the key. Idempotent: removing an already-absent key succeeds,
+    /// since "no key" is the desired end state either way.
     fn delete(&self) -> Result<(), ApiKeyStoreError>;
 }
 
@@ -43,25 +44,40 @@ impl ApiKeyStore for KeychainApiKeyStore {
     }
 
     fn delete(&self) -> Result<(), ApiKeyStoreError> {
-        self.entry.delete_credential().map_err(|e| ApiKeyStoreError(e.to_string()))
+        match self.entry.delete_credential() {
+            Ok(()) => Ok(()),
+            // Already absent is the desired end state, so a Remove never
+            // surfaces a spurious failure for a key that isn't there.
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(ApiKeyStoreError(e.to_string())),
+        }
     }
 }
 
 /// In-memory stand-in used by every other module's tests -- the real OS
-/// keychain is never exercised by the automated suite (see plan Task 6).
+/// keychain is never exercised by the automated suite. The `#[ignore]`d
+/// round-trip test below is the only real-keychain exercise, run by hand
+/// (ADR 0020, issue #4).
 #[cfg(test)]
 pub struct FakeApiKeyStore {
     key: std::cell::RefCell<Option<String>>,
+    fail_write: bool,
 }
 
 #[cfg(test)]
 impl FakeApiKeyStore {
     pub fn empty() -> Self {
-        Self { key: std::cell::RefCell::new(None) }
+        Self { key: std::cell::RefCell::new(None), fail_write: false }
     }
 
     pub fn with_key(key: &str) -> Self {
-        Self { key: std::cell::RefCell::new(Some(key.to_string())) }
+        Self { key: std::cell::RefCell::new(Some(key.to_string())), fail_write: false }
+    }
+
+    /// A store whose `set` always fails, to prove the failure path never leaks
+    /// the key in its error (issue #4).
+    pub fn failing_to_write() -> Self {
+        Self { key: std::cell::RefCell::new(None), fail_write: true }
     }
 }
 
@@ -72,6 +88,10 @@ impl ApiKeyStore for FakeApiKeyStore {
     }
 
     fn set(&self, key: &str) -> Result<(), ApiKeyStoreError> {
+        if self.fail_write {
+            // Deliberately does not include the key value.
+            return Err(ApiKeyStoreError("keychain write failed".to_string()));
+        }
         *self.key.borrow_mut() = Some(key.to_string());
         Ok(())
     }

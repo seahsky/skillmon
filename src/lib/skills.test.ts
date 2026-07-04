@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { formatTokens, layerDisplay, skillKey, sortSkills, type SkillReport } from "./skills";
+import {
+  estimatedLayerCount,
+  formatTokens,
+  layerDisplay,
+  normalizeApiKey,
+  skillKey,
+  sortSkills,
+  type ScanReport,
+  type SkillReport,
+} from "./skills";
 
 /** Build a SkillReport with only the fields a test cares about overridden. */
 function makeSkill(overrides: Partial<SkillReport> & { name: string }): SkillReport {
@@ -84,5 +93,59 @@ describe("layerDisplay", () => {
 
   it("prefixes an estimate with ~ so the two tiers never blend (ADR 0003/0006)", () => {
     expect(layerDisplay({ tokens: 1234, exact: false })).toBe("~1,234");
+  });
+});
+
+describe("normalizeApiKey", () => {
+  it("trims surrounding whitespace", () => {
+    expect(normalizeApiKey("  sk-ant-abc  ")).toBe("sk-ant-abc");
+  });
+
+  it("returns an empty string for an all-whitespace input", () => {
+    expect(normalizeApiKey("   \t\n")).toBe("");
+  });
+});
+
+describe("estimatedLayerCount", () => {
+  function makeReport(overrides: Partial<ScanReport>): ScanReport {
+    return { skills: [], warnings: [], activeRepoPath: null, apiKeyPresent: true, ...overrides };
+  }
+
+  it("returns 0 when no key is present, even if every layer is an estimate", () => {
+    const report = makeReport({
+      apiKeyPresent: false,
+      skills: [
+        makeSkill({
+          name: "a",
+          alwaysOn: { tokens: 1, exact: false },
+          onInvoke: { tokens: 2, exact: false },
+          onDemand: { tokens: 3, exact: false },
+        }),
+      ],
+    });
+
+    expect(estimatedLayerCount(report)).toBe(0);
+  });
+
+  it("counts only non-exact layers across all skills when a key is present", () => {
+    const report = makeReport({
+      skills: [
+        makeSkill({
+          name: "a",
+          alwaysOn: { tokens: 1, exact: true },
+          onInvoke: { tokens: 2, exact: false },
+          onDemand: { tokens: 0, exact: true },
+        }),
+        makeSkill({
+          name: "b",
+          alwaysOn: { tokens: 5, exact: false },
+          onInvoke: { tokens: 6, exact: false },
+          onDemand: { tokens: 7, exact: true },
+        }),
+      ],
+    });
+
+    // a: onInvoke estimate (1); b: alwaysOn + onInvoke estimates (2) => 3.
+    expect(estimatedLayerCount(report)).toBe(3);
   });
 });
