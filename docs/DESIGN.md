@@ -20,7 +20,7 @@ skillmon is a Tauri v2 app: a Rust core holds all domain logic, and a web UI ren
 - **Rust core** — skill discovery, footprint counting, transcript parsing and usage attribution, mutation operations (disable/uninstall/plugin removal), persistence, file-watching (registry surfaces drive rescans, content hash drives recompute, transcript freshness is checked lazily on panel open — ADR 0019), and threshold evaluation for toasts.
 - **Web UI (Svelte + TypeScript)** — the menu-bar/tray panel: the installed-skill list, footprint and usage columns, the ascending/descending sort control, and the disable/uninstall actions.
 - **Harness-adapter trait** — a Rust trait that abstracts everything agent-specific: where skills live, how to read a skill's footprint, how to parse transcripts, and how to mutate enable/disable state. v1 ships exactly one implementation, the Claude Code adapter.
-- **Data layer** — SQLite via `rusqlite` (bundled) inside the core for typed synchronous access, plus a content-hash → token-count cache (tagged exact or estimated, per ADR 0006) so footprint counting is offline in steady state.
+- **Data layer** — SQLite via `rusqlite` (bundled) inside the core for typed synchronous access, plus two persisted caches that keep a warm scan cheap: a content-hash → token-count cache (tagged exact or estimated, per ADR 0006) so footprint counting is offline in steady state, and a per-transcript `(mtime, size)` → listing-bullets memo (ADR 0022) so a warm rescan skips re-reading unchanged transcripts.
 
 ## The domain: Claude Code skills
 

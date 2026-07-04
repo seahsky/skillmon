@@ -1,6 +1,7 @@
 pub mod discovery;
 pub mod footprint_text;
 pub mod frontmatter;
+pub mod listing_cache;
 pub mod paths;
 pub mod settings;
 pub mod watcher;
@@ -17,6 +18,7 @@ use discovery::plugin::{discover_plugin_skills, parse_installed_plugins};
 use discovery::project::discover_project_skills;
 use discovery::transcript::{enumerate_known_repos, find_active_repo, RepoInfo};
 use footprint_text::{always_on_text_from_index, transcript_refs_by_recency, AlwaysOnText, ListingIndex};
+use listing_cache::SqliteListingCache;
 use settings::is_plugin_live;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -28,32 +30,35 @@ const REFERENCE_MODEL_ID: &str = "claude-sonnet-5";
 pub struct ClaudeCodeAdapter {
     pub claude_home: PathBuf,
     cache: TokenCache,
+    listing_cache: SqliteListingCache,
     api_key_store: Box<dyn ApiKeyStore>,
     client: Box<dyn CountTokensClient>,
 }
 
 impl ClaudeCodeAdapter {
-    /// Callers construct the cache/key-store/client at the composition root
+    /// Callers construct the caches/key-store/client at the composition root
     /// (e.g. Tauri's `setup` hook) and hand them in already built, so this
-    /// constructor stays infallible -- any I/O error in opening the cache or
+    /// constructor stays infallible -- any I/O error in opening a cache or
     /// resolving the keychain entry surfaces where it's actually handled.
     pub fn new(
         claude_home: PathBuf,
         cache: TokenCache,
+        listing_cache: SqliteListingCache,
         api_key_store: Box<dyn ApiKeyStore>,
         client: Box<dyn CountTokensClient>,
     ) -> Self {
-        Self { claude_home, cache, api_key_store, client }
+        Self { claude_home, cache, listing_cache, api_key_store, client }
     }
 
     /// Convenience for tests that only exercise `discover_skills` and don't
-    /// care about footprint wiring -- an in-memory cache and fakes that
+    /// care about footprint wiring -- in-memory caches and fakes that
     /// never get called.
     #[cfg(test)]
     pub fn for_discovery_only(claude_home: PathBuf) -> Self {
         Self::new(
             claude_home,
             TokenCache::open_in_memory().unwrap(),
+            SqliteListingCache::open_in_memory().unwrap(),
             Box::new(crate::footprint::api_key_store::FakeApiKeyStore::empty()),
             Box::new(crate::footprint::count_tokens_client::FakeCountTokensClient::always_returns(0)),
         )
@@ -210,7 +215,22 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         let wanted: HashSet<String> =
             discovery.skills.iter().map(|s| s.directory_name().to_string()).collect();
         let transcripts = transcript_refs_by_recency(&all_project_dirs);
-        let index = ListingIndex::build(&transcripts, &wanted);
+        let (index, _stats) = ListingIndex::build_incremental(&transcripts, &wanted, &self.listing_cache);
+        // Bound the memo: drop rows for transcripts no longer present. Keyed on
+        // every transcript this full scan enumerated, so a row is only evicted
+        // when its file is genuinely gone (ADR 0022). Safe because scan_all
+        // always enumerates the complete set, never a narrowed scope.
+        //
+        // Skip pruning entirely when the enumeration came back empty: that is
+        // far more likely a transient read failure than every transcript
+        // vanishing at once, and pruning on it would wipe the memo and re-read
+        // the whole corpus cold next scan -- the opposite of the persistence
+        // goal. A genuinely empty corpus simply keeps its (already empty) memo.
+        let seen: HashSet<String> =
+            transcripts.iter().map(|t| t.path.to_string_lossy().into_owned()).collect();
+        if !seen.is_empty() {
+            self.listing_cache.retain(&seen);
+        }
 
         let skills = discovery
             .skills
@@ -600,6 +620,7 @@ mod tests {
         let adapter = ClaudeCodeAdapter::new(
             paths::default_claude_home(),
             TokenCache::open(&tmp.path().join("footprint.sqlite")).unwrap(),
+            SqliteListingCache::open(&tmp.path().join("listing_index.sqlite")).unwrap(),
             Box::new(KeychainApiKeyStore::new().unwrap()),
             Box::new(AnthropicCountTokensClient::new()),
         );

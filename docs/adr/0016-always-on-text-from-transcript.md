@@ -40,3 +40,9 @@ Which transcripts to search for a skill's rendered bullet depends on the skill's
 - **Project skills and project/local-scoped plugin skills** search *only their own repo's* transcripts, since that is the only place they can ever render.
 
 The repo set comes from `discovery::transcript::enumerate_known_repos`, and the active-repo gate is the same one ADR 0015 uses for plugin liveness. A skill absent from every transcript in its scope falls back to the reconstructed line above.
+
+## Update (the rendered bullet is now sourced through a persisted memo)
+
+The batched scan resolves each skill's rendered bullet through a persisted per-transcript memo (`SqliteListingCache`, ADR 0022) instead of re-reading every transcript on every scan.
+The native-first contract is unchanged: the bullet is still the most-recent rendered line in scope, per-repo scoping is byte-identical, and a never-rendered skill still falls back to the reconstructed line.
+The Reconstructed-to-Native upgrade still happens on the next scan after a session renders the skill, because a render grows the transcript and the memo's `(mtime, size)` change forces a re-read.

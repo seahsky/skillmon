@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{Emitter, Manager};
 
+use adapters::claude_code::listing_cache::SqliteListingCache;
 use adapters::claude_code::paths::default_claude_home;
 use adapters::claude_code::watcher::RegistryWatcher;
 use adapters::claude_code::ClaudeCodeAdapter;
@@ -106,9 +107,16 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let cache = TokenCache::open(&data_dir.join("footprint.sqlite"))?;
+            // Sibling of footprint.sqlite: the per-transcript listing memo that
+            // makes a warm rescan skip re-reading unchanged transcripts, and
+            // survives restart so the first panel-open after login is fast too
+            // (ADR 0022). Kept in its own file because it holds Claude-Code
+            // transcript data, not harness-neutral token counts (ADR 0002).
+            let listing_cache = SqliteListingCache::open(&data_dir.join("listing_index.sqlite"))?;
             let adapter = ClaudeCodeAdapter::new(
                 default_claude_home(),
                 cache,
+                listing_cache,
                 Box::new(KeychainApiKeyStore::new()?),
                 Box::new(AnthropicCountTokensClient::new()),
             );
