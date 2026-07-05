@@ -30,12 +30,18 @@ pub struct ScanParams {
     /// the panel always injects a genuine clock (always `> 0`).
     pub now_millis: i64,
     pub usage_window: UsageWindow,
+    /// Whether the attributed-usage pass folds in sub-agent transcripts (issue
+    /// #13's include toggle). Widens only the usage refs and the totals query;
+    /// the listing index stays main-thread only regardless (grill D4).
+    pub include_subagents: bool,
 }
 
 impl ScanParams {
     /// The clockless, all-time request the trait `scan_all` delegates to.
+    /// Sub-agents excluded by default; the trait wrapper overrides this per its
+    /// own `include_subagents` argument.
     pub fn all_time() -> Self {
-        ScanParams { now_millis: 0, usage_window: UsageWindow::AllTime }
+        ScanParams { now_millis: 0, usage_window: UsageWindow::AllTime, include_subagents: false }
     }
 }
 

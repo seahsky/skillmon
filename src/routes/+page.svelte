@@ -21,6 +21,12 @@
   let error = $state<string | null>(null);
   let loading = $state(true);
 
+  // Attributed-usage scope toggle (issue #13). Off by default: the headline
+  // usage metric excludes sub-agent tokens. Flipping it re-scans with the
+  // sub-agent transcripts folded in — a backend re-scan param, never a
+  // frontend filter, since the tokens must come from the deduped store.
+  let includeSubagents = $state(false);
+
   // API-key settings (issue #4). The panel is a view-swap: the gear replaces
   // the skill table with a settings pane, never a modal on this small surface.
   let view = $state<"table" | "settings">("table");
@@ -54,7 +60,7 @@
     loading = true;
     error = null;
     try {
-      report = await invoke<ScanReport>("list_skills", { usageWindowHours: windowHours });
+      report = await invoke<ScanReport>("list_skills", { includeSubagents, usageWindowHours: windowHours });
     } catch (e) {
       error = String(e);
     } finally {
@@ -158,7 +164,8 @@
       : `${base}. Always-on text reconstructed from frontmatter; no session has listed this skill yet`;
   }
 
-  function onDemandTitle(layer: LayerReport): string {
+  function onDemandTitle(layer: LayerReport | null): string {
+    if (layer === null) return "Computing on-demand ceiling…";
     const base = "Ceiling: raw size of bundled references, loaded only if the body reads them";
     return layer.exact ? base : `${base} (calibrated estimate)`;
   }
@@ -168,9 +175,13 @@
     // The registry watcher (ADR 0019) fires this when a skill/plugin surface
     // changes; re-scan so the list doesn't go stale. Enablement is read at
     // session start, so this is a freshness nudge, not a live-state mirror.
-    const unlisten = listen("registry-changed", () => load());
+    const unlistenRegistry = listen("registry-changed", () => load());
+    // The background on-demand fill (issue #11) fires this once it has computed
+    // the pending ceilings; re-scan so the "…" cells resolve to real numbers.
+    const unlistenOnDemand = listen("on-demand-ready", () => load());
     return () => {
-      unlisten.then((off) => off());
+      unlistenRegistry.then((off) => off());
+      unlistenOnDemand.then((off) => off());
     };
   });
 </script>
@@ -295,6 +306,21 @@
             title="Show attributed usage from the last 24 hours"
           >Last 24h</button>
         </div>
+        <label
+          class="subagents-toggle"
+          title="Include sub-agent usage. Only sub-agents that themselves invoked a skill are credited; the rest are dropped."
+        >
+          <input
+            type="checkbox"
+            checked={includeSubagents}
+            disabled={loading}
+            onchange={(e) => {
+              includeSubagents = e.currentTarget.checked;
+              load();
+            }}
+          />
+          Sub-agents
+        </label>
         <button class="rescan" onclick={load} disabled={loading} title="Rescan now">
           {loading ? "Scanning…" : "Rescan"}
         </button>
@@ -375,7 +401,11 @@
 
             {@render layerCell(skill.alwaysOn, alwaysOnTitle(skill), !skill.alwaysOnNative)}
             {@render layerCell(skill.onInvoke, layerTitle(skill.onInvoke))}
-            {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand))}
+            {#if skill.onDemand === null}
+              <div class="col num pending" role="cell" title={onDemandTitle(null)}>…</div>
+            {:else}
+              {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand))}
+            {/if}
           </div>
         {/each}
       </div>
@@ -472,6 +502,23 @@
   }
   .window-toggle .seg.active:hover:not(:disabled) {
     color: #fff;
+  }
+
+  /* Sub-agent usage scope toggle (issue #13): a demoted, muted control that
+     sits alongside Rescan, matching the demoted framing of the usage metric
+     it widens. */
+  .subagents-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .subagents-toggle input {
+    margin: 0;
+    cursor: pointer;
   }
 
   button {
@@ -632,6 +679,11 @@
   /* An estimate is muted and marked; it never blends with an exact count. */
   .col.num.estimate {
     color: var(--estimate-fg);
+  }
+  /* On-demand ceiling still being computed off the interactive scan (issue
+     #11): a faint ellipsis, never a 0 that would read as a resolved ceiling. */
+  .col.num.pending {
+    color: var(--faint);
   }
   /* Always-on text reconstructed from frontmatter (no transcript yet). */
   .col.num.reconstructed {
