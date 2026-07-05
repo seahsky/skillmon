@@ -4,6 +4,11 @@ use std::path::Path;
 /// Content-addressed: one row per `content_hash`, no skill or layer in the
 /// key (ADR 0006 + ADR 0018 -- there is only ever one live reference model,
 /// so `exact_model_id` is a staleness-check column, not part of the key).
+///
+/// `tiktoken_count` keeps its name for cache/schema stability, but since the
+/// issue #2 swap it holds the `bpe-openai` `o200k` estimate, which is
+/// byte-for-byte identical to the old `tiktoken-rs` value (ADR 0006 update),
+/// so no migration or cache wipe was needed.
 pub struct CachedEntry {
     pub tiktoken_count: u32,
     pub exact: Option<(u32, String)>,

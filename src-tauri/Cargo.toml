@@ -27,7 +27,11 @@ tauri-plugin-notification = "2"
 serde_yaml_ng = "0.10"
 thiserror = "2"
 dirs = "6"
-tiktoken-rs = "0.12"
+# Estimate tokenizer (ADR 0006). bpe-openai's o200k_base is a linear-time BPE
+# that is byte-for-byte identical to tiktoken-rs's o200k_base (asserted by the
+# exact-parity oracle test in `tokenizer.rs`) but without the fancy-regex
+# backtracking cost. Pinned exact: any bump must re-run the parity oracle.
+bpe-openai = "=0.3.0"
 sha2 = "0.11"
 rusqlite = { version = "0.40", features = ["bundled"] }
 reqwest = { version = "0.13", features = ["blocking", "json"] }
@@ -44,3 +48,6 @@ tauri-plugin-single-instance = "2"
 [dev-dependencies]
 tempfile = "3"
 mockito = "1"
+# Kept only as the authoring-time oracle for the estimate-tokenizer parity test
+# (ADR 0006). Never linked into the shipping binary.
+tiktoken-rs = "0.12"

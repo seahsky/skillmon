@@ -605,13 +605,15 @@ mod tests {
         );
 
         // Cold scan populates the content-hash cache; the second scan reuses
-        // it. Measured on a real 75-skill machine: cold ~120s (dominated by
-        // tiktoken encoding every skill's full body -- tiktoken_rs is
-        // fancy-regex-based and slow), warm ~7s. The persistent production
-        // cache (app data dir, not this test's temp file) amortizes the cold
-        // cost to once-ever per unique content (ADR 0006). Making the cold
-        // pass itself fast (a faster BPE crate, or parallel encoding vs ADR
-        // 0008's sync core) is a scoped follow-up, tracked in the plan.
+        // it. The often-quoted "~120s cold" was a *debug-build* artifact of
+        // running this ignored test under `cargo test`; in release the same
+        // real corpus (216 MB, 72M tokens) tokenizes in ~11s with tiktoken and
+        // ~6.5s since the swap to bpe-openai (ADR 0006 update, issue #2). Nearly
+        // all of that volume is the on-demand ceiling (bundled reference files),
+        // not the skill bodies; deferring on-demand tokenization off the
+        // interactive scan is tracked separately as a follow-up issue. The
+        // persistent production cache (app data dir, not this test's temp file)
+        // still amortizes the cold cost to once-ever per unique content.
         use std::time::Instant;
         let cold = Instant::now();
         let report = adapter.scan_all();

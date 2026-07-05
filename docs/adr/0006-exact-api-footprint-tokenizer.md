@@ -24,6 +24,7 @@ The estimate is not a rare transient fallback; it is the real default experience
 If the user has supplied a Console `ANTHROPIC_API_KEY` (their own, entered explicitly in skillmon — never read from Claude Code's credential store), the headline is the exact `count_tokens` value, cached by content hash (`sha256(canonical content)`; `model_id` is a staleness-check column, not part of the key — see Update below).
 Call the REST endpoint directly from the Rust core with `reqwest` (`x-api-key`, `anthropic-version: 2023-06-01`) on a cache miss only; steady state is fully offline.
 Without a key, every footprint is `tiktoken-rs` `o200k_base` multiplied by a locally computed calibration factor (`Σ api_tokens / Σ tiktoken_tokens` over the user's own skills, once any are exact — otherwise uncalibrated), flagged `token_source = heuristic_estimate` and never silently occupying the headline slot as if it were exact.
+(Superseded by the issue #2 update below: the estimate tokenizer is now `bpe-openai`'s byte-for-byte-identical `o200k_base`, not `tiktoken-rs`.)
 Headline = always-on (per ADR 0016) + on-invoke (body); bundled files are a separate on-demand ceiling.
 
 ## Consequences
@@ -54,3 +55,26 @@ Neither is fixed here; both are scoped follow-ups because the fix is a real deci
 ## Update (cache key is the content hash alone, not hash+model)
 
 Implementing the cache collapsed the compound `(hash, model_id)` key this ADR proposed down to a single `content_hash` primary key, with `exact_model_id` demoted to an ordinary column checked for staleness (`src-tauri/src/footprint/cache.rs`). The reason is ADR 0018: skillmon pins one internal reference model at a time, so there is only ever one live exact model for a given hash — a compound key could never hold a second row that mattered. One row per hash also lets the same row serve both tiers: an always-present `tiktoken_count` column feeds both the raw estimate and the calibration math, so there are no duplicate tiktoken-only rows to keep in sync. Staleness after a reference-model bump is handled by ADR 0019's fourth trigger (`TokenCache::stale_exact_hashes`), not by widening the key.
+
+## Update (issue #2: bpe-openai is the estimate engine; the "~120s cold" was a debug artifact)
+
+The tokenizer named in the Decision above and in the first Update is superseded.
+The production estimate engine is now `bpe-openai`'s `o200k_base` (pinned `=0.3.0`), not `tiktoken-rs`, which is demoted to an authoring-time dev-dependency serving only as the parity oracle.
+
+The swap is safe because the two are byte-for-byte identical on `o200k_base`.
+Measured on a real `~/.claude` (216 MB, 72.3M tokens across 14,172 files): zero count mismatches and identical totals, across every skill body and a corpus of pretokenization edge cases (digit runs, contractions, whitespace before newline, CJK, emoji, base64, literal special-token spellings).
+This exactness matters most for the no-key majority, whose headline is the raw estimate with no calibration factor to absorb any drift, so the bar is exact equality rather than "within calibration tolerance."
+Both parity checks are permanent tests in `src-tauri/src/footprint/tokenizer.rs`; any `bpe-openai` bump must re-run the oracle.
+
+The first Update's "~120s cold" figure was a debug-build artifact of the `#[ignore]`d `scan_all_against_the_real_claude_home` test run under `cargo test`.
+In release the same corpus tokenizes in about 11.1s with `tiktoken-rs` and about 6.5s with `bpe-openai` (1.72x), a real but modest win rather than the 10-to-100x the first Update speculated.
+Nearly all of that token volume is the on-demand ceiling (the bundled reference files, about 72M of the 72M tokens), not the low hundreds of skill bodies.
+On-demand is a demoted, non-headline ceiling (ADR 0017), so taking its tokenization off the interactive cold scan (compute the headline synchronously, fill the on-demand ceiling lazily into the persistent cache) is the lever that robustly reaches a sub-second interactive cold scan at any tree size.
+That deferral changes the panel's rendering (issue #1) and overlaps the warm index (issue #3), so it is filed as its own follow-up issue rather than folded into this tokenizer swap.
+
+Parallel encoding (rayon) is rejected: once on-demand is deferred, the eager headline corpus is sub-second single-threaded, so parallelism would only add a `Mutex` around the `!Sync` rusqlite `Connection` to optimize a cost that no longer exists (YAGNI).
+`bpe-openai`'s `Tokenizer` is `Sync`, so future parallelism stays cheap if ever warranted, and ADR 0008's "synchronous core" is about persistence access, not a ban on CPU parallelism.
+
+No cache invalidation is needed: because the counts are identical, every persisted `tiktoken_count` row already equals what `bpe-openai` would produce, so the warm path is unaffected and calibration stays correct.
+The `token_cache.tiktoken_count` column and `put_tiktoken` method keep their names (a rename would force a schema migration for no behavioral gain); the column now holds the `o200k` estimate from `bpe-openai`, noted in `cache.rs`.
+A tokenizer-identity guard (a `tokenizer_id` column that invalidates only rows whose tokenizer truly changed) is deliberately not added now: it would be speculative machinery for a hypothetical future tokenizer whose counts differ, a change the parity tests would catch and force at that time.
