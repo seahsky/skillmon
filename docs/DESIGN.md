@@ -20,7 +20,7 @@ skillmon is a Tauri v2 app: a Rust core holds all domain logic, and a web UI ren
 - **Rust core** — skill discovery, footprint counting, transcript parsing and usage attribution, mutation operations (disable/uninstall/plugin removal), persistence, file-watching (registry surfaces drive rescans, content hash drives recompute, transcript freshness is checked lazily on panel open — ADR 0019), and threshold evaluation for toasts.
 - **Web UI (Svelte + TypeScript)** — the menu-bar/tray panel: the installed-skill list, footprint and usage columns, the ascending/descending sort control, and the disable/uninstall actions.
 - **Harness-adapter trait** — a Rust trait that abstracts everything agent-specific: where skills live, how to read a skill's footprint, how to parse transcripts, and how to mutate enable/disable state. v1 ships exactly one implementation, the Claude Code adapter.
-- **Data layer** — SQLite via `rusqlite` (bundled) inside the core for typed synchronous access, plus a content-hash → token-count cache (tagged exact or estimated, per ADR 0006) so footprint counting is offline in steady state.
+- **Data layer** — SQLite via `rusqlite` (bundled) inside the core for typed synchronous access, plus three persisted stores that keep a warm scan cheap and correct: a content-hash → token-count cache (tagged exact or estimated, per ADR 0006) so footprint counting is offline in steady state; a per-transcript `(mtime, size)` → listing-bullets memo (ADR 0022) so a warm rescan skips re-reading unchanged transcripts; and a global `message.id`-keyed attributed-usage table (ADR 0024) written INSERT OR IGNORE so usage dedups across resume/compact copies and re-reads stay idempotent.
 
 ## The domain: Claude Code skills
 
@@ -48,6 +48,8 @@ So the exact number, cached by content hash plus model id, is available only to 
 Claude Code already computes this natively — main-thread `assistant` records carry `attributionSkill` and `attributionPlugin` — so skillmon trusts those fields where present and reconstructs a skill stack only where they are absent (sub-agent files, pre-attribution builds).
 This is a proxy for causation, not a bill: the tokens are dominated by whatever task the user was doing while the skill was open, so it is labeled "tokens during this skill," never "tokens used by it."
 Usage is split into work tokens (`input + output`, the headline), cache-write, and cache-read (which dominates 10–100× and is shown separately as "context tax / mostly cached").
+The issue #5 MVP ships native-first only, over main-thread transcripts, as cumulative all-time per-skill usage (not the rolling-24h window of UX decision #4, which stays a separate toast slice).
+The `parentUuid` reconstruction walk and the sub-agent include toggle are named follow-ups (ADR 0005 Update), consistent with the #2/#3 scope splits.
 
 ## Key data sources (under `~/.claude`, mirrored per-repo under `<repo>/.claude`)
 
@@ -90,3 +92,4 @@ Settled in the grilling pass.
 6. **Uninstall history** — tombstone: the skill leaves the active list, its history is retained under a "removed" view, and reinstalling restores continuity.
 7. **Onboarding / empty state** — the empty state names the exact scanned paths (`~/.claude/skills`, plugin cache, active repo) with a rescan button; Windows shows a one-time "drag the icon onto the taskbar to pin it" coach mark.
 8. **Dollar cost** — tokens only. No dollar figures anywhere; footprint is not a recurring bill and usage dollars would be an estimate on an estimate.
+9. **API-key settings** — a full-panel view-swap behind a topbar gear (ADR 0023). Saving a key validates it with one `count_tokens` probe, so a rejected key is reported rather than silently yielding estimates, and a rejected key is never stored. Removing a key stops new exact counts but leaves already-computed ones exact until their skill content changes. Only the key's presence, never its value, crosses to the UI.

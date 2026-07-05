@@ -1,3 +1,4 @@
+pub mod api_key_service;
 pub mod api_key_store;
 pub mod cache;
 pub mod compute;

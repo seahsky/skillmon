@@ -108,6 +108,7 @@ pub struct FakeCountTokensClient {
 enum FakeOutcome {
     Succeed(u32),
     Fail,
+    RejectUnauthorized,
 }
 
 #[cfg(test)]
@@ -118,6 +119,12 @@ impl FakeCountTokensClient {
 
     pub fn always_fails() -> Self {
         Self { outcome: FakeOutcome::Fail, call_count: std::cell::RefCell::new(0) }
+    }
+
+    /// A 401, the shape of a key Anthropic refuses -- used by the API-key
+    /// save-probe test (issue #4) to prove a rejected key is never stored.
+    pub fn always_rejects_unauthorized() -> Self {
+        Self { outcome: FakeOutcome::RejectUnauthorized, call_count: std::cell::RefCell::new(0) }
     }
 
     pub fn call_count(&self) -> u32 {
@@ -132,6 +139,9 @@ impl CountTokensClient for FakeCountTokensClient {
         match self.outcome {
             FakeOutcome::Succeed(n) => Ok(n),
             FakeOutcome::Fail => Err(CountTokensError::Request("simulated failure".to_string())),
+            FakeOutcome::RejectUnauthorized => {
+                Err(CountTokensError::UnexpectedStatus { status: 401, body: "authentication_error".to_string() })
+            }
         }
     }
 }

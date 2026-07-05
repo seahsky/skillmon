@@ -1,8 +1,11 @@
 pub mod discovery;
 pub mod footprint_text;
 pub mod frontmatter;
+pub mod listing_cache;
 pub mod paths;
 pub mod settings;
+pub mod usage;
+pub mod usage_cache;
 pub mod watcher;
 
 use crate::domain::footprint::{AlwaysOnFootprint, Footprint, LayerCount, TokenSource};
@@ -17,43 +20,53 @@ use discovery::plugin::{discover_plugin_skills, parse_installed_plugins};
 use discovery::project::discover_project_skills;
 use discovery::transcript::{enumerate_known_repos, find_active_repo, RepoInfo};
 use footprint_text::{always_on_text_from_index, transcript_refs_by_recency, AlwaysOnText, ListingIndex};
+use listing_cache::SqliteListingCache;
 use settings::is_plugin_live;
+use usage::UsageIndex;
+use usage_cache::SqliteUsageCache;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// ADR 0018: the single fixed model `count_tokens` is called against,
-/// internal-only, never surfaced to the user.
-const REFERENCE_MODEL_ID: &str = "claude-sonnet-5";
+/// internal-only, never surfaced to the user. `pub(crate)` so the `set_api_key`
+/// command's validation probe (issue #4) uses the same model the counter does.
+pub(crate) const REFERENCE_MODEL_ID: &str = "claude-sonnet-5";
 
 pub struct ClaudeCodeAdapter {
     pub claude_home: PathBuf,
     cache: TokenCache,
+    listing_cache: SqliteListingCache,
+    usage_cache: SqliteUsageCache,
     api_key_store: Box<dyn ApiKeyStore>,
     client: Box<dyn CountTokensClient>,
 }
 
 impl ClaudeCodeAdapter {
-    /// Callers construct the cache/key-store/client at the composition root
+    /// Callers construct the caches/key-store/client at the composition root
     /// (e.g. Tauri's `setup` hook) and hand them in already built, so this
-    /// constructor stays infallible -- any I/O error in opening the cache or
+    /// constructor stays infallible -- any I/O error in opening a cache or
     /// resolving the keychain entry surfaces where it's actually handled.
     pub fn new(
         claude_home: PathBuf,
         cache: TokenCache,
+        listing_cache: SqliteListingCache,
+        usage_cache: SqliteUsageCache,
         api_key_store: Box<dyn ApiKeyStore>,
         client: Box<dyn CountTokensClient>,
     ) -> Self {
-        Self { claude_home, cache, api_key_store, client }
+        Self { claude_home, cache, listing_cache, usage_cache, api_key_store, client }
     }
 
     /// Convenience for tests that only exercise `discover_skills` and don't
-    /// care about footprint wiring -- an in-memory cache and fakes that
+    /// care about footprint wiring -- in-memory caches and fakes that
     /// never get called.
     #[cfg(test)]
     pub fn for_discovery_only(claude_home: PathBuf) -> Self {
         Self::new(
             claude_home,
             TokenCache::open_in_memory().unwrap(),
+            SqliteListingCache::open_in_memory().unwrap(),
+            SqliteUsageCache::open_in_memory().unwrap(),
             Box::new(crate::footprint::api_key_store::FakeApiKeyStore::empty()),
             Box::new(crate::footprint::count_tokens_client::FakeCountTokensClient::always_returns(0)),
         )
@@ -210,7 +223,29 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         let wanted: HashSet<String> =
             discovery.skills.iter().map(|s| s.directory_name().to_string()).collect();
         let transcripts = transcript_refs_by_recency(&all_project_dirs);
-        let index = ListingIndex::build(&transcripts, &wanted);
+        let (index, _stats) = ListingIndex::build_incremental(&transcripts, &wanted, &self.listing_cache);
+        // Bound the memo: drop rows for transcripts no longer present. Keyed on
+        // every transcript this full scan enumerated, so a row is only evicted
+        // when its file is genuinely gone (ADR 0022). Safe because scan_all
+        // always enumerates the complete set, never a narrowed scope.
+        //
+        // Skip pruning entirely when the enumeration came back empty: that is
+        // far more likely a transient read failure than every transcript
+        // vanishing at once, and pruning on it would wipe the memo and re-read
+        // the whole corpus cold next scan -- the opposite of the persistence
+        // goal. A genuinely empty corpus simply keeps its (already empty) memo.
+        let seen: HashSet<String> =
+            transcripts.iter().map(|t| t.path.to_string_lossy().into_owned()).collect();
+        if !seen.is_empty() {
+            self.listing_cache.retain(&seen);
+        }
+
+        // Attributed usage (issue #5): ingest new transcript usage into the
+        // persisted, deduped store over the SAME enumeration the listing index
+        // already built, then index the totals by attribution key so each skill
+        // can look up its own.
+        usage::refresh_usage(&transcripts, &self.usage_cache);
+        let usage_index = UsageIndex::build(&self.usage_cache);
 
         let skills = discovery
             .skills
@@ -219,7 +254,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
                 let search_dirs = self.always_on_search_dirs(skill, &known_repos);
                 let always_on = always_on_text_from_index(skill, &index, &search_dirs);
                 let footprint = self.footprint_with_always_on(skill, always_on);
-                SkillReport::from_parts(skill, &footprint)
+                SkillReport::from_parts(skill, &footprint, usage_index.for_skill(skill))
             })
             .collect();
         let warnings = discovery
@@ -232,7 +267,12 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             skills,
             warnings,
             active_repo_path: discovery.active_repo_path.map(|p| p.display().to_string()),
+            api_key_present: self.api_key_present(),
         }
+    }
+
+    fn api_key_present(&self) -> bool {
+        self.api_key_store.get().is_some()
     }
 }
 
@@ -582,6 +622,37 @@ mod tests {
         assert_eq!(adapter.stale_exact_count(), 0);
     }
 
+    #[test]
+    fn scan_all_reports_no_api_key_when_none_is_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_home).unwrap();
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+
+        assert!(!adapter.scan_all().api_key_present);
+    }
+
+    #[test]
+    fn scan_all_reports_an_api_key_when_one_is_configured() {
+        use crate::footprint::api_key_store::FakeApiKeyStore;
+        use crate::footprint::cache::TokenCache;
+        use crate::footprint::count_tokens_client::FakeCountTokensClient;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_home).unwrap();
+        let adapter = ClaudeCodeAdapter::new(
+            claude_home,
+            TokenCache::open_in_memory().unwrap(),
+            SqliteListingCache::open_in_memory().unwrap(),
+            SqliteUsageCache::open_in_memory().unwrap(),
+            Box::new(FakeApiKeyStore::with_key("sk-ant-test")),
+            Box::new(FakeCountTokensClient::always_returns(0)),
+        );
+
+        assert!(adapter.scan_all().api_key_present);
+    }
+
     /// Exercises the real production adapter (real keychain store, real HTTP
     /// client, real `default_claude_home()`) against this machine's actual
     /// `~/.claude` -- the CLAUDE.md verification bar for this flow. Not run by
@@ -600,6 +671,8 @@ mod tests {
         let adapter = ClaudeCodeAdapter::new(
             paths::default_claude_home(),
             TokenCache::open(&tmp.path().join("footprint.sqlite")).unwrap(),
+            SqliteListingCache::open(&tmp.path().join("listing_index.sqlite")).unwrap(),
+            SqliteUsageCache::open(&tmp.path().join("usage.sqlite")).unwrap(),
             Box::new(KeychainApiKeyStore::new().unwrap()),
             Box::new(AnthropicCountTokensClient::new()),
         );
@@ -637,7 +710,7 @@ mod tests {
         );
         for skill in report.skills.iter().take(10) {
             eprintln!(
-                "  [{:?}] {:<28} always_on={:>4} (exact={}, native={})  on_invoke={:>5}  on_demand={:>6}",
+                "  [{:?}] {:<28} always_on={:>4} (exact={}, native={})  on_invoke={:>5}  on_demand={:>6}  usage={:?}",
                 skill.kind,
                 skill.name,
                 skill.always_on.tokens,
@@ -645,8 +718,11 @@ mod tests {
                 skill.always_on_native,
                 skill.on_invoke.tokens,
                 skill.on_demand.tokens,
+                skill.usage.map(|u| u.work),
             );
         }
+        let attributed = report.skills.iter().filter(|s| s.usage.is_some()).count();
+        eprintln!("{attributed} of {} skills have attributed usage (issue #5)", report.skills.len());
 
         // The bar: a real machine with skills installed returns a non-empty
         // scan whose always-on layer actually measured something.
@@ -654,6 +730,12 @@ mod tests {
         assert!(
             report.skills.iter().any(|s| s.always_on.tokens > 0),
             "expected at least one skill's always-on layer to count more than zero tokens"
+        );
+        // Issue #5: this machine's transcripts carry native attribution, so at
+        // least one discovered skill should have attributed work tokens.
+        assert!(
+            report.skills.iter().any(|s| s.usage.is_some_and(|u| u.work > 0)),
+            "expected at least one skill to have attributed usage from the real transcripts"
         );
     }
 }

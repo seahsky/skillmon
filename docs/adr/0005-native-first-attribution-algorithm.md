@@ -3,6 +3,7 @@
 ## Status
 
 Accepted (primary algorithm and sub-agent default settled in grilling; hierarchical roll-up deferred as an implementation detail).
+Native-first shipped in issue #5; reconstruction and the sub-agent include toggle are named follow-ups (see the Update below).
 
 ## Context
 
@@ -28,3 +29,16 @@ Dedup by `message.id` with `INSERT OR IGNORE`; parse incrementally via byte-offs
 - **Pure heuristic windowing (original brief)** — less reliable than the field Claude Code already computes; rejected as the primary path, retained only as the reconstruction fallback.
 - **Native-only** — leaves sub-agents and old builds unattributed; rejected.
 - **Native-first + reconstructed fallback + message.id dedup** — chosen.
+
+## Update (issue #5: native-first shipped; the attribution field shape corrected; two follow-ups split off)
+
+Correction to the Context above: "`attributionSkill` (null for personal skills)" is imprecise and, read literally, would zero every personal skill.
+Verified against real transcripts: it is **`attributionPlugin`** that is null for personal skills; **`attributionSkill` carries the bare directory name** for personal/project skills (e.g. `ship`, `grilling`) and the `plugin:name` form for plugin skills (e.g. `superpowers:executing-plans`, with `attributionPlugin` = `superpowers`).
+`message.id` (the dedup key) lives at `message.id`, distinct from the record-level `uuid`; usage is at `message.usage.{input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens}`.
+The join is therefore by a `(plugin, name)` key, never the directory name alone: two plugins can share a skill name (`impeccable:frontend-design` vs `frontend-design:frontend-design`), and marketplace is absent from attribution.
+
+What shipped in issue #5 is native-first only, over main-thread transcripts, deduped by `message.id`, incremental (ADR 0024).
+Two pieces are deliberately deferred as named follow-ups, mirroring the #2/#3 splits:
+
+- **`parentUuid` skill-stack reconstruction** is deferred. Measured on a real `~/.claude`: native attribution is present on 144 of 145 files, and attribution absence spans *current* Claude versions (the same builds appear in both the attributed and unattributed sets), so absence means "no skill was active," not "pre-attribution build." Walking a stack on absence would fabricate attribution Claude deliberately withheld. The reconstruction walk is a version-gated follow-up; the `attribution_source` field (`native` | `reconstructed`) reserves the seam.
+- **The sub-agent include toggle** is deferred to a follow-up (#5b). Exclude-by-default (the shipped half) is free: the enumeration never descends into `subagents/`. The toggle's hard part, crediting a sub-agent file's tokens to the skill that spawned it, is the hierarchical roll-up this ADR already defers, so it is blocked on that. When built it must be a backend `list_skills(include_subagents)` re-scan param writing `is_subagent = 1` rows into the same store, never a frontend filter.

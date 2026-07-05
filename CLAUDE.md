@@ -9,14 +9,14 @@ This file is a starting point; grow it a line at a time as the code lands and as
 
 ## Status
 
-Rust core is well underway; the first UI slice has landed. Landed in the core: skill/plugin discovery, the three-layer footprint counter (content-hash SQLite cache, `tiktoken` estimate, optional exact `count_tokens` via a keychain-stored API key), the `HarnessAdapter` trait, a debounced registry file-watcher (ADR 0019), harness-neutral scan orchestration (`scan_all`, ADR 0021), and the `list_skills` Tauri command. The tray panel (issue #1) now renders `list_skills` as a read-only three-layer list and refreshes on `registry-changed`; the `greet` command and demo page are gone. Pure UI logic lives in `src/lib/skills.ts` with Vitest coverage. Requires Rust ≥ 1.89 (the notification plugin's `notify-rust` dep).
+Rust core is well underway; the tray panel renders the footprint and a demoted usage sub-line. Landed in the core: skill/plugin discovery, the three-layer footprint counter (content-hash SQLite cache, `bpe-openai` estimate, optional exact `count_tokens` via a keychain-stored API key), the `HarnessAdapter` trait, a debounced registry file-watcher (ADR 0019), harness-neutral scan orchestration (`scan_all`, ADR 0021), the `list_skills` Tauri command, an incremental listing-index memo (issue #3, ADR 0022), the API-key `set`/`delete` commands with validate-on-save (issue #4, ADR 0023), and native-first attributed session usage (issue #5, ADR 0005/0024). The estimator swapped `tiktoken-rs` for a byte-identical, faster `bpe-openai` (issue #2, ADR 0006 update). The tray panel (issue #1) renders `list_skills` as a read-only three-layer list with a demoted "tokens during this skill" sub-line, refreshes on `registry-changed`, and has an API-key settings surface behind a gear. Pure UI logic lives in `src/lib/skills.ts` with Vitest coverage. Requires Rust ≥ 1.89 (the notification plugin's `notify-rust` dep).
 
-**Next up** is tracked as GitHub issues (`seahsky/skillmon`, label `ready-for-agent`):
+**Next up** — follow-ups that spun out of #2–#5 while implementing them (still to file as GitHub issues, label `ready-for-agent`):
 
-- [#2](https://github.com/seahsky/skillmon/issues/2) — cut the ~120s cold tokenizer cost (re-validates ADR 0006)
-- [#3](https://github.com/seahsky/skillmon/issues/3) — cut the ~7s warm per-scan cost (incremental index)
-- [#4](https://github.com/seahsky/skillmon/issues/4) — API-key settings UI + set/delete commands (was blocked by #1, now unblocked)
-- [#5](https://github.com/seahsky/skillmon/issues/5) — attributed usage, ADR 0005 (was blocked by #1, now unblocked)
+- Defer the on-demand ceiling tokenization off the interactive cold scan (from #2/#3): the real remaining cold/warm cost is the ~216 MB bundled-file read + hash, not the tokenizer or the listing index. Needs a UI "pending" affordance, so it touches the panel.
+- `parentUuid` skill-stack reconstruction for pre-attribution transcripts, version-gated (from #5). The `attribution_source` seam (`native` | `reconstructed`) is already reserved.
+- The sub-agent usage include toggle (#5b): a backend `list_skills(include_subagents)` re-scan param, blocked on ADR 0005's deferred hierarchical roll-up.
+- Smaller: `message_usage` pruning, a byte-offset tail-reader, and the rolling-24h usage window + toast budget (DESIGN.md UX #4).
 
 The post-mutation "restart Claude Code to apply" nudge is deferred until the disable/uninstall mutation ops are scoped.
 

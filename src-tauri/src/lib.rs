@@ -10,14 +10,17 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{Emitter, Manager};
 
+use adapters::claude_code::listing_cache::SqliteListingCache;
 use adapters::claude_code::paths::default_claude_home;
+use adapters::claude_code::usage_cache::SqliteUsageCache;
 use adapters::claude_code::watcher::RegistryWatcher;
-use adapters::claude_code::ClaudeCodeAdapter;
+use adapters::claude_code::{ClaudeCodeAdapter, REFERENCE_MODEL_ID};
 use domain::harness::HarnessAdapter;
 use domain::report::ScanReport;
-use footprint::api_key_store::KeychainApiKeyStore;
+use footprint::api_key_service::{self, SetKeyOutcome};
+use footprint::api_key_store::{ApiKeyStore, KeychainApiKeyStore};
 use footprint::cache::TokenCache;
-use footprint::count_tokens_client::AnthropicCountTokensClient;
+use footprint::count_tokens_client::{AnthropicCountTokensClient, CountTokensClient};
 
 /// The scan orchestration is synchronous (ADR 0008) and can block on file
 /// I/O or a `count_tokens` call, so it lives behind a `Mutex` and is only
@@ -28,8 +31,22 @@ use footprint::count_tokens_client::AnthropicCountTokensClient;
 type SharedAdapter = Arc<Mutex<ClaudeCodeAdapter>>;
 type SharedWatcher = Arc<Mutex<RegistryWatcher>>;
 
-// TODO(skillmon): remaining IPC surface (attributed_usage, disable/enable,
-// uninstall, remove_plugin, API-key set/delete) lands with later plans.
+/// The API-key settings surface (issue #4), managed SEPARATELY from the
+/// adapter on purpose. A keychain write can block on a modal OS auth dialog
+/// for an unbounded time, and a first-key scan can run for many seconds, so
+/// sharing the adapter's scan `Mutex` would let a Save freeze behind a scan
+/// and a scan freeze the whole UI behind a keychain prompt. The store here is
+/// a second stateless handle over the same keychain entry the adapter reads
+/// (same SERVICE/USERNAME), so the two stay coherent; the client is used only
+/// to validate a key on save.
+struct ApiKeySettings {
+    store: Box<dyn ApiKeyStore>,
+    client: Box<dyn CountTokensClient>,
+}
+type SharedApiKeySettings = Arc<Mutex<ApiKeySettings>>;
+
+// TODO(skillmon): remaining IPC surface (disable/enable, uninstall,
+// remove_plugin) lands with later plans.
 
 /// Discover every skill and compute its three-layer footprint (ADR 0019's
 /// scan). The synchronous core runs on the blocking pool via
@@ -52,6 +69,39 @@ async fn list_skills(
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Validate and store a user-supplied API key (issue #4). Runs on the blocking
+/// pool because both the validating `count_tokens` probe and the keychain
+/// write can block; locks only the settings `Mutex`, never the scan one, so a
+/// Save can never freeze behind an in-flight scan. Returns a `SetKeyOutcome`
+/// (stored / stored-unverified / rejected) so a mistyped key gets feedback
+/// instead of silently yielding estimates. The key never crosses back to the
+/// UI and never appears in a log or an error string.
+#[tauri::command]
+async fn set_api_key(key: String, settings: tauri::State<'_, SharedApiKeySettings>) -> Result<SetKeyOutcome, String> {
+    let settings = settings.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = settings.lock().expect("api key settings mutex poisoned");
+        api_key_service::set_api_key(&key, settings.store.as_ref(), settings.client.as_ref(), REFERENCE_MODEL_ID)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Forget the stored API key (issue #4). Idempotent, and deliberately does NOT
+/// purge already-computed exact counts from the footprint cache -- those stay
+/// true until their skill content changes (ADR 0023); removal only stops NEW
+/// exact counts.
+#[tauri::command]
+async fn delete_api_key(settings: tauri::State<'_, SharedApiKeySettings>) -> Result<(), String> {
+    let settings = settings.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = settings.lock().expect("api key settings mutex poisoned");
+        settings.store.delete().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -106,9 +156,21 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let cache = TokenCache::open(&data_dir.join("footprint.sqlite"))?;
+            // Sibling of footprint.sqlite: the per-transcript listing memo that
+            // makes a warm rescan skip re-reading unchanged transcripts, and
+            // survives restart so the first panel-open after login is fast too
+            // (ADR 0022). Kept in its own file because it holds Claude-Code
+            // transcript data, not harness-neutral token counts (ADR 0002).
+            let listing_cache = SqliteListingCache::open(&data_dir.join("listing_index.sqlite"))?;
+            // Attributed-usage store (issue #5): a third persisted sqlite file
+            // beside the footprint and listing caches, holding deduped
+            // per-message usage keyed by message.id (ADR 0024).
+            let usage_cache = SqliteUsageCache::open(&data_dir.join("usage.sqlite"))?;
             let adapter = ClaudeCodeAdapter::new(
                 default_claude_home(),
                 cache,
+                listing_cache,
+                usage_cache,
                 Box::new(KeychainApiKeyStore::new()?),
                 Box::new(AnthropicCountTokensClient::new()),
             );
@@ -144,12 +206,21 @@ pub fn run() {
                 .expect("adapter mutex poisoned")
                 .sync_watcher(&mut watcher.lock().expect("watcher mutex poisoned"));
 
+            // API-key settings (issue #4): a second, independent handle over
+            // the same keychain entry the adapter reads, managed on its own so
+            // set/delete never lock the scan Mutex (see ApiKeySettings).
+            let api_key_settings: SharedApiKeySettings = Arc::new(Mutex::new(ApiKeySettings {
+                store: Box::new(KeychainApiKeyStore::new()?),
+                client: Box::new(AnthropicCountTokensClient::new()),
+            }));
+
             app.manage(adapter);
             app.manage(watcher);
+            app.manage(api_key_settings);
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_skills])
+        .invoke_handler(tauri::generate_handler![list_skills, set_api_key, delete_api_key])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

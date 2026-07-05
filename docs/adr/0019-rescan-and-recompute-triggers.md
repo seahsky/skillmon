@@ -41,3 +41,9 @@ A fourth trigger is needed: **reference-model change**, detected by comparing th
 ## Update 2 (the rescan loop landed)
 
 The rescan loop and Tauri command layer this update deferred to now exist, and the reference-model check is wired — but as a startup **observability signal**, not a recompute engine. `ClaudeCodeAdapter::stale_exact_count()` (built on `stale_exact_hashes`) is logged when the app constructs its adapter, so a reference-model bump is visible rather than silent. No dedicated recompute sweep was needed after all: a scan already re-counts any cached exact whose `model_id` differs from the current reference model (`count_text` declines to trust a stale-model exact), so the ordinary scan path *is* the self-heal. The count only reports how many rows predate the current model. This is why the "wire the recompute sweep in later" option above was satisfied without building a separate loop (ADR 0021 covers where the scan orchestration itself lives).
+
+## Update 3 (the incremental listing memo keeps transcript freshness lazy)
+
+The incremental listing index (ADR 0022) does not change this ADR's stance that transcripts are deliberately *not* watched.
+Freshness stays lazy, evaluated on the next `scan_all` (a panel reopen or a registry-change rescan); the persisted `(mtime, size)` memo only makes that lazy check cheap by skipping the re-read of unchanged transcripts.
+No continuous transcript watcher is added, so the third leg of the rescan model is intact.
