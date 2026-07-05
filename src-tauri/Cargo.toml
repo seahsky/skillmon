@@ -32,6 +32,10 @@ dirs = "6"
 # exact-parity oracle test in `tokenizer.rs`) but without the fancy-regex
 # backtracking cost. Pinned exact: any bump must re-run the parity oracle.
 bpe-openai = "=0.3.0"
+# RFC3339 transcript-timestamp parsing for the rolling-24h window (issue #14).
+# Already a transitive dep at 0.3.53 in Cargo.lock; the `parsing` feature only
+# turns on `OffsetDateTime::parse`/`Rfc3339`, it pulls no new crate.
+time = { version = "0.3", features = ["parsing"] }
 sha2 = "0.11"
 rusqlite = { version = "0.40", features = ["bundled"] }
 reqwest = { version = "0.13", features = ["blocking", "json"] }

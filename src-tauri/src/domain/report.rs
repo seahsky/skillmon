@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::footprint::{Footprint, TextConfidence, TokenSource};
 use super::skill::{DiscoveredSkill, SkillId};
@@ -131,6 +131,25 @@ pub struct ScanReport {
     /// key-presence UI flips from one `list_skills` payload (issue #4). Only a
     /// boolean crosses the IPC boundary; the key itself never does.
     pub api_key_present: bool,
+    /// Which window the per-skill `usage` figures cover: `None` = all-time
+    /// (issue #5's shipped cumulative numbers, the default view), `Some(24)` =
+    /// the last 24h. Lets the panel label the usage sub-line honestly (issue
+    /// #14). The 24h budget toast is independent of this and always 24h.
+    pub usage_window_hours: Option<u32>,
+}
+
+/// The user-configurable usage-toast settings (issue #14), round-tripped by the
+/// `get_usage_settings` / `set_usage_settings` commands. Deserialized on the way
+/// in, so it derives `Deserialize` unlike the other read-only report DTOs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSettings {
+    /// The rolling-24h attributed-work budget toast, on by default.
+    pub budget_enabled: bool,
+    /// The attributed work-token ceiling per 24h.
+    pub budget_work_tokens: u64,
+    /// Per-skill anomaly toasts, off by default (DESIGN.md UX #4).
+    pub anomaly_enabled: bool,
 }
 
 #[cfg(test)]
@@ -239,10 +258,40 @@ mod tests {
             warnings: vec!["a warning".to_string()],
             active_repo_path: Some("/repo".to_string()),
             api_key_present: true,
+            usage_window_hours: None,
         };
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["activeRepoPath"], "/repo");
         assert_eq!(json["warnings"][0], "a warning");
         assert_eq!(json["apiKeyPresent"], true);
+    }
+
+    #[test]
+    fn scan_report_serializes_usage_window_hours() {
+        let all_time = ScanReport {
+            skills: vec![],
+            warnings: vec![],
+            active_repo_path: None,
+            api_key_present: false,
+            usage_window_hours: None,
+        };
+        // All-time serializes as an explicit null, not an omitted key, so the
+        // panel can distinguish "all-time" from a malformed payload.
+        assert_eq!(serde_json::to_value(&all_time).unwrap()["usageWindowHours"], serde_json::Value::Null);
+
+        let windowed = ScanReport { usage_window_hours: Some(24), ..all_time };
+        assert_eq!(serde_json::to_value(&windowed).unwrap()["usageWindowHours"], 24);
+    }
+
+    #[test]
+    fn usage_settings_round_trips_camel_case() {
+        let settings = UsageSettings { budget_enabled: true, budget_work_tokens: 250_000, anomaly_enabled: false };
+        let json = serde_json::to_value(settings).unwrap();
+        assert_eq!(json["budgetEnabled"], true);
+        assert_eq!(json["budgetWorkTokens"], 250_000);
+        assert_eq!(json["anomalyEnabled"], false);
+        // The set command deserializes the same shape back.
+        let back: UsageSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(back, settings);
     }
 }

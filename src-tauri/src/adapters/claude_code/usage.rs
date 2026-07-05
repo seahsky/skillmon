@@ -1,5 +1,5 @@
 use super::footprint_text::{mtime_nanos, TranscriptRef};
-use super::usage_cache::{SqliteUsageCache, UsageRow};
+use super::usage_cache::{SqliteUsageCache, UsageRow, UsageTotal};
 use crate::domain::report::{AttributionSource, UsageReport};
 use crate::domain::skill::{DiscoveredSkill, SkillId};
 use serde::Deserialize;
@@ -21,7 +21,21 @@ struct UsageRecord {
     attribution_plugin: Option<String>,
     #[serde(rename = "isSidechain", default)]
     is_sidechain: bool,
+    /// The record's top-level RFC3339 timestamp (`"...Z"`, ms precision UTC).
+    /// Optional so a record without one parses instead of failing (issue #14).
+    #[serde(default)]
+    timestamp: Option<String>,
     message: Option<UsageMessage>,
+}
+
+/// Parses a transcript record's RFC3339 timestamp to unix epoch millis, e.g.
+/// `2026-06-27T02:13:52.480Z` -> `1782526432480`. `None` for a malformed value
+/// so the caller can fall back to 0 (oldest) rather than drop the row.
+pub fn parse_iso8601_millis(s: &str) -> Option<i64> {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+    let odt = OffsetDateTime::parse(s, &Rfc3339).ok()?;
+    i64::try_from(odt.unix_timestamp_nanos() / 1_000_000).ok()
 }
 
 #[derive(Deserialize)]
@@ -73,6 +87,9 @@ pub fn parse_usage_rows(content: &str) -> Vec<UsageRow> {
             work: usage.input_tokens.saturating_add(usage.output_tokens),
             cache_write: usage.cache_creation_input_tokens,
             cache_read: usage.cache_read_input_tokens,
+            // Missing/malformed timestamp -> 0 (oldest); never drop the row, so
+            // it still counts all-time and just never lands in a recent window.
+            timestamp_millis: record.timestamp.as_deref().and_then(parse_iso8601_millis).unwrap_or(0),
         });
     }
     rows
@@ -167,10 +184,11 @@ pub fn refresh_usage(transcripts: &[TranscriptRef], cache: &SqliteUsageCache) ->
 /// The per-attribution totals folded into a lookup keyed by the join key, so
 /// `scan_all` can attach each discovered skill's usage. Attribution strings
 /// with no matching discovered skill simply never get looked up (dropped, not
-/// fabricated).
-fn usage_by_key(cache: &SqliteUsageCache) -> HashMap<UsageKey, UsageReport> {
+/// fabricated). Takes the totals rather than the cache so the all-time and
+/// windowed index builders share one folding path (issue #14).
+fn usage_by_key(totals: Vec<UsageTotal>) -> HashMap<UsageKey, UsageReport> {
     let mut map: HashMap<UsageKey, UsageReport> = HashMap::new();
-    for total in cache.totals() {
+    for total in totals {
         let key = UsageKey::from_attribution(&total.attribution_skill, total.attribution_plugin.as_deref());
         let entry = map.entry(key).or_insert(UsageReport {
             work: 0,
@@ -191,8 +209,17 @@ pub struct UsageIndex {
 }
 
 impl UsageIndex {
+    /// All-time per-skill usage (issue #5): the shipped cumulative figures.
     pub fn build(cache: &SqliteUsageCache) -> Self {
-        UsageIndex { by_key: usage_by_key(cache) }
+        UsageIndex { by_key: usage_by_key(cache.totals()) }
+    }
+
+    /// Per-skill usage restricted to records at or after `cutoff_millis` (issue
+    /// #14): the rolling-window counterpart, same folding, only the totals
+    /// query is bounded. A record with a 0 timestamp (unparseable) never lands
+    /// in a positive-cutoff window.
+    pub fn build_windowed(cache: &SqliteUsageCache, cutoff_millis: i64) -> Self {
+        UsageIndex { by_key: usage_by_key(cache.totals_since(cutoff_millis)) }
     }
 
     /// This skill's attributed usage, or `None` if no session touched it.
@@ -238,6 +265,15 @@ mod tests {
         if let Some(p) = plugin {
             rec["attributionPlugin"] = json!(p);
         }
+        rec.to_string()
+    }
+
+    /// An assistant line carrying a top-level RFC3339 `timestamp`, built on the
+    /// base fixture so only the timestamp field is added (issue #14).
+    fn assistant_line_at(message_id: &str, skill: &str, timestamp: &str, work: u32) -> String {
+        let mut rec: serde_json::Value =
+            serde_json::from_str(&assistant_line(message_id, "u", Some(skill), None, work, 0, 0, 0)).unwrap();
+        rec["timestamp"] = json!(timestamp);
         rec.to_string()
     }
 
@@ -453,5 +489,51 @@ mod tests {
         assert_eq!(stats.files_read, 1, "only the depth-1 main.jsonl is enumerated, never the subagents/ file");
         let total = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(total, 10, "the sub-agent file's 999 tokens are excluded by default");
+    }
+
+    #[test]
+    fn parse_iso8601_millis_golden_values() {
+        assert_eq!(parse_iso8601_millis("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_iso8601_millis("1970-01-01T00:00:01.500Z"), Some(1500));
+        assert_eq!(parse_iso8601_millis("2000-01-01T00:00:00Z"), Some(946_684_800_000));
+        assert_eq!(parse_iso8601_millis("2020-01-01T00:00:00Z"), Some(1_577_836_800_000));
+        assert_eq!(parse_iso8601_millis("2026-06-27T02:13:52.480Z"), Some(1_782_526_432_480));
+        assert_eq!(parse_iso8601_millis("not-a-timestamp"), None, "garbage -> None, never a bogus millis");
+        assert_eq!(parse_iso8601_millis(""), None);
+    }
+
+    #[test]
+    fn parses_timestamp_from_an_assistant_record() {
+        let rows = parse_usage_rows(&assistant_line_at("m1", "grilling", "2026-06-27T02:13:52.480Z", 10));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].timestamp_millis, 1_782_526_432_480);
+    }
+
+    #[test]
+    fn a_record_without_a_timestamp_defaults_to_zero_not_dropped() {
+        // The base fixture carries no top-level timestamp.
+        let rows = parse_usage_rows(&assistant_line("m1", "u1", Some("grilling"), None, 10, 0, 0, 0));
+        assert_eq!(rows.len(), 1, "a timestamp-less record is still counted, never dropped");
+        assert_eq!(rows[0].timestamp_millis, 0, "it degrades to 0 (oldest)");
+    }
+
+    #[test]
+    fn a_malformed_timestamp_defaults_to_zero() {
+        let rows = parse_usage_rows(&assistant_line_at("m1", "grilling", "yesterday-ish", 10));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].timestamp_millis, 0, "an unparseable timestamp degrades to 0, row kept");
+    }
+
+    #[test]
+    fn windowed_index_credits_only_in_window_usage() {
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        cache.ingest(&parse_usage_rows(&assistant_line_at("old", "grilling", "2020-01-01T00:00:00Z", 100)));
+        cache.ingest(&parse_usage_rows(&assistant_line_at("new", "grilling", "2026-06-27T02:13:52.480Z", 40)));
+        let g = skill(SkillId::Personal { name: "grilling".to_string() });
+
+        // All-time sees both; a cutoff between the two records sees only the recent one.
+        assert_eq!(UsageIndex::build(&cache).for_skill(&g).unwrap().work, 140);
+        let cutoff = 1_600_000_000_000; // 2020-09, after the old record, before the new one
+        assert_eq!(UsageIndex::build_windowed(&cache, cutoff).for_skill(&g).unwrap().work, 40);
     }
 }

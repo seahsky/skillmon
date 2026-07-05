@@ -8,9 +8,14 @@ pub mod usage;
 pub mod usage_cache;
 pub mod watcher;
 
+use crate::domain::budget::{
+    detect_anomaly, evaluate_budget, BudgetConfig, ToastRequest, ANOMALY_WINDOW_DAYS, DEFAULT_ANOMALY_FLOOR,
+    DEFAULT_ANOMALY_MULTIPLIER, DEFAULT_BUDGET_WORK_TOKENS,
+};
 use crate::domain::footprint::{AlwaysOnFootprint, Footprint, LayerCount, TokenSource};
 use crate::domain::harness::HarnessAdapter;
-use crate::domain::report::{ScanReport, SkillReport};
+use crate::domain::report::{ScanReport, SkillReport, UsageSettings};
+use crate::domain::scan::{ScanOutcome, ScanParams, UsageWindow, DAY_MILLIS, HOUR_MILLIS};
 use crate::domain::skill::{DiscoveredSkill, DiscoveryResult, SkillId};
 use crate::footprint::api_key_store::ApiKeyStore;
 use crate::footprint::cache::TokenCache;
@@ -23,7 +28,9 @@ use footprint_text::{always_on_text_from_index, transcript_refs_by_recency, Alwa
 use listing_cache::SqliteListingCache;
 use settings::is_plugin_live;
 use usage::UsageIndex;
-use usage_cache::SqliteUsageCache;
+use usage_cache::{
+    SqliteUsageCache, META_ANOMALY_ENABLED, META_BUDGET_ALERTED, META_BUDGET_ENABLED, META_BUDGET_WORK_TOKENS,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -147,8 +154,16 @@ impl ClaudeCodeAdapter {
 
     /// Single-skill footprint: reads transcripts directly for the always-on
     /// text. Fine for a one-off recompute, but a full scan uses the batched
-    /// `scan_all` override instead, which reads each transcript once rather
-    /// than once per skill.
+    /// `scan` path instead, which reads each transcript once rather than once
+    /// per skill.
+    ///
+    /// The batched runtime entry point (`list_skills` -> inherent `scan`) no
+    /// longer reaches this, so from the cdylib's perspective it and its
+    /// transcript helpers are dead; they are kept as the single-skill recompute
+    /// primitive (ADR 0019) and the `HarnessAdapter::compute_footprint` seam
+    /// (ADR 0002), and are exercised by the test suite. `allow(dead_code)`
+    /// propagates to the private always-on helpers this calls.
+    #[allow(dead_code)]
     pub fn compute_footprint(&self, skill: &DiscoveredSkill) -> Footprint {
         let known_repos = enumerate_known_repos(&self.claude_home);
         let search_dirs = self.always_on_search_dirs(skill, &known_repos);
@@ -197,25 +212,15 @@ impl ClaudeCodeAdapter {
     pub fn stale_exact_count(&self) -> usize {
         self.cache.stale_exact_hashes(REFERENCE_MODEL_ID).len()
     }
-}
 
-impl HarnessAdapter for ClaudeCodeAdapter {
-    fn discover_skills(&self) -> DiscoveryResult {
-        ClaudeCodeAdapter::discover_skills(self)
-    }
-
-    fn compute_footprint(&self, skill: &DiscoveredSkill) -> Footprint {
-        ClaudeCodeAdapter::compute_footprint(self, skill)
-    }
-
-    /// Overrides the trait's naive per-skill default (which would re-read
-    /// every transcript once per skill -- tens of GB on a real machine) with a
-    /// batched pass: enumerate repos once, build the skill-listing index once
-    /// over exactly the discovered skill names, then resolve each skill's
-    /// always-on text from that index with the same type-scoped search dirs
-    /// the single-skill path uses. Result is identical, cost drops from
-    /// O(skills × transcripts) reads to O(transcripts).
-    fn scan_all(&self) -> ScanReport {
+    /// One full scan, parameterized by an injected clock and the requested
+    /// display window (issue #14). The batched pass (discover once, build the
+    /// listing index once, ingest usage once) is unchanged from the former
+    /// `scan_all`; what's new is that the per-skill usage figures are windowed
+    /// per `params`, and a fixed-24h budget/anomaly evaluation runs afterward
+    /// and returns any toasts. The trait `scan_all` is the clockless all-time
+    /// shim over this, so the `HarnessAdapter` trait stays untouched (ADR 0002).
+    pub fn scan(&self, params: &ScanParams) -> ScanOutcome {
         let discovery = ClaudeCodeAdapter::discover_skills(self);
         let known_repos = enumerate_known_repos(&self.claude_home);
 
@@ -224,28 +229,27 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             discovery.skills.iter().map(|s| s.directory_name().to_string()).collect();
         let transcripts = transcript_refs_by_recency(&all_project_dirs);
         let (index, _stats) = ListingIndex::build_incremental(&transcripts, &wanted, &self.listing_cache);
-        // Bound the memo: drop rows for transcripts no longer present. Keyed on
-        // every transcript this full scan enumerated, so a row is only evicted
-        // when its file is genuinely gone (ADR 0022). Safe because scan_all
-        // always enumerates the complete set, never a narrowed scope.
-        //
-        // Skip pruning entirely when the enumeration came back empty: that is
-        // far more likely a transient read failure than every transcript
-        // vanishing at once, and pruning on it would wipe the memo and re-read
-        // the whole corpus cold next scan -- the opposite of the persistence
-        // goal. A genuinely empty corpus simply keeps its (already empty) memo.
+        // Bound the memo (see the former scan_all): only prune when the
+        // enumeration is non-empty, so a transient read failure doesn't wipe it.
         let seen: HashSet<String> =
             transcripts.iter().map(|t| t.path.to_string_lossy().into_owned()).collect();
         if !seen.is_empty() {
             self.listing_cache.retain(&seen);
         }
 
-        // Attributed usage (issue #5): ingest new transcript usage into the
-        // persisted, deduped store over the SAME enumeration the listing index
-        // already built, then index the totals by attribution key so each skill
-        // can look up its own.
+        // Ingest new transcript usage into the persisted deduped store over the
+        // SAME enumeration the listing index built (issue #5).
         usage::refresh_usage(&transcripts, &self.usage_cache);
-        let usage_index = UsageIndex::build(&self.usage_cache);
+
+        // The per-skill display figures depend on the requested window; the 24h
+        // budget below is independent and always 24h (DESIGN.md UX #4).
+        let (usage_index, usage_window_hours) = match params.usage_window {
+            UsageWindow::AllTime => (UsageIndex::build(&self.usage_cache), None),
+            UsageWindow::Rolling { hours } => {
+                let cutoff = params.now_millis - (hours as i64) * HOUR_MILLIS;
+                (UsageIndex::build_windowed(&self.usage_cache, cutoff), Some(hours))
+            }
+        };
 
         let skills = discovery
             .skills
@@ -263,12 +267,123 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             .map(|w| format!("{}: {}", w.path.display(), w.reason))
             .collect();
 
-        ScanReport {
+        let report = ScanReport {
             skills,
             warnings,
             active_repo_path: discovery.active_repo_path.map(|p| p.display().to_string()),
             api_key_present: self.api_key_present(),
+            usage_window_hours,
+        };
+
+        // A clockless scan (all_time(), now == 0) skips the time-relative toast
+        // evaluation entirely: no wall-clock read, no meta writes. A real panel
+        // scan always injects now > 0. Toasts are emitted in lib.rs, outside the
+        // scan lock, after the debounce state below is persisted (D6).
+        let toasts = if params.now_millis > 0 { self.evaluate_toasts(params.now_millis) } else { Vec::new() };
+
+        ScanOutcome { report, toasts }
+    }
+
+    /// The fixed-24h budget check plus the optional per-skill anomaly check
+    /// (issue #14), run after usage was ingested. Reads config + the persisted
+    /// debounce flag from `usage_meta`, persists the next debounce state, and
+    /// returns the toasts to fire. Persisting the flag BEFORE emission (which
+    /// happens in lib.rs) makes a failed `.show()` a lost nudge, not a stuck
+    /// flag that suppresses the next real crossing (D6).
+    fn evaluate_toasts(&self, now_millis: i64) -> Vec<ToastRequest> {
+        let mut toasts = Vec::new();
+        let settings = self.get_usage_settings();
+
+        let cfg = BudgetConfig { enabled: settings.budget_enabled, work_token_limit: settings.budget_work_tokens };
+        let rolling_work = self.usage_cache.attributed_work_since(now_millis - DAY_MILLIS);
+        let alerted = self.usage_cache.get_meta(META_BUDGET_ALERTED).unwrap_or(0) != 0;
+        let outcome = evaluate_budget(rolling_work, &cfg, alerted);
+        self.usage_cache.set_meta(META_BUDGET_ALERTED, outcome.next_alerted as i64);
+        toasts.extend(outcome.toast);
+
+        if settings.anomaly_enabled {
+            toasts.extend(self.detect_usage_anomalies(now_millis));
         }
+        toasts
+    }
+
+    /// Per-skill anomaly toasts (issue #14, off by default): a skill whose
+    /// current-UTC-day attributed work runs above `DEFAULT_ANOMALY_MULTIPLIER`x
+    /// its trailing daily average over the prior week. Fuzzy and default-off; a
+    /// proxy, not a bill.
+    fn detect_usage_anomalies(&self, now_millis: i64) -> Vec<ToastRequest> {
+        let cutoff = now_millis - ANOMALY_WINDOW_DAYS * DAY_MILLIS;
+        let today = now_millis / DAY_MILLIS;
+        // Fold day buckets into per-key (today's work, trailing days' work).
+        let mut by_key: HashMap<(String, Option<String>), (u64, Vec<u64>)> = HashMap::new();
+        for bucket in self.usage_cache.work_by_key_and_day_since(cutoff) {
+            let entry = by_key.entry((bucket.attribution_skill, bucket.attribution_plugin)).or_default();
+            if bucket.day >= today {
+                entry.0 = entry.0.saturating_add(bucket.work);
+            } else {
+                entry.1.push(bucket.work);
+            }
+        }
+
+        let mut toasts = Vec::new();
+        for ((skill, _plugin), (current, trailing)) in by_key {
+            if let Some(multiple) =
+                detect_anomaly(current, &trailing, DEFAULT_ANOMALY_MULTIPLIER, DEFAULT_ANOMALY_FLOOR)
+            {
+                // Toast the bare skill name, not the `plugin:name` join key.
+                let name = skill.rsplit(':').next().unwrap_or(&skill).to_string();
+                toasts.push(ToastRequest::Anomaly { skill: name, window_work: current, multiple });
+            }
+        }
+        toasts
+    }
+
+    /// The user-configurable usage-toast settings, with product defaults for any
+    /// `usage_meta` key not yet written: budget on at the 250k attributed-work
+    /// default, anomaly off (issue #14, DESIGN.md UX #4).
+    pub fn get_usage_settings(&self) -> UsageSettings {
+        UsageSettings {
+            budget_enabled: self.usage_cache.get_meta(META_BUDGET_ENABLED).unwrap_or(1) != 0,
+            budget_work_tokens: self
+                .usage_cache
+                .get_meta(META_BUDGET_WORK_TOKENS)
+                .map(|v| v.max(0) as u64)
+                .unwrap_or(DEFAULT_BUDGET_WORK_TOKENS),
+            anomaly_enabled: self.usage_cache.get_meta(META_ANOMALY_ENABLED).unwrap_or(0) != 0,
+        }
+    }
+
+    /// Persists the usage-toast settings. Re-arms the budget debounce when the
+    /// limit or the enabled flag changed (D5), so a lowered limit re-evaluates
+    /// on the next scan instead of staying silent until the 24h window resets.
+    pub fn set_usage_settings(&self, settings: &UsageSettings) {
+        let prev = self.get_usage_settings();
+        self.usage_cache.set_meta(META_BUDGET_ENABLED, settings.budget_enabled as i64);
+        self.usage_cache.set_meta(META_BUDGET_WORK_TOKENS, settings.budget_work_tokens as i64);
+        self.usage_cache.set_meta(META_ANOMALY_ENABLED, settings.anomaly_enabled as i64);
+        if prev.budget_enabled != settings.budget_enabled || prev.budget_work_tokens != settings.budget_work_tokens {
+            self.usage_cache.set_meta(META_BUDGET_ALERTED, 0);
+        }
+    }
+}
+
+impl HarnessAdapter for ClaudeCodeAdapter {
+    fn discover_skills(&self) -> DiscoveryResult {
+        ClaudeCodeAdapter::discover_skills(self)
+    }
+
+    fn compute_footprint(&self, skill: &DiscoveredSkill) -> Footprint {
+        ClaudeCodeAdapter::compute_footprint(self, skill)
+    }
+
+    /// The clockless all-time shim over the inherent `scan` (issue #14): a scan
+    /// with no injected clock, so it evaluates no time-relative budget and
+    /// discards any toasts. The batched, per-transcript-once cost still lives in
+    /// `scan`; this only picks the all-time window and drops the toast channel,
+    /// so a generic `HarnessAdapter` caller that never learned about toasts is
+    /// unaffected (the trait stays untouched, ADR 0002).
+    fn scan_all(&self) -> ScanReport {
+        self.scan(&ScanParams::all_time()).report
     }
 
     fn api_key_present(&self) -> bool {
@@ -305,6 +420,27 @@ mod tests {
         )
         .unwrap();
     }
+
+    /// A directly-ingestable attributed-usage row for the scan-level e2e tests,
+    /// so a test can seed the persisted store with a chosen timestamp without
+    /// hand-writing a transcript. `message_id` folds in every field so distinct
+    /// rows never collide under the `message_id` PK dedup.
+    fn usage_row(skill: &str, work: u32, timestamp_millis: i64) -> usage_cache::UsageRow {
+        usage_cache::UsageRow {
+            message_id: format!("{skill}-{work}-{timestamp_millis}"),
+            attribution_skill: skill.to_string(),
+            attribution_plugin: None,
+            is_subagent: false,
+            work,
+            cache_write: 0,
+            cache_read: 0,
+            timestamp_millis,
+        }
+    }
+
+    /// A fixed 2027-ish clock, so windowed-scan tests are deterministic and
+    /// independent of the wall clock.
+    const FIXED_NOW: i64 = 1_800_000_000_000;
 
     #[test]
     fn assembles_personal_project_and_plugin_skills_together() {
@@ -651,6 +787,135 @@ mod tests {
         );
 
         assert!(adapter.scan_all().api_key_present);
+    }
+
+    #[test]
+    fn scan_all_delegates_to_scan_all_time_with_no_toasts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        write_skill(&claude_home.join("skills").join("grilling"), "grilling");
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        // Far over any budget, but a clockless all-time scan reads no clock, so
+        // it evaluates no budget and fires no toast, and reports all-time usage.
+        adapter.usage_cache.ingest(&[usage_row("grilling", 1_000_000, FIXED_NOW - 1000)]);
+
+        let outcome = adapter.scan(&ScanParams::all_time());
+        assert!(outcome.toasts.is_empty(), "a clockless all_time scan never toasts");
+        assert_eq!(outcome.report.usage_window_hours, None, "all_time reports the all-time window");
+        // And the debounce flag was never touched (no meta write on now == 0).
+        assert_eq!(adapter.usage_cache.get_meta(META_BUDGET_ALERTED), None);
+    }
+
+    #[test]
+    fn scan_windowed_usage_reflects_the_requested_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        write_skill(&claude_home.join("skills").join("grilling"), "grilling");
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        adapter.usage_cache.ingest(&[
+            usage_row("grilling", 100, FIXED_NOW - 90 * DAY_MILLIS), // old, outside 24h
+            usage_row("grilling", 40, FIXED_NOW - 1000),             // recent, inside 24h
+        ]);
+
+        let all = adapter.scan(&ScanParams { now_millis: FIXED_NOW, usage_window: UsageWindow::AllTime });
+        let g_all = all.report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        assert_eq!(g_all.usage.unwrap().work, 140, "all-time sums both records");
+        assert_eq!(all.report.usage_window_hours, None);
+
+        let win = adapter.scan(&ScanParams { now_millis: FIXED_NOW, usage_window: UsageWindow::Rolling { hours: 24 } });
+        let g_win = win.report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        assert_eq!(g_win.usage.unwrap().work, 40, "the 24h window shows only the recent work");
+        assert_eq!(win.report.usage_window_hours, Some(24));
+    }
+
+    #[test]
+    fn scan_emits_budget_toast_when_rolling_24h_work_exceeds_limit_then_debounces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_home).unwrap();
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        // 300k attributed work inside the last 24h, over the 250k default budget.
+        adapter.usage_cache.ingest(&[usage_row("grilling", 300_000, FIXED_NOW - 1000)]);
+
+        let params = ScanParams { now_millis: FIXED_NOW, usage_window: UsageWindow::AllTime };
+        let first = adapter.scan(&params);
+        assert_eq!(first.toasts.len(), 1, "crossing the budget fires exactly one toast");
+        assert!(matches!(first.toasts[0], ToastRequest::Budget { rolling_work: 300_000, limit: 250_000 }));
+
+        // Second scan, still over budget: debounced by the persisted flag.
+        let second = adapter.scan(&params);
+        assert!(second.toasts.is_empty(), "still over budget must not re-toast (persisted debounce)");
+    }
+
+    #[test]
+    fn budget_is_on_by_default_with_no_meta_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_home).unwrap();
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+
+        let s = adapter.get_usage_settings();
+        assert!(s.budget_enabled, "the budget is on by default");
+        assert_eq!(s.budget_work_tokens, 250_000, "the default limit is the 250k product default");
+        assert!(!s.anomaly_enabled, "anomaly is off by default");
+
+        // And an over-limit window toasts with no configuration at all.
+        adapter.usage_cache.ingest(&[usage_row("grilling", 300_000, FIXED_NOW - 1000)]);
+        let out = adapter.scan(&ScanParams { now_millis: FIXED_NOW, usage_window: UsageWindow::AllTime });
+        assert_eq!(out.toasts.len(), 1, "default-on budget toasts without any set_usage_settings call");
+    }
+
+    #[test]
+    fn anomaly_is_off_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_home).unwrap();
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        // A blatant spike: a week of ~10k/day, then 500k today. Anomaly still off.
+        let day = FIXED_NOW / DAY_MILLIS;
+        for d in 1..=7 {
+            adapter.usage_cache.ingest(&[usage_row("grilling", 10_000, (day - d) * DAY_MILLIS + 100)]);
+        }
+        adapter.usage_cache.ingest(&[usage_row("grilling", 500_000, day * DAY_MILLIS + 100)]);
+
+        let out = adapter.scan(&ScanParams { now_millis: FIXED_NOW, usage_window: UsageWindow::AllTime });
+        assert!(
+            !out.toasts.iter().any(|t| matches!(t, ToastRequest::Anomaly { .. })),
+            "no anomaly toast fires while anomaly detection is off by default"
+        );
+    }
+
+    #[test]
+    fn scan_emits_anomaly_toast_when_enabled_and_a_skill_spikes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_home).unwrap();
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        // Turn anomaly on and the budget off, so only the anomaly path can toast.
+        adapter.set_usage_settings(&UsageSettings {
+            budget_enabled: false,
+            budget_work_tokens: 250_000,
+            anomaly_enabled: true,
+        });
+        let day = FIXED_NOW / DAY_MILLIS;
+        for d in 1..=7 {
+            adapter.usage_cache.ingest(&[usage_row("grilling", 10_000, (day - d) * DAY_MILLIS + 100)]);
+        }
+        adapter.usage_cache.ingest(&[usage_row("grilling", 500_000, day * DAY_MILLIS + 100)]);
+
+        let out = adapter.scan(&ScanParams { now_millis: FIXED_NOW, usage_window: UsageWindow::AllTime });
+        let anomaly = out
+            .toasts
+            .iter()
+            .find(|t| matches!(t, ToastRequest::Anomaly { .. }))
+            .expect("a 50x spike must toast when anomaly is enabled");
+        match anomaly {
+            ToastRequest::Anomaly { skill, window_work, .. } => {
+                assert_eq!(skill, "grilling", "the toast names the spiking skill");
+                assert_eq!(*window_work, 500_000, "and reports the current-day work");
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// Exercises the real production adapter (real keychain store, real HTTP

@@ -5,6 +5,14 @@ use crate::domain::skill::{DiscoveredSkill, DiscoveryResult};
 /// Abstracts everything agent-specific: where skills live, how footprint is
 /// read, how enable/disable is mutated (mutation methods land in a later
 /// plan). v1 ships a single implementation, `ClaudeCodeAdapter` (ADR 0002).
+///
+/// The MVP's runtime path calls the concrete adapter's inherent `scan`
+/// directly (for the windowed usage + toasts of issue #14), so the generic
+/// trait methods here are no longer dispatched from the cdylib entry point.
+/// They are the harness seam reserved for a second adapter and are exercised
+/// by the test suite (`StubAdapter`), so `allow(dead_code)` keeps them without
+/// masking a real regression.
+#[allow(dead_code)]
 pub trait HarnessAdapter {
     fn discover_skills(&self) -> DiscoveryResult;
     fn compute_footprint(&self, skill: &DiscoveredSkill) -> Footprint;
@@ -42,6 +50,10 @@ pub trait HarnessAdapter {
             warnings,
             active_repo_path: discovery.active_repo_path.map(|p| p.display().to_string()),
             api_key_present: self.api_key_present(),
+            // The trait default has no transcript access, so it can only ever
+            // report all-time usage (`None`). A harness that windows usage does
+            // so in its own `scan` override, not here (issue #14).
+            usage_window_hours: None,
         }
     }
 }
