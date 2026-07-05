@@ -16,7 +16,7 @@ Rust core is well underway; the tray panel renders the footprint and a demoted u
 - Defer the on-demand ceiling tokenization off the interactive cold scan (from #2/#3): the real remaining cold/warm cost is the ~216 MB bundled-file read + hash, not the tokenizer or the listing index. Needs a UI "pending" affordance, so it touches the panel.
 - `parentUuid` skill-stack reconstruction for pre-attribution transcripts, version-gated (from #5). The `attribution_source` seam (`native` | `reconstructed`) is already reserved.
 - The sub-agent usage include toggle (#5b): a backend `list_skills(include_subagents)` re-scan param, blocked on ADR 0005's deferred hierarchical roll-up.
-- Smaller: `message_usage` pruning, a byte-offset tail-reader, and the rolling-24h usage window + toast budget (DESIGN.md UX #4).
+- Smaller: `message_usage` pruning and a byte-offset tail-reader landed together (issue #15, ADR 0024): a vanished checkpoint triggers a dir-scoped, conditional full rebuild (`wipe` + re-ingest, never a targeted delete), and `read_plan` tails only appended bytes. Still open: the rolling-24h usage window + toast budget (DESIGN.md UX #4).
 
 The post-mutation "restart Claude Code to apply" nudge is deferred until the disable/uninstall mutation ops are scoped.
 
