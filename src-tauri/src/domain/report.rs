@@ -79,7 +79,11 @@ pub struct SkillReport {
     /// skill yet (ADR 0016). Only the always-on layer carries this.
     pub always_on_native: bool,
     pub on_invoke: LayerReport,
-    pub on_demand: LayerReport,
+    /// `None` (a JSON `null`) means the on-demand ceiling is still being
+    /// computed off the interactive scan (issue #11); the panel renders a
+    /// pending affordance, never a `0`. `Some(LayerReport { tokens: 0, .. })`
+    /// is the resolved "no bundled files" state, kept distinct from pending.
+    pub on_demand: Option<LayerReport>,
     /// Attributed session usage (issue #5), or `None` when no session has
     /// touched this skill. `None` (a null in the panel) means "untouched," not
     /// "attributed zero," so a zero figure is never fabricated for a skill no
@@ -111,7 +115,7 @@ impl SkillReport {
             always_on: footprint.always_on.count.into(),
             always_on_native: footprint.always_on.confidence == TextConfidence::Native,
             on_invoke: footprint.on_invoke.into(),
-            on_demand: footprint.on_demand.into(),
+            on_demand: footprint.on_demand.map(Into::into),
             usage,
             repo_path,
             marketplace,
@@ -169,7 +173,7 @@ mod tests {
                 confidence: TextConfidence::Native,
             },
             on_invoke: LayerCount { tokens: 200, source: TokenSource::Estimate },
-            on_demand: LayerCount { tokens: 0, source: TokenSource::Exact },
+            on_demand: Some(LayerCount { tokens: 0, source: TokenSource::Exact }),
         }
     }
 
@@ -246,6 +250,28 @@ mod tests {
         let with_recon = SkillReport::from_parts(&skill, &sample_footprint(), Some(reconstructed));
         let recon_json = serde_json::to_value(&with_recon).unwrap();
         assert_eq!(recon_json["usage"]["attributionSource"], "reconstructed");
+    }
+
+    #[test]
+    fn a_pending_on_demand_serializes_to_json_null_not_zero() {
+        // The pending contract at the IPC boundary (issue #11): a `None`
+        // on-demand must reach the panel as `null` so it can render the
+        // "computing…" affordance, never as a `0` that would read as an exact
+        // "nothing to load" ceiling.
+        let skill = skill_with_id(SkillId::Personal { name: "grilling".to_string() });
+        let footprint = Footprint {
+            always_on: AlwaysOnFootprint {
+                count: LayerCount { tokens: 10, source: TokenSource::Estimate },
+                confidence: TextConfidence::Native,
+            },
+            on_invoke: LayerCount { tokens: 20, source: TokenSource::Estimate },
+            on_demand: None,
+        };
+        let report = SkillReport::from_parts(&skill, &footprint, None);
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["onDemand"], serde_json::Value::Null);
+        assert!(json.get("onDemand").is_some(), "the key is present, just null");
     }
 
     #[test]

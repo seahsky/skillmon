@@ -11,16 +11,18 @@ use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 
 use adapters::claude_code::listing_cache::SqliteListingCache;
+use adapters::claude_code::on_demand_cache::SqliteOnDemandCache;
 use adapters::claude_code::paths::default_claude_home;
 use adapters::claude_code::usage_cache::SqliteUsageCache;
 use adapters::claude_code::watcher::RegistryWatcher;
-use adapters::claude_code::{ClaudeCodeAdapter, REFERENCE_MODEL_ID};
+use adapters::claude_code::{fill_on_demand_ceilings, ClaudeCodeAdapter, REFERENCE_MODEL_ID};
 use domain::harness::HarnessAdapter;
 use domain::report::ScanReport;
 use footprint::api_key_service::{self, SetKeyOutcome};
 use footprint::api_key_store::{ApiKeyStore, KeychainApiKeyStore};
 use footprint::cache::TokenCache;
 use footprint::count_tokens_client::{AnthropicCountTokensClient, CountTokensClient};
+use footprint::tokenizer::BpeTokenizer;
 
 /// The scan orchestration is synchronous (ADR 0008) and can block on file
 /// I/O or a `count_tokens` call, so it lives behind a `Mutex` and is only
@@ -56,19 +58,70 @@ type SharedApiKeySettings = Arc<Mutex<ApiKeySettings>>;
 /// scan starts being watched without waiting for a restart.
 #[tauri::command]
 async fn list_skills(
+    app: tauri::AppHandle,
     adapter: tauri::State<'_, SharedAdapter>,
     watcher: tauri::State<'_, SharedWatcher>,
 ) -> Result<ScanReport, String> {
     let adapter = adapter.inner().clone();
     let watcher = watcher.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let adapter = adapter.lock().expect("adapter mutex poisoned");
-        let report = adapter.scan_all();
-        adapter.sync_watcher(&mut watcher.lock().expect("watcher mutex poisoned"));
-        report
+    let report = tauri::async_runtime::spawn_blocking({
+        let adapter = adapter.clone();
+        move || {
+            let adapter = adapter.lock().expect("adapter mutex poisoned");
+            let report = adapter.scan_all();
+            adapter.sync_watcher(&mut watcher.lock().expect("watcher mutex poisoned"));
+            report
+        }
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+
+    // Issue #11: the interactive scan defers the on-demand ceiling, so any
+    // skill whose ceiling is still pending gets filled off this response, on a
+    // detached blocking task with its OWN sqlite connections. The task holds
+    // the scan `Mutex` only for the cheap `pending_on_demand()` worklist, then
+    // tokenizes off the lock so it neither blocks the next scan nor -- if a
+    // background sqlite call panics -- poisons the adapter `Mutex`.
+    if report.skills.iter().any(|s| s.on_demand.is_none()) {
+        spawn_on_demand_fill(app, adapter);
+    }
+
+    Ok(report)
+}
+
+/// Detached background fill of every pending on-demand ceiling (issue #11).
+/// Emits `on-demand-ready` exactly once, only when it wrote at least one
+/// ceiling, so the panel reloads precisely when there is something new to
+/// resolve; the fill is idempotent, so that reload's rescan finds nothing
+/// pending and the cycle terminates after one extra pass.
+fn spawn_on_demand_fill(app: tauri::AppHandle, adapter: SharedAdapter) {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Cheap step under the scan lock: the worklist only, no tokenization.
+        let pending = {
+            let adapter = adapter.lock().expect("adapter mutex poisoned");
+            adapter.pending_on_demand()
+        };
+        if pending.is_empty() {
+            return;
+        }
+
+        // The background's own connections, opened from the app data dir. A
+        // panic in any of these can't poison the interactive adapter's Mutex
+        // because none of them is that adapter. If a handle can't be built the
+        // fill simply no-ops; the next scan re-pends and tries again.
+        let Ok(data_dir) = app.path().app_data_dir() else { return };
+        let Ok(cache) = TokenCache::open(&data_dir.join("footprint.sqlite")) else { return };
+        let Ok(on_demand_cache) = SqliteOnDemandCache::open(&data_dir.join("on_demand_index.sqlite")) else {
+            return;
+        };
+        let Ok(store) = KeychainApiKeyStore::new() else { return };
+        let client = AnthropicCountTokensClient::new();
+
+        let wrote = fill_on_demand_ceilings(&pending, &cache, &on_demand_cache, &store, &client, &BpeTokenizer);
+        if wrote {
+            let _ = app.emit("on-demand-ready", ());
+        }
+    });
 }
 
 /// Validate and store a user-supplied API key (issue #4). Runs on the blocking
@@ -166,13 +219,19 @@ pub fn run() {
             // beside the footprint and listing caches, holding deduped
             // per-message usage keyed by message.id (ADR 0024).
             let usage_cache = SqliteUsageCache::open(&data_dir.join("usage.sqlite"))?;
+            // Fourth persisted sqlite file (issue #11): the per-skill on-demand
+            // ceiling memo, opened WAL so the background fill's separate
+            // connection to the same file never blocks or poisons this one.
+            let on_demand_cache = SqliteOnDemandCache::open(&data_dir.join("on_demand_index.sqlite"))?;
             let adapter = ClaudeCodeAdapter::new(
                 default_claude_home(),
                 cache,
                 listing_cache,
                 usage_cache,
+                on_demand_cache,
                 Box::new(KeychainApiKeyStore::new()?),
                 Box::new(AnthropicCountTokensClient::new()),
+                Box::new(BpeTokenizer),
             );
 
             // ADR 0018/0019: exact counts measured against a superseded

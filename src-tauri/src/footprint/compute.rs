@@ -3,18 +3,24 @@ use crate::footprint::api_key_store::ApiKeyStore;
 use crate::footprint::cache::TokenCache;
 use crate::footprint::count_tokens_client::CountTokensClient;
 use crate::footprint::hashing::sha256_hex;
-use crate::footprint::tokenizer::estimate_tokens;
+use crate::footprint::tokenizer::Tokenizer;
 
 /// Counts `text` following ADR 0006 + ADR 0018's priority order: a fresh
 /// exact value under the current reference model wins outright; otherwise a
 /// live `count_tokens` call is attempted if a key is configured; a failed
 /// call and "no key configured" share the same calibrated-estimate fallback,
 /// since both mean "exact isn't available right now."
+///
+/// The estimate goes through the injected `tokenizer` rather than the free
+/// `estimate_tokens` so a scan can prove which texts it actually tokenizes
+/// (issue #11's spy seam); `BpeTokenizer` is the only production impl and is
+/// byte-identical to the free function.
 pub fn count_text(
     text: &str,
     cache: &TokenCache,
     api_key_store: &dyn ApiKeyStore,
     client: &dyn CountTokensClient,
+    tokenizer: &dyn Tokenizer,
     reference_model_id: &str,
 ) -> LayerCount {
     let hash = sha256_hex(text);
@@ -31,7 +37,7 @@ pub fn count_text(
     let tiktoken_count = match &cached {
         Some(entry) => entry.tiktoken_count,
         None => {
-            let count = estimate_tokens(text);
+            let count = tokenizer.estimate(text);
             cache.put_tiktoken(&hash, count);
             count
         }
@@ -58,6 +64,7 @@ mod tests {
     use super::*;
     use crate::footprint::api_key_store::FakeApiKeyStore;
     use crate::footprint::count_tokens_client::FakeCountTokensClient;
+    use crate::footprint::tokenizer::{estimate_tokens, BpeTokenizer};
 
     const MODEL: &str = "claude-sonnet-5";
 
@@ -67,7 +74,7 @@ mod tests {
         let api_key_store = FakeApiKeyStore::empty();
         let client = FakeCountTokensClient::always_returns(999);
 
-        let result = count_text("some skill body text", &cache, &api_key_store, &client, MODEL);
+        let result = count_text("some skill body text", &cache, &api_key_store, &client, &BpeTokenizer, MODEL);
 
         assert_eq!(result.source, TokenSource::Estimate);
         assert_eq!(result.tokens, estimate_tokens("some skill body text"));
@@ -83,7 +90,7 @@ mod tests {
         let api_key_store = FakeApiKeyStore::empty();
         let client = FakeCountTokensClient::always_returns(999);
 
-        let result = count_text("some other skill body text", &cache, &api_key_store, &client, MODEL);
+        let result = count_text("some other skill body text", &cache, &api_key_store, &client, &BpeTokenizer, MODEL);
         let raw = estimate_tokens("some other skill body text");
 
         assert_eq!(result.source, TokenSource::Estimate);
@@ -96,7 +103,7 @@ mod tests {
         let api_key_store = FakeApiKeyStore::with_key("sk-ant-test");
         let client = FakeCountTokensClient::always_returns(42);
 
-        let result = count_text("skill body", &cache, &api_key_store, &client, MODEL);
+        let result = count_text("skill body", &cache, &api_key_store, &client, &BpeTokenizer, MODEL);
 
         assert_eq!(result, LayerCount { tokens: 42, source: TokenSource::Exact });
         assert_eq!(cache.get(&sha256_hex("skill body")).unwrap().exact, Some((42, MODEL.to_string())));
@@ -108,8 +115,8 @@ mod tests {
         let api_key_store = FakeApiKeyStore::with_key("sk-ant-test");
         let client = FakeCountTokensClient::always_returns(42);
 
-        count_text("skill body", &cache, &api_key_store, &client, MODEL);
-        let second = count_text("skill body", &cache, &api_key_store, &client, MODEL);
+        count_text("skill body", &cache, &api_key_store, &client, &BpeTokenizer, MODEL);
+        let second = count_text("skill body", &cache, &api_key_store, &client, &BpeTokenizer, MODEL);
 
         assert_eq!(second, LayerCount { tokens: 42, source: TokenSource::Exact });
         assert_eq!(client.call_count(), 1, "second call should be served entirely from cache");
@@ -121,7 +128,7 @@ mod tests {
         let api_key_store = FakeApiKeyStore::with_key("sk-ant-test");
         let client = FakeCountTokensClient::always_fails();
 
-        let result = count_text("skill body", &cache, &api_key_store, &client, MODEL);
+        let result = count_text("skill body", &cache, &api_key_store, &client, &BpeTokenizer, MODEL);
 
         assert_eq!(result.source, TokenSource::Estimate);
         assert_eq!(result.tokens, estimate_tokens("skill body"));
@@ -136,7 +143,7 @@ mod tests {
         let api_key_store = FakeApiKeyStore::with_key("sk-ant-test");
         let client = FakeCountTokensClient::always_returns(50);
 
-        let result = count_text("skill body", &cache, &api_key_store, &client, "new-model");
+        let result = count_text("skill body", &cache, &api_key_store, &client, &BpeTokenizer, "new-model");
 
         assert_eq!(result, LayerCount { tokens: 50, source: TokenSource::Exact });
         assert_eq!(client.call_count(), 1, "stale model_id should trigger a fresh call");
