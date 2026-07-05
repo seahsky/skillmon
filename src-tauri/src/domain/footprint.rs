@@ -26,7 +26,12 @@ pub struct AlwaysOnFootprint {
 pub struct Footprint {
     pub always_on: AlwaysOnFootprint,
     pub on_invoke: LayerCount,
-    pub on_demand: LayerCount,
+    /// `None` means the on-demand ceiling is still pending: the interactive
+    /// scan deferred its tokenization and a background pass has not filled it
+    /// yet (issue #11). `Some(LayerCount { tokens: 0, .. })` is the distinct
+    /// "resolved, and there is nothing to load" state for a skill with no
+    /// bundled files -- never conflated with pending.
+    pub on_demand: Option<LayerCount>,
 }
 
 #[cfg(test)]
@@ -41,12 +46,12 @@ mod tests {
                 confidence: TextConfidence::Native,
             },
             on_invoke: LayerCount { tokens: 512, source: TokenSource::Estimate },
-            on_demand: LayerCount { tokens: 1024, source: TokenSource::Estimate },
+            on_demand: Some(LayerCount { tokens: 1024, source: TokenSource::Estimate }),
         };
 
         assert_eq!(footprint.always_on.count.tokens, 42);
         assert_eq!(footprint.always_on.confidence, TextConfidence::Native);
         assert_eq!(footprint.on_invoke.source, TokenSource::Estimate);
-        assert_eq!(footprint.on_demand.tokens, 1024);
+        assert_eq!(footprint.on_demand.unwrap().tokens, 1024);
     }
 }

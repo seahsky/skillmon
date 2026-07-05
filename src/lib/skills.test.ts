@@ -4,6 +4,7 @@ import {
   formatTokens,
   layerDisplay,
   normalizeApiKey,
+  onDemandDisplay,
   skillKey,
   sortSkills,
   usageDisplay,
@@ -100,6 +101,24 @@ describe("layerDisplay", () => {
   });
 });
 
+describe("onDemandDisplay", () => {
+  it("renders a pending (null) on-demand as an ellipsis, never 0 or ~0 (issue #11)", () => {
+    const out = onDemandDisplay(null);
+    expect(out).toBe("…");
+    expect(out).not.toBe("0");
+    expect(out).not.toBe("~0");
+  });
+
+  it("renders a resolved exact layer like layerDisplay", () => {
+    expect(onDemandDisplay({ tokens: 1234, exact: true })).toBe(layerDisplay({ tokens: 1234, exact: true }));
+    expect(onDemandDisplay({ tokens: 1234, exact: true })).toBe("1,234");
+  });
+
+  it("renders a resolved estimate layer with the ~ prefix", () => {
+    expect(onDemandDisplay({ tokens: 1234, exact: false })).toBe("~1,234");
+  });
+});
+
 describe("normalizeApiKey", () => {
   it("trims surrounding whitespace", () => {
     expect(normalizeApiKey("  sk-ant-abc  ")).toBe("sk-ant-abc");
@@ -182,5 +201,23 @@ describe("estimatedLayerCount", () => {
 
     // a: onInvoke estimate (1); b: alwaysOn + onInvoke estimates (2) => 3.
     expect(estimatedLayerCount(report)).toBe(3);
+  });
+
+  it("skips a pending (null) on-demand without throwing and without counting it (issue #11)", () => {
+    const report = makeReport({
+      skills: [
+        makeSkill({
+          name: "pending",
+          alwaysOn: { tokens: 1, exact: false },
+          onInvoke: { tokens: 2, exact: true },
+          onDemand: null,
+        }),
+      ],
+    });
+
+    // Only the estimated always-on is counted; the null on-demand is neither
+    // counted nor a source of a thrown `.exact` access.
+    expect(() => estimatedLayerCount(report)).not.toThrow();
+    expect(estimatedLayerCount(report)).toBe(1);
   });
 });
