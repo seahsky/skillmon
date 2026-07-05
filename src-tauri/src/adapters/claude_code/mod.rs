@@ -848,6 +848,21 @@ mod tests {
     }
 
     #[test]
+    fn changing_the_budget_limit_re_arms_the_debounce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_home).unwrap();
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        adapter.usage_cache.ingest(&[usage_row("grilling", 300_000, FIXED_NOW - 1000)]);
+        let params = ScanParams { now_millis: FIXED_NOW, usage_window: UsageWindow::AllTime };
+        assert_eq!(adapter.scan(&params).toasts.len(), 1); // cross -> toast
+        assert!(adapter.scan(&params).toasts.is_empty()); // debounced
+        adapter.set_usage_settings(&UsageSettings { budget_enabled: true, budget_work_tokens: 100_000, anomaly_enabled: false });
+        assert_eq!(adapter.usage_cache.get_meta(META_BUDGET_ALERTED), Some(0), "settings change re-arms (D5)");
+        assert_eq!(adapter.scan(&params).toasts.len(), 1, "re-armed budget re-toasts");
+    }
+
+    #[test]
     fn budget_is_on_by_default_with_no_meta_configured() {
         let tmp = tempfile::tempdir().unwrap();
         let claude_home = tmp.path().join(".claude");
