@@ -36,6 +36,21 @@ pub struct UsageTotal {
     pub cache_read: u64,
 }
 
+/// What a scan should do with one transcript, decided from its checkpoint
+/// (issue #15). `Tail(off)` reads only the bytes appended past the last parsed
+/// newline; any doubt collapses to `Full`, which is always safe because
+/// `ingest` is INSERT OR IGNORE on the immutable `message.id` (ADR 0024).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadPlan {
+    /// `(mtime, size)` unchanged: the file is already fully parsed.
+    Skip,
+    /// Re-read the whole file from byte 0 (new file, shrink, in-place rewrite,
+    /// version mismatch, or a legacy zero-offset row).
+    Full,
+    /// Read only `[offset..EOF]`; the file grew and the prefix is intact.
+    Tail(u64),
+}
+
 /// Persisted, GLOBAL attributed-usage store (issue #5, ADR 0024). Global
 /// because resume/branch/compact copy the same `message.id` into different
 /// transcript files, so a per-file memo (like `SqliteListingCache`) would
@@ -73,6 +88,7 @@ impl SqliteUsageCache {
                 path          TEXT PRIMARY KEY,
                 mtime_nanos   INTEGER NOT NULL,
                 size          INTEGER NOT NULL,
+                byte_offset   INTEGER NOT NULL DEFAULT 0,
                 logic_version INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS usage_meta (
@@ -80,6 +96,24 @@ impl SqliteUsageCache {
                 value INTEGER NOT NULL
             );",
         )?;
+
+        // Guarded migration for `byte_offset` (issue #15). It changes only WHICH
+        // bytes a scan reads, not how a row derives from bytes, so it needs no
+        // logic-version bump: a DB predating it keeps its history and its
+        // existing rows default to offset 0, forcing one Full re-read on their
+        // next growth (self-correcting, ADR 0024).
+        let has_byte_offset = conn
+            .prepare("PRAGMA table_info(usage_checkpoint)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<SqliteResult<Vec<String>>>()?
+            .iter()
+            .any(|name| name == "byte_offset");
+        if !has_byte_offset {
+            conn.execute(
+                "ALTER TABLE usage_checkpoint ADD COLUMN byte_offset INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
 
         // Because INSERT OR IGNORE never overwrites, a logic-version change
         // cannot refresh stored rows in place; the only correct migration is a
@@ -99,36 +133,41 @@ impl SqliteUsageCache {
         Ok(Self { conn })
     }
 
-    /// Whether `path` is already parsed at exactly `(mtime_nanos, size)` under
-    /// the current logic version. Strict equality in both directions (an older
-    /// mtime is still a miss), so a same-size in-place rewrite with a backwards
-    /// clock still re-reads (ADR 0022).
-    pub fn is_fresh(&self, path: &str, mtime_nanos: i64, size: i64) -> bool {
-        let row: Option<(i64, i64, i64)> = self
+    /// Decides how to read `path` given its freshly-stat'd `(mtime, size)`,
+    /// from the stored checkpoint (issue #15). The `Skip` branch is the exact
+    /// strict-equality freshness gate of ADR 0022 (an older mtime is still a
+    /// miss, so a same-size backwards-clock rewrite re-reads); a genuine growth
+    /// with a non-zero stored offset is the only case that tails.
+    pub fn read_plan(&self, path: &str, new_mtime: i64, new_size: i64) -> ReadPlan {
+        let row: Option<(i64, i64, i64, i64)> = self
             .conn
             .query_row(
-                "SELECT mtime_nanos, size, logic_version FROM usage_checkpoint WHERE path = ?1",
+                "SELECT mtime_nanos, size, byte_offset, logic_version FROM usage_checkpoint WHERE path = ?1",
                 params![path],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .expect("usage_checkpoint lookup should not fail");
-        matches!(row, Some((m, s, v)) if m == mtime_nanos && s == size && v == USAGE_LOGIC_VERSION)
+        // STUB (issue #15, red phase): always Full until the real plan lands.
+        let _ = row;
+        ReadPlan::Full
     }
 
-    /// Records `path` as parsed at `(mtime_nanos, size)`. Call only after a
-    /// successful whole-file parse, so a truncated trailing line is re-read
-    /// next scan rather than marked complete.
-    pub fn mark(&self, path: &str, mtime_nanos: i64, size: i64) {
+    /// Records `path` as parsed up to `byte_offset` (the byte position just past
+    /// the last newline consumed) at `(mtime_nanos, size)`. Call only after a
+    /// successful parse of the consumed prefix, so a truncated trailing line is
+    /// re-read next scan rather than marked complete.
+    pub fn mark(&self, path: &str, mtime_nanos: i64, size: i64, byte_offset: i64) {
         self.conn
             .execute(
-                "INSERT INTO usage_checkpoint (path, mtime_nanos, size, logic_version)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO usage_checkpoint (path, mtime_nanos, size, byte_offset, logic_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(path) DO UPDATE SET
                      mtime_nanos = excluded.mtime_nanos,
                      size = excluded.size,
+                     byte_offset = excluded.byte_offset,
                      logic_version = excluded.logic_version",
-                params![path, mtime_nanos, size, USAGE_LOGIC_VERSION],
+                params![path, mtime_nanos, size, byte_offset, USAGE_LOGIC_VERSION],
             )
             .expect("usage_checkpoint upsert should not fail");
     }
@@ -191,27 +230,35 @@ impl SqliteUsageCache {
         rows.collect::<SqliteResult<Vec<UsageTotal>>>().expect("usage totals mapping should not fail")
     }
 
-    /// Prunes checkpoint rows for transcripts no longer present, so the gate
-    /// table can't grow unbounded. Only the checkpoint table is pruned; the
-    /// `message_usage` history is intentionally cumulative in the MVP (ADR 0024).
-    pub fn retain(&self, keep_paths: &HashSet<String>) {
-        let existing: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT path FROM usage_checkpoint")
-                .expect("usage_checkpoint path scan prepare should not fail");
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .expect("usage_checkpoint path scan should not fail");
-            rows.collect::<SqliteResult<Vec<String>>>().expect("usage_checkpoint path mapping should not fail")
-        };
-        for path in existing {
-            if !keep_paths.contains(&path) {
-                self.conn
-                    .execute("DELETE FROM usage_checkpoint WHERE path = ?1", params![path])
-                    .expect("usage_checkpoint prune delete should not fail");
-            }
-        }
+    /// Whether any checkpointed transcript has genuinely vanished: it is absent
+    /// from `seen` AND its parent dir is in `enumerated_dirs` (a dir whose
+    /// `read_dir` actually succeeded this scan). A checkpoint under a dir that
+    /// failed to enumerate is "unknown", never a vanish, so a transient blip on
+    /// one project dir can't be mistaken for every transcript disappearing and
+    /// trigger a needless wipe of the cumulative store (issue #15 data-loss
+    /// guard, ADR 0024). Usage rows carry no per-path provenance and a
+    /// `message.id` can live in many transcripts, so a true vanish forces a
+    /// full rebuild (`wipe` + re-ingest), never a targeted delete.
+    pub fn has_vanished_checkpoint(
+        &self,
+        seen: &HashSet<String>,
+        enumerated_dirs: &HashSet<String>,
+    ) -> bool {
+        // STUB (issue #15, red phase): never reports a vanish until the real
+        // dir-scoped detection lands.
+        let _ = (seen, enumerated_dirs);
+        false
+    }
+
+    /// Drops all attributed usage AND every checkpoint. Called only on a
+    /// detected vanish, so the per-file loop re-ingests the present set from
+    /// scratch; INSERT OR IGNORE dedup makes the rebuild re-derive correct
+    /// totals (a still-present `message.id` survives, an only-in-vanished one
+    /// drops -- the actual prune).
+    pub fn wipe(&self) {
+        self.conn
+            .execute_batch("DELETE FROM message_usage; DELETE FROM usage_checkpoint;")
+            .expect("usage store wipe should not fail");
     }
 }
 
@@ -271,30 +318,120 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_freshness_is_strict_equality_in_both_directions() {
+    fn read_plan_skips_a_fresh_unchanged_file() {
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        let m = 1_000i64;
-        cache.mark("/p/a.jsonl", m, 500);
-        assert!(cache.is_fresh("/p/a.jsonl", m, 500));
-        assert!(!cache.is_fresh("/p/a.jsonl", m, 501), "grown file is a miss");
-        assert!(!cache.is_fresh("/p/a.jsonl", m + 1, 500), "newer mtime is a miss");
-        assert!(!cache.is_fresh("/p/a.jsonl", m - 1, 500), "OLDER mtime is a miss (no newer-than compare)");
-        assert!(!cache.is_fresh("/p/never.jsonl", m, 500), "unseen path is a miss");
+        cache.mark("/p/a.jsonl", 1000, 500, 500);
+        assert_eq!(cache.read_plan("/p/a.jsonl", 1000, 500), ReadPlan::Skip);
     }
 
     #[test]
-    fn retain_prunes_only_the_checkpoint_table_not_the_message_history() {
+    fn read_plan_tails_a_grown_file_from_the_stored_offset() {
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        cache.mark("/p/gone.jsonl", 1, 1);
-        cache.mark("/p/here.jsonl", 1, 1);
+        cache.mark("/p/a.jsonl", 1000, 500, 500);
+        // grown (600 > 500) with a non-zero stored offset: read only [500..EOF].
+        assert_eq!(cache.read_plan("/p/a.jsonl", 2000, 600), ReadPlan::Tail(500));
+    }
+
+    #[test]
+    fn read_plan_full_reads_a_shrunk_file() {
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        cache.mark("/p/a.jsonl", 1000, 500, 500);
+        assert_eq!(cache.read_plan("/p/a.jsonl", 2000, 400), ReadPlan::Full, "a shrink is never a tail");
+    }
+
+    #[test]
+    fn read_plan_full_reads_a_same_size_inplace_rewrite() {
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        cache.mark("/p/a.jsonl", 1000, 500, 500);
+        // Same size, newer mtime: an in-place rewrite, not an append.
+        assert_eq!(cache.read_plan("/p/a.jsonl", 2000, 500), ReadPlan::Full);
+        // Same size, OLDER mtime: strict equality both ways still re-reads.
+        assert_eq!(cache.read_plan("/p/a.jsonl", 999, 500), ReadPlan::Full);
+    }
+
+    #[test]
+    fn read_plan_full_reads_an_unknown_path() {
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        assert_eq!(cache.read_plan("/p/never.jsonl", 1, 1), ReadPlan::Full);
+    }
+
+    #[test]
+    fn read_plan_full_reads_a_grown_file_with_zero_offset() {
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        // A legacy/whole-file-no-newline row at offset 0: growth forces a Full.
+        cache.mark("/p/a.jsonl", 1000, 500, 0);
+        assert_eq!(cache.read_plan("/p/a.jsonl", 2000, 600), ReadPlan::Full);
+    }
+
+    #[test]
+    fn wipe_clears_both_data_tables() {
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
         cache.ingest(&[row("m1", "grilling", None, 10)]);
+        cache.mark("/p/a.jsonl", 1, 1, 1);
+        assert_eq!(cache.totals().len(), 1);
 
-        let keep: HashSet<String> = ["/p/here.jsonl".to_string()].into_iter().collect();
-        cache.retain(&keep);
+        cache.wipe();
 
-        assert!(cache.is_fresh("/p/here.jsonl", 1, 1));
-        assert!(!cache.is_fresh("/p/gone.jsonl", 1, 1), "absent path pruned from the gate");
-        assert_eq!(cache.totals()[0].work, 10, "message history is never pruned by retain");
+        assert!(cache.totals().is_empty(), "wipe clears message_usage");
+        assert_eq!(cache.read_plan("/p/a.jsonl", 1, 1), ReadPlan::Full, "wipe clears usage_checkpoint");
+    }
+
+    #[test]
+    fn has_vanished_checkpoint_flags_an_absent_path_only_when_its_dir_was_enumerated() {
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        cache.mark("/p/gone.jsonl", 1, 1, 1);
+        cache.mark("/p/here.jsonl", 1, 1, 1);
+        let dirs: HashSet<String> = ["/p".to_string()].into_iter().collect();
+
+        let both: HashSet<String> =
+            ["/p/gone.jsonl".to_string(), "/p/here.jsonl".to_string()].into_iter().collect();
+        assert!(!cache.has_vanished_checkpoint(&both, &dirs), "both present -> nothing vanished");
+
+        let only_here: HashSet<String> = ["/p/here.jsonl".to_string()].into_iter().collect();
+        assert!(cache.has_vanished_checkpoint(&only_here, &dirs), "gone.jsonl absent under an enumerated dir -> vanished");
+
+        // gone.jsonl absent, but its dir was NOT enumerated this scan: unknown.
+        let no_dirs: HashSet<String> = HashSet::new();
+        assert!(!cache.has_vanished_checkpoint(&only_here, &no_dirs), "an un-enumerated dir is never pruned");
+
+        // Total enumeration failure: nothing enumerated -> nothing vanished.
+        assert!(!cache.has_vanished_checkpoint(&HashSet::new(), &HashSet::new()));
+    }
+
+    #[test]
+    fn byte_offset_migrates_onto_an_existing_v1_db_without_wiping_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("usage.sqlite");
+        // Build a pre-#15 DB by hand: usage_checkpoint WITHOUT byte_offset, one
+        // message_usage row, logic_version already current (so no version wipe).
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE message_usage (
+                    message_id TEXT PRIMARY KEY, attribution_skill TEXT NOT NULL,
+                    attribution_plugin TEXT, is_subagent INTEGER NOT NULL,
+                    work INTEGER NOT NULL, cache_write INTEGER NOT NULL, cache_read INTEGER NOT NULL
+                 );
+                 CREATE TABLE usage_checkpoint (
+                    path TEXT PRIMARY KEY, mtime_nanos INTEGER NOT NULL,
+                    size INTEGER NOT NULL, logic_version INTEGER NOT NULL
+                 );
+                 CREATE TABLE usage_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO usage_meta (key, value) VALUES ('logic_version', ?1)", params![USAGE_LOGIC_VERSION]).unwrap();
+            conn.execute("INSERT INTO message_usage VALUES ('m1','grilling',NULL,0,30,0,0)", []).unwrap();
+            conn.execute("INSERT INTO usage_checkpoint (path, mtime_nanos, size, logic_version) VALUES ('/p/a.jsonl', 1000, 500, ?1)", params![USAGE_LOGIC_VERSION]).unwrap();
+        }
+
+        // Reopen through the real init: the guarded ALTER adds byte_offset and,
+        // because the logic_version already matches, history is preserved.
+        let cache = SqliteUsageCache::open(&db).unwrap();
+        assert_eq!(cache.totals().len(), 1, "an ALTER migration must not wipe message history");
+        assert_eq!(cache.totals()[0].work, 30);
+        // The migrated row reads back with byte_offset defaulted to 0.
+        assert_eq!(cache.read_plan("/p/a.jsonl", 1000, 500), ReadPlan::Skip, "an unchanged migrated file is still fresh");
+        assert_eq!(cache.read_plan("/p/a.jsonl", 2000, 600), ReadPlan::Full, "legacy offset 0 forces one full re-read on first growth");
     }
 
     #[test]
@@ -304,7 +441,7 @@ mod tests {
         {
             let cache = SqliteUsageCache::open(&db).unwrap();
             cache.ingest(&[row("m1", "grilling", None, 10)]);
-            cache.mark("/p/a.jsonl", 1, 1);
+            cache.mark("/p/a.jsonl", 1, 1, 0);
             assert_eq!(cache.totals().len(), 1);
         }
         // Simulate an old-version DB: rewrite the stored logic_version.
@@ -317,6 +454,6 @@ mod tests {
         // overwrite stale rows, so the only correct migration is a wipe.
         let cache = SqliteUsageCache::open(&db).unwrap();
         assert!(cache.totals().is_empty(), "a logic bump must wipe message_usage");
-        assert!(!cache.is_fresh("/p/a.jsonl", 1, 1), "a logic bump must wipe usage_checkpoint");
+        assert_eq!(cache.read_plan("/p/a.jsonl", 1, 1), ReadPlan::Full, "a logic bump must wipe usage_checkpoint");
     }
 }

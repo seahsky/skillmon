@@ -194,11 +194,18 @@ pub fn always_on_text_from_index(
 
 /// Gathers every `.jsonl` under `project_dirs`, paired with its project dir
 /// and mtime, ordered most-recent-first -- the input `ListingIndex::build`
-/// expects.
-pub fn transcript_refs_by_recency(project_dirs: &[PathBuf]) -> Vec<TranscriptRef> {
+/// expects. Also returns the set of dirs whose `read_dir` actually SUCCEEDED:
+/// the usage prune (issue #15) treats a checkpointed transcript as vanished
+/// only when its dir was successfully enumerated, so a transient `read_dir`
+/// failure on one dir is "unknown", never mistaken for a deletion (ADR 0024).
+/// A successfully-enumerated but empty dir is still in the set, which is what
+/// lets a genuinely emptied dir prune while a failed one does not.
+pub fn transcript_refs_by_recency(project_dirs: &[PathBuf]) -> (Vec<TranscriptRef>, HashSet<PathBuf>) {
     let mut refs: Vec<TranscriptRef> = Vec::new();
+    let mut enumerated_dirs: HashSet<PathBuf> = HashSet::new();
     for dir in project_dirs {
         let Ok(read_dir) = fs::read_dir(dir) else { continue };
+        enumerated_dirs.insert(dir.clone());
         for entry in read_dir.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -210,7 +217,7 @@ pub fn transcript_refs_by_recency(project_dirs: &[PathBuf]) -> Vec<TranscriptRef
         }
     }
     refs.sort_by_key(|r| std::cmp::Reverse(r.mtime));
-    refs
+    (refs, enumerated_dirs)
 }
 
 #[derive(Debug, Deserialize)]
@@ -552,7 +559,7 @@ mod tests {
             "- grilling: Interview relentlessly.\n- domain-modeling: Build the model.",
         );
 
-        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let (refs, _) = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
         let index = ListingIndex::build(&refs, &wanted(&["grilling"]));
 
         assert_eq!(index.resolve("grilling", &[project_dir]), Some("- grilling: Interview relentlessly."));
@@ -566,7 +573,7 @@ mod tests {
         sleep(Duration::from_millis(20));
         write_skill_listing_transcript(&project_dir, "newer.jsonl", &["grilling"], "- grilling: NEW wording");
 
-        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let (refs, _) = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
         let index = ListingIndex::build(&refs, &wanted(&["grilling"]));
 
         assert_eq!(index.resolve("grilling", &[project_dir]), Some("- grilling: NEW wording"));
@@ -580,7 +587,7 @@ mod tests {
         write_skill_listing_transcript(&repo_a, "s.jsonl", &["deploy"], "- deploy: repo A wording");
         write_skill_listing_transcript(&repo_b, "s.jsonl", &["deploy"], "- deploy: repo B wording");
 
-        let refs = transcript_refs_by_recency(&[repo_a.clone(), repo_b.clone()]);
+        let (refs, _) = transcript_refs_by_recency(&[repo_a.clone(), repo_b.clone()]);
         let index = ListingIndex::build(&refs, &wanted(&["deploy"]));
 
         // A project skill scoped to repo A only sees repo A's rendering.
@@ -605,7 +612,7 @@ mod tests {
         sleep(Duration::from_millis(20));
         write_skill_listing_transcript(&repo_b, "s.jsonl", &["deploy"], "- deploy: repo B wording");
 
-        let refs = transcript_refs_by_recency(&[repo_a.clone(), repo_b.clone()]);
+        let (refs, _) = transcript_refs_by_recency(&[repo_a.clone(), repo_b.clone()]);
         let index = ListingIndex::build(&refs, &wanted(&["deploy"]));
 
         assert_eq!(index.resolve("deploy", &[repo_a]), Some("- deploy: repo A wording"));
@@ -618,7 +625,7 @@ mod tests {
         let project_dir = tmp.path().join("repo-a");
         write_skill_listing_transcript(&project_dir, "s.jsonl", &["other"], "- other: something");
 
-        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let (refs, _) = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
         let index = ListingIndex::build(&refs, &wanted(&["grilling"]));
 
         assert_eq!(index.resolve("grilling", &[project_dir]), None);
@@ -636,7 +643,7 @@ mod tests {
         );
 
         let skill = sample_skill("grilling", "fallback, unused");
-        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let (refs, _) = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
         let index = ListingIndex::build(&refs, &wanted(&["grilling"]));
 
         let via_index = always_on_text_from_index(&skill, &index, std::slice::from_ref(&project_dir));
@@ -674,7 +681,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project_dir = tmp.path().join("repo-a");
         write_skill_listing_transcript(&project_dir, "s.jsonl", &["grilling"], "- grilling: Interview relentlessly.");
-        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let (refs, _) = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
         let cache = SqliteListingCache::open_in_memory().unwrap();
 
         let (cold, cold_stats) = ListingIndex::build_incremental(&refs, &wanted(&["grilling"]), &cache);
@@ -694,7 +701,7 @@ mod tests {
         let project_dir = tmp.path().join("repo-a");
         fs::create_dir_all(&project_dir).unwrap();
         fs::write(project_dir.join("plain.jsonl"), "{\"type\":\"message\",\"text\":\"hi\"}\n").unwrap();
-        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let (refs, _) = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
         let cache = SqliteListingCache::open_in_memory().unwrap();
 
         let (_, cold) = ListingIndex::build_incremental(&refs, &wanted(&["grilling"]), &cache);
@@ -711,7 +718,7 @@ mod tests {
         let first = serde_json::json!({"type":"attachment","attachment":{"type":"skill_listing","content":"- grilling: FIRST wording","names":["grilling"]}});
         let second = serde_json::json!({"type":"attachment","attachment":{"type":"skill_listing","content":"- grilling: SECOND wording","names":["grilling"]}});
         fs::write(project_dir.join("s.jsonl"), format!("{first}\n{second}\n")).unwrap();
-        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let (refs, _) = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
         let cache = SqliteListingCache::open_in_memory().unwrap();
 
         let (cold, _) = ListingIndex::build_incremental(&refs, &wanted(&["grilling"]), &cache);
@@ -729,7 +736,7 @@ mod tests {
         write_skill_listing_transcript(&project_dir, "s.jsonl", &["other"], "- other: something");
         let cache = SqliteListingCache::open_in_memory().unwrap();
 
-        let refs1 = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let (refs1, _) = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
         let (idx1, _) = ListingIndex::build_incremental(&refs1, &wanted(&["grilling"]), &cache);
         assert_eq!(idx1.resolve("grilling", std::slice::from_ref(&project_dir)), None, "not rendered yet");
 
@@ -738,7 +745,7 @@ mod tests {
         writeln!(f, "{extra}").unwrap();
         drop(f);
 
-        let refs2 = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let (refs2, _) = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
         let (idx2, stats2) = ListingIndex::build_incremental(&refs2, &wanted(&["grilling"]), &cache);
         assert!(stats2.files_read >= 1, "the grown file is re-read");
         assert_eq!(
@@ -778,7 +785,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project_dir = tmp.path().join("repo-a");
         write_skill_listing_transcript(&project_dir, "s.jsonl", &["grilling", "deploy"], "- grilling: g\n- deploy: d");
-        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let (refs, _) = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
         let cache = SqliteListingCache::open_in_memory().unwrap();
 
         let (only_grilling, _) = ListingIndex::build_incremental(&refs, &wanted(&["grilling"]), &cache);
@@ -794,7 +801,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project_dir = tmp.path().join("repo-a");
         write_skill_listing_transcript(&project_dir, "s.jsonl", &["grilling"], "- grilling: Interview relentlessly.");
-        let refs = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let (refs, _) = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
         let db = tmp.path().join("listing_index.sqlite");
 
         {
@@ -832,12 +839,12 @@ mod tests {
 
         // Time the whole index portion of a scan: enumerate + build.
         let t_cold = Instant::now();
-        let refs = transcript_refs_by_recency(&project_dirs);
+        let (refs, _) = transcript_refs_by_recency(&project_dirs);
         let (_, cold) = ListingIndex::build_incremental(&refs, &all, &cache);
         let cold_elapsed = t_cold.elapsed();
 
         let t_warm = Instant::now();
-        let refs2 = transcript_refs_by_recency(&project_dirs);
+        let (refs2, _) = transcript_refs_by_recency(&project_dirs);
         let (_, warm) = ListingIndex::build_incremental(&refs2, &all, &cache);
         let warm_elapsed = t_warm.elapsed();
 

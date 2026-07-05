@@ -222,7 +222,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         let all_project_dirs: Vec<PathBuf> = known_repos.iter().map(|r| r.project_dir.clone()).collect();
         let wanted: HashSet<String> =
             discovery.skills.iter().map(|s| s.directory_name().to_string()).collect();
-        let transcripts = transcript_refs_by_recency(&all_project_dirs);
+        let (transcripts, enumerated_dirs) = transcript_refs_by_recency(&all_project_dirs);
         let (index, _stats) = ListingIndex::build_incremental(&transcripts, &wanted, &self.listing_cache);
         // Bound the memo: drop rows for transcripts no longer present. Keyed on
         // every transcript this full scan enumerated, so a row is only evicted
@@ -243,8 +243,10 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         // Attributed usage (issue #5): ingest new transcript usage into the
         // persisted, deduped store over the SAME enumeration the listing index
         // already built, then index the totals by attribution key so each skill
-        // can look up its own.
-        usage::refresh_usage(&transcripts, &self.usage_cache);
+        // can look up its own. Passes the successfully-enumerated dirs so the
+        // usage prune (issue #15) can tell a genuine deletion from a transient
+        // read failure on one dir.
+        usage::refresh_usage(&transcripts, &enumerated_dirs, &self.usage_cache);
         let usage_index = UsageIndex::build(&self.usage_cache);
 
         let skills = discovery

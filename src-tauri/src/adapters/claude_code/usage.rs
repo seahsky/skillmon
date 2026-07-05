@@ -1,10 +1,12 @@
 use super::footprint_text::{mtime_nanos, TranscriptRef};
-use super::usage_cache::{SqliteUsageCache, UsageRow};
+use super::usage_cache::{ReadPlan, SqliteUsageCache, UsageRow};
 use crate::domain::report::{AttributionSource, UsageReport};
 use crate::domain::skill::{DiscoveredSkill, SkillId};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 /// Substring prefilter: only lines carrying a usage block are worth a full
 /// parse, so the vast majority of transcript lines are skipped cheaply
@@ -114,23 +116,57 @@ impl UsageKey {
 }
 
 /// Read accounting for the usage pass, so a test can assert a warm rescan
-/// re-reads no transcripts.
+/// re-reads no transcripts and that a growth tailed rather than fully re-read.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct UsageStats {
     pub files_total: usize,
     pub files_read: usize,
+    /// Bytes actually read from disk this pass (a tail reads far fewer than a
+    /// full re-read of the same grown file).
+    pub bytes_read: u64,
+    pub tail_reads: usize,
+    /// Whole-file reads, INCLUDING a tail that fell back to Full because the
+    /// prefix had been rewritten.
+    pub full_reads: usize,
 }
 
-/// Incremental usage ingest over `transcripts` (issue #5). Takes the
-/// already-enumerated main-thread refs `scan_all` built for the listing index,
-/// so a scan enumerates the transcript dirs once, not twice. A file is opened
-/// only when its `(mtime, size)` changed since last scan; rows are written
-/// INSERT OR IGNORE, so a re-read is idempotent and cross-file duplicate
-/// `message.id`s (resume/branch/compact) count once. Sub-agent files live under
-/// `subagents/` subdirs, which the enumeration does not descend into, so they
-/// are excluded by default for free.
-pub fn refresh_usage(transcripts: &[TranscriptRef], cache: &SqliteUsageCache) -> UsageStats {
+/// Incremental usage ingest over `transcripts` (issue #5 + #15). Takes the
+/// already-enumerated main-thread refs `scan_all` built for the listing index
+/// (so a scan enumerates the transcript dirs once, not twice) plus the set of
+/// dirs whose enumeration actually SUCCEEDED (`enumerated_dirs`), which the
+/// prune step needs to tell a real deletion from a transient read failure.
+///
+/// Two hygiene jobs wrap the per-file loop (issue #15, ADR 0024):
+/// - **Prune by rebuild.** If a checkpointed transcript has genuinely vanished,
+///   `wipe` both tables and let the loop re-ingest the present set. Rows carry
+///   no per-path provenance and a `message.id` lives in many transcripts, so a
+///   targeted delete is unsafe; a rebuild via `message.id` dedup is the only
+///   correct prune (a still-present id survives, an only-in-vanished id drops).
+/// - **Tail-read.** A file is opened only when its `(mtime, size)` changed; a
+///   grown file with an intact prefix reads only its appended bytes.
+///
+/// Rows are written INSERT OR IGNORE, so any re-read is idempotent and both a
+/// mis-tailed rewrite and a cross-file duplicate `message.id` collapse to one
+/// count. Sub-agent files live under `subagents/` subdirs the enumeration never
+/// descends into, so they stay excluded by default for free.
+pub fn refresh_usage(
+    transcripts: &[TranscriptRef],
+    enumerated_dirs: &HashSet<PathBuf>,
+    cache: &SqliteUsageCache,
+) -> UsageStats {
     let mut stats = UsageStats::default();
+
+    // Conditional full rebuild on a genuine vanish. The dir-scoped check inside
+    // `has_vanished_checkpoint` already ignores dirs that failed to enumerate,
+    // so an empty enumeration (total read failure) reports nothing vanished and
+    // never wipes -- no separate "is_empty" guard is needed or correct.
+    let seen: HashSet<String> =
+        transcripts.iter().map(|t| t.path.to_string_lossy().into_owned()).collect();
+    let enumerated: HashSet<String> =
+        enumerated_dirs.iter().map(|d| d.to_string_lossy().into_owned()).collect();
+    if cache.has_vanished_checkpoint(&seen, &enumerated) {
+        cache.wipe();
+    }
 
     for transcript in transcripts {
         stats.files_total += 1;
@@ -138,30 +174,75 @@ pub fn refresh_usage(transcripts: &[TranscriptRef], cache: &SqliteUsageCache) ->
         let size = transcript.size as i64;
         let mnanos = mtime_nanos(transcript.mtime);
 
-        if let Some(m) = mnanos {
-            if cache.is_fresh(&path_key, m, size) {
-                continue;
-            }
-        }
+        // A file with no reliable mtime key can't be checkpointed, so it is
+        // fully re-read every scan and never marked (unchanged from #5).
+        let plan = match mnanos {
+            Some(m) => cache.read_plan(&path_key, m, size),
+            None => ReadPlan::Full,
+        };
+
+        // Resolve the plan to the bytes to parse: `base` is their byte offset
+        // in the file, `slice_start` is where they begin within `bytes` (1 for a
+        // tail, to drop the boundary newline). `is_tail` is only for accounting.
+        let (base, bytes, slice_start, is_tail) = match plan {
+            ReadPlan::Skip => continue,
+            ReadPlan::Full => match fs::read(&transcript.path) {
+                Ok(bytes) => (0u64, bytes, 0usize, false),
+                Err(_) => continue,
+            },
+            ReadPlan::Tail(off) => match read_tail_bytes(&transcript.path, off) {
+                // The byte at `off - 1` is the newline we last parsed past, so
+                // the prefix is intact and only `[off..EOF]` is new.
+                Some(buf) if buf.first() == Some(&b'\n') => (off, buf, 1usize, true),
+                // Boundary byte isn't a newline: the prefix was rewritten, so
+                // the append assumption is void -- re-read the whole file. This
+                // is safe (never overcounts) because ingest dedups on the stable
+                // message.id, but it counts as a full read.
+                Some(_) => match fs::read(&transcript.path) {
+                    Ok(bytes) => (0u64, bytes, 0usize, false),
+                    Err(_) => continue,
+                },
+                None => continue,
+            },
+        };
+
         stats.files_read += 1;
-        let Ok(content) = fs::read_to_string(&transcript.path) else { continue };
-        cache.ingest(&parse_usage_rows(&content));
-        // A truncated trailing line fails serde and is skipped; completing it
-        // changes `(mtime, size)`, so the file re-reads and the once-partial
-        // record then counts exactly once.
+        stats.bytes_read += bytes.len() as u64;
+        if is_tail {
+            stats.tail_reads += 1;
+        } else {
+            stats.full_reads += 1;
+        }
+
+        // Consume only up to and including the last newline; a partial trailing
+        // line stays unparsed and is re-read (as a tail) once completed.
+        let appended = &bytes[slice_start..];
+        let consumed = appended.iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0);
+        // The consumed slice ends exactly on a '\n' (a char boundary), so it is
+        // valid UTF-8 whenever the file is; a non-UTF-8 file is skipped without
+        // advancing the gate, exactly as the old read_to_string path did.
+        let Ok(text) = std::str::from_utf8(&appended[..consumed]) else { continue };
+        cache.ingest(&parse_usage_rows(text));
+        let new_off = base + consumed as u64;
         if let Some(m) = mnanos {
-            cache.mark(&path_key, m, size);
+            cache.mark(&path_key, m, size, new_off as i64);
         }
     }
 
-    // Prune the checkpoint gate for vanished transcripts, but skip an empty
-    // enumeration (a transient read failure) so the whole gate isn't wiped.
-    if !transcripts.is_empty() {
-        let seen: HashSet<String> =
-            transcripts.iter().map(|t| t.path.to_string_lossy().into_owned()).collect();
-        cache.retain(&seen);
-    }
     stats
+}
+
+/// Reads `[off - 1 .. EOF]` of `path`: the byte before the append point plus
+/// everything after it. The caller inspects `buf[0]` (the presumed boundary
+/// newline) to confirm the prefix is intact before trusting the tail. `None`
+/// on any I/O error, so the caller falls through to a re-read. `off` is always
+/// `> 0` (only `read_plan`'s `Tail(off)` reaches here, and it never yields 0).
+fn read_tail_bytes(path: &Path, off: u64) -> Option<Vec<u8>> {
+    let mut file = fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(off - 1)).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    Some(buf)
 }
 
 /// The per-attribution totals folded into a lookup keyed by the join key, so
@@ -204,15 +285,33 @@ impl UsageIndex {
 #[cfg(test)]
 mod tests {
     use super::super::footprint_text::transcript_refs_by_recency;
+    use super::super::usage_cache::UsageTotal;
     use super::*;
     use crate::domain::skill::{Frontmatter, SkillId};
     use serde_json::json;
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, UNIX_EPOCH};
 
-    /// Enumerate a single dir into the `TranscriptRef`s `refresh_usage` now
-    /// takes, re-stat'd fresh so an appended/rewritten file is seen.
-    fn refs(dir: &Path) -> Vec<TranscriptRef> {
-        transcript_refs_by_recency(&[dir.to_path_buf()])
+    /// Enumerate a single dir fresh (re-stat'd so an append/rewrite is seen) and
+    /// run one usage refresh over it -- the common case for these tests.
+    fn scan(dir: &Path, cache: &SqliteUsageCache) -> UsageStats {
+        let (refs, dirs) = transcript_refs_by_recency(&[dir.to_path_buf()]);
+        refresh_usage(&refs, &dirs, cache)
+    }
+
+    /// Force a file's mtime to a fixed instant, so a test can drive `read_plan`
+    /// past the `(mtime, size)` gate deterministically (an in-place same-size
+    /// rewrite needs a distinct mtime to be seen at all).
+    fn set_mtime(path: &Path, secs: u64) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+    }
+
+    fn append_line(path: &Path, line: &str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(f, "{line}").unwrap();
     }
 
     #[allow(clippy::too_many_arguments)] // a test fixture builder; each arg is a distinct transcript field
@@ -362,11 +461,11 @@ mod tests {
         write_transcript(&dir, "s.jsonl", &[assistant_line("m1", "u1", Some("grilling"), None, 10, 5, 0, 0)]);
         let cache = SqliteUsageCache::open_in_memory().unwrap();
 
-        let cold = refresh_usage(&refs(&dir), &cache);
+        let cold = scan(&dir, &cache);
         assert_eq!(cold.files_read, 1);
         let cold_total = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
 
-        let warm = refresh_usage(&refs(&dir), &cache);
+        let warm = scan(&dir, &cache);
         assert_eq!(warm.files_read, 0, "an unchanged transcript is not re-read");
         let warm_total = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(cold_total, warm_total, "warm totals must be byte-identical (idempotent)");
@@ -381,13 +480,13 @@ mod tests {
         let path = dir.join("s.jsonl");
         write_transcript(&dir, "s.jsonl", &[assistant_line("m1", "u1", Some("grilling"), None, 10, 0, 0, 0)]);
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        refresh_usage(&refs(&dir), &cache);
+        scan(&dir, &cache);
 
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(f, "{}", assistant_line("m2", "u2", Some("grilling"), None, 7, 0, 0, 0)).unwrap();
         drop(f);
 
-        let stats = refresh_usage(&refs(&dir), &cache);
+        let stats = scan(&dir, &cache);
         assert_eq!(stats.files_read, 1, "the grown file is re-read");
         let total = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(total, 17, "m1 (10) counted once + m2 (7); no double count of m1 on the re-read");
@@ -403,14 +502,14 @@ mod tests {
         // Second line is a truncated (mid-write) JSON object.
         fs::write(&path, format!("{good}\n{{\"type\":\"assist")).unwrap();
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        refresh_usage(&refs(&dir), &cache);
+        scan(&dir, &cache);
         let after_partial = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(after_partial, 10, "the partial line is skipped, not counted");
 
         // Complete the file; the once-partial record now counts exactly once.
         let m2 = assistant_line("m2", "u2", Some("grilling"), None, 5, 0, 0, 0);
         fs::write(&path, format!("{good}\n{m2}\n")).unwrap();
-        refresh_usage(&refs(&dir), &cache);
+        scan(&dir, &cache);
         let after_complete = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(after_complete, 15);
     }
@@ -431,7 +530,7 @@ mod tests {
             ],
         );
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        refresh_usage(&refs(&dir), &cache);
+        scan(&dir, &cache);
 
         let total = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(total, 17, "msg_A (10) counted once across both files + msg_B (7)");
@@ -448,10 +547,292 @@ mod tests {
         write_transcript(&sub_dir, "agent-1.jsonl", &[assistant_line("m_sub", "u2", Some("grilling"), None, 999, 0, 0, 0)]);
 
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        let stats = refresh_usage(&refs(&dir), &cache);
+        let stats = scan(&dir, &cache);
 
         assert_eq!(stats.files_read, 1, "only the depth-1 main.jsonl is enumerated, never the subagents/ file");
         let total = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(total, 10, "the sub-agent file's 999 tokens are excluded by default");
+    }
+
+    // ---- issue #15: byte-offset tail-reader ----
+
+    /// This machine's grilling work total, the metric most #15 tests assert on.
+    fn grilling_work(cache: &SqliteUsageCache) -> u64 {
+        UsageIndex::build(cache)
+            .for_skill(&skill(SkillId::Personal { name: "grilling".to_string() }))
+            .map(|u| u.work)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn an_append_tail_reads_only_the_appended_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        let path = dir.join("s.jsonl");
+        // A is deliberately several records, so a tail of the small append reads
+        // far fewer bytes than a full re-read of the grown file would (AC2).
+        let a_lines: Vec<String> = (0..5)
+            .map(|i| assistant_line(&format!("a{i}"), &format!("u{i}"), Some("grilling"), None, 10, 0, 0, 0))
+            .collect();
+        write_transcript(&dir, "s.jsonl", &a_lines);
+        set_mtime(&path, 1000);
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        let cold = scan(&dir, &cache);
+        assert_eq!(cold.full_reads, 1, "the cold pass is a full read");
+        let a_size = fs::metadata(&path).unwrap().len();
+
+        append_line(&path, &assistant_line("b1", "ub", Some("grilling"), None, 7, 0, 0, 0));
+        set_mtime(&path, 2000);
+
+        let stats = scan(&dir, &cache);
+        assert_eq!(stats.tail_reads, 1, "a grown file with an intact prefix is tail-read");
+        assert_eq!(stats.full_reads, 0);
+        assert!(
+            stats.bytes_read < a_size,
+            "a tail reads fewer bytes than a full re-read of A ({} vs {a_size})",
+            stats.bytes_read,
+        );
+        assert_eq!(grilling_work(&cache), 5 * 10 + 7, "all five A records once + the appended B");
+    }
+
+    #[test]
+    fn a_compaction_shrink_triggers_a_full_re_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        let path = dir.join("s.jsonl");
+        write_transcript(&dir, "s.jsonl", &[
+            assistant_line("m1", "u1", Some("grilling"), None, 10, 0, 0, 0),
+            assistant_line("m2", "u2", Some("grilling"), None, 20, 0, 0, 0),
+            assistant_line("m3", "u3", Some("grilling"), None, 30, 0, 0, 0),
+        ]);
+        set_mtime(&path, 1000);
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        scan(&dir, &cache);
+
+        // A shrink (fewer bytes than before) is never an append.
+        fs::write(&path, format!("{}\n", assistant_line("m1", "u1", Some("grilling"), None, 10, 0, 0, 0))).unwrap();
+        set_mtime(&path, 2000);
+        let new_size = fs::metadata(&path).unwrap().len();
+
+        let stats = scan(&dir, &cache);
+        assert_eq!(stats.full_reads, 1, "a shrink forces a full re-read, never a tail");
+        assert_eq!(stats.tail_reads, 0);
+        assert_eq!(stats.bytes_read, new_size, "a full read reads the whole (shrunk) file");
+    }
+
+    #[test]
+    fn a_same_size_rewrite_with_a_newer_mtime_triggers_a_full_re_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        let path = dir.join("s.jsonl");
+        let a = assistant_line("m1", "u1", Some("grilling"), None, 10, 0, 0, 0);
+        write_transcript(&dir, "s.jsonl", std::slice::from_ref(&a));
+        set_mtime(&path, 1000);
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        scan(&dir, &cache);
+        let size = fs::metadata(&path).unwrap().len();
+
+        // Rewrite in place: SAME byte size, different content, newer mtime.
+        let b = assistant_line("m2", "u2", Some("grilling"), None, 20, 0, 0, 0);
+        assert_eq!(a.len(), b.len(), "test setup: both lines must be the same byte length");
+        fs::write(&path, format!("{b}\n")).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), size, "test setup: same byte size after rewrite");
+        set_mtime(&path, 2000);
+
+        let stats = scan(&dir, &cache);
+        assert_eq!(stats.full_reads, 1, "a same-size in-place rewrite (mtime changed) is a full re-read");
+        assert_eq!(stats.tail_reads, 0);
+    }
+
+    #[test]
+    fn a_truncated_append_is_not_counted_until_completed_via_tail() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        let path = dir.join("s.jsonl");
+        write_transcript(&dir, "s.jsonl", &[assistant_line("m1", "u1", Some("grilling"), None, 10, 0, 0, 0)]);
+        set_mtime(&path, 1000);
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        scan(&dir, &cache);
+
+        // Append a complete record WITHOUT its line terminator: a mid-write
+        // partial line from the tail-reader's point of view.
+        let m2 = assistant_line("m2", "u2", Some("grilling"), None, 5, 0, 0, 0);
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            write!(f, "{m2}").unwrap();
+        }
+        set_mtime(&path, 2000);
+        let partial = scan(&dir, &cache);
+        assert_eq!(partial.tail_reads, 1, "the grown file is tail-read");
+        assert_eq!(grilling_work(&cache), 10, "an unterminated trailing line is not counted yet");
+
+        // Terminate the line: the once-partial record now counts exactly once,
+        // re-read as a tail from the SAME offset (it never advanced past it).
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f).unwrap();
+        }
+        set_mtime(&path, 3000);
+        let done = scan(&dir, &cache);
+        assert_eq!(done.tail_reads, 1);
+        assert_eq!(grilling_work(&cache), 15, "the completed record counts once");
+    }
+
+    #[test]
+    fn a_grown_file_with_a_rewritten_prefix_falls_back_to_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        let path = dir.join("s.jsonl");
+        let a = assistant_line("m1", "u1", Some("grilling"), None, 10, 0, 0, 0);
+        write_transcript(&dir, "s.jsonl", std::slice::from_ref(&a));
+        set_mtime(&path, 1000);
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        scan(&dir, &cache);
+
+        // Grow the FIRST line (trailing spaces keep m1's identity -- JSON ignores
+        // them) so the stored offset now points inside the rewritten line: the
+        // boundary byte is a space, not the old newline, forcing a Full fallback.
+        let a_padded = format!("{a}          ");
+        let b = assistant_line("m2", "u2", Some("grilling"), None, 7, 0, 0, 0);
+        fs::write(&path, format!("{a_padded}\n{b}\n")).unwrap();
+        set_mtime(&path, 2000);
+
+        let stats = scan(&dir, &cache);
+        assert_eq!(stats.full_reads, 1, "a rewritten prefix falls back to a full read");
+        assert_eq!(stats.tail_reads, 0);
+        assert_eq!(grilling_work(&cache), 17, "m1 (same id, deduped) + the new m2");
+    }
+
+    #[test]
+    fn tail_and_full_incremental_yield_identical_totals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        let path = dir.join("s.jsonl");
+
+        // Incremental store: a cold read, then a sequence of appends -- each a
+        // tail -- across two skills and a plugin attribution.
+        let incr = SqliteUsageCache::open_in_memory().unwrap();
+        write_transcript(&dir, "s.jsonl", &[assistant_line("m1", "u1", Some("grilling"), None, 10, 0, 0, 0)]);
+        set_mtime(&path, 1000);
+        assert_eq!(scan(&dir, &incr).full_reads, 1);
+
+        append_line(&path, &assistant_line("m2", "u2", Some("grilling"), None, 20, 0, 0, 0));
+        set_mtime(&path, 2000);
+        assert_eq!(scan(&dir, &incr).tail_reads, 1);
+
+        append_line(&path, &assistant_line("m3", "u3", Some("superpowers:executing-plans"), Some("superpowers"), 30, 0, 0, 0));
+        set_mtime(&path, 3000);
+        assert_eq!(scan(&dir, &incr).tail_reads, 1);
+
+        append_line(&path, &assistant_line("m4", "u4", Some("grilling"), None, 5, 0, 0, 0));
+        set_mtime(&path, 4000);
+        assert_eq!(scan(&dir, &incr).tail_reads, 1);
+
+        // Control: a fresh cache does ONE cold full read of the FINAL file.
+        let control = SqliteUsageCache::open_in_memory().unwrap();
+        let ctrl_stats = scan(&dir, &control);
+        assert_eq!(ctrl_stats.full_reads, 1, "the control is a single cold pass");
+        assert_eq!(ctrl_stats.tail_reads, 0);
+
+        let key = |t: &UsageTotal| (t.attribution_skill.clone(), t.attribution_plugin.clone());
+        let mut incr_totals = incr.totals();
+        let mut ctrl_totals = control.totals();
+        incr_totals.sort_by_key(key);
+        ctrl_totals.sort_by_key(key);
+        assert_eq!(incr_totals, ctrl_totals, "incremental tail reads must equal a cold full read");
+    }
+
+    #[test]
+    fn a_vanished_transcript_is_rebuilt_without_losing_shared_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        // a: msgA; b: a resume holding msgA (again) + msgB; c: msgC.
+        write_transcript(&dir, "a.jsonl", &[assistant_line("msgA", "ua", Some("grilling"), None, 10, 0, 0, 0)]);
+        write_transcript(&dir, "b.jsonl", &[
+            assistant_line("msgA", "ua-copy", Some("grilling"), None, 10, 0, 0, 0),
+            assistant_line("msgB", "ub", Some("grilling"), None, 7, 0, 0, 0),
+        ]);
+        write_transcript(&dir, "c.jsonl", &[assistant_line("msgC", "uc", Some("grilling"), None, 5, 0, 0, 0)]);
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        scan(&dir, &cache);
+        assert_eq!(grilling_work(&cache), 22, "msgA(10, once across a+b) + msgB(7) + msgC(5)");
+
+        // a and c vanish; b (which also holds msgA) survives.
+        fs::remove_file(dir.join("a.jsonl")).unwrap();
+        fs::remove_file(dir.join("c.jsonl")).unwrap();
+
+        let stats = scan(&dir, &cache);
+        assert!(stats.files_read >= 1, "the rebuild re-reads the surviving transcript");
+        assert_eq!(
+            grilling_work(&cache),
+            17,
+            "rebuild drops msgC (only in the vanished c) but keeps msgA (still in b) + msgB",
+        );
+    }
+
+    #[test]
+    fn a_rebuild_is_idempotent_on_the_next_warm_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        write_transcript(&dir, "a.jsonl", &[assistant_line("msgA", "ua", Some("grilling"), None, 10, 0, 0, 0)]);
+        write_transcript(&dir, "b.jsonl", &[assistant_line("msgB", "ub", Some("grilling"), None, 7, 0, 0, 0)]);
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        scan(&dir, &cache);
+
+        fs::remove_file(dir.join("a.jsonl")).unwrap();
+        let rebuilt = scan(&dir, &cache); // detects the vanish, wipes, re-ingests b
+        assert!(rebuilt.files_read >= 1);
+        assert_eq!(grilling_work(&cache), 7, "only msgB survives the rebuild");
+
+        // Nothing changed since: no vanish, no re-read, identical total.
+        let warm = scan(&dir, &cache);
+        assert_eq!(warm.files_read, 0, "a warm rescan after a rebuild re-reads nothing");
+        assert_eq!(grilling_work(&cache), 7);
+    }
+
+    #[test]
+    fn an_empty_enumeration_does_not_wipe_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        write_transcript(&dir, "s.jsonl", &[assistant_line("m1", "u1", Some("grilling"), None, 10, 0, 0, 0)]);
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        scan(&dir, &cache);
+        assert_eq!(grilling_work(&cache), 10);
+
+        // A total enumeration failure (no dirs read) must NOT be read as "every
+        // transcript vanished": the cumulative store is preserved.
+        let no_dirs: HashSet<PathBuf> = HashSet::new();
+        let stats = refresh_usage(&[], &no_dirs, &cache);
+        assert_eq!(stats.files_read, 0);
+        assert_eq!(grilling_work(&cache), 10, "an empty enumeration preserves the store");
+    }
+
+    #[test]
+    fn a_transiently_unreadable_project_dir_does_not_wipe_usage_for_its_present_transcripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_a = tmp.path().join("repo-a");
+        let dir_b = tmp.path().join("repo-b");
+        write_transcript(&dir_a, "a.jsonl", &[assistant_line("mA", "uA", Some("grilling"), None, 10, 0, 0, 0)]);
+        write_transcript(&dir_b, "b.jsonl", &[assistant_line("mB", "uB", Some("grilling"), None, 20, 0, 0, 0)]);
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        let (refs, dirs) = transcript_refs_by_recency(&[dir_a.clone(), dir_b.clone()]);
+        refresh_usage(&refs, &dirs, &cache);
+        assert_eq!(grilling_work(&cache), 30);
+
+        // repo-b becomes unreadable (here: removed, so read_dir fails -- the
+        // portable stand-in for any transient enumeration failure). Its
+        // checkpoint is "unknown", never a vanish, so nothing is wiped and mB's
+        // usage survives even though b.jsonl is absent from this scan.
+        fs::remove_dir_all(&dir_b).unwrap();
+        let (refs2, dirs2) = transcript_refs_by_recency(&[dir_a.clone(), dir_b.clone()]);
+        assert!(!dirs2.contains(&dir_b), "an unreadable dir is not in the enumerated set");
+        refresh_usage(&refs2, &dirs2, &cache);
+
+        assert_eq!(
+            grilling_work(&cache),
+            30,
+            "a transiently unreadable dir must not wipe its transcripts' usage (data-loss guard)",
+        );
     }
 }
