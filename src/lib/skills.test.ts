@@ -111,34 +111,43 @@ describe("normalizeApiKey", () => {
 });
 
 describe("usageDisplay", () => {
-  const src = "native" as const;
-
   it("renders nothing for an untouched skill, never ~0", () => {
     expect(usageDisplay(null)).toBe("");
   });
 
-  it("shows ~work during this skill with cache-read segmented out, never blended or a currency", () => {
-    const usage: UsageReport = { work: 1229, cacheWrite: 13781, cacheRead: 35154, attributionSource: src };
-    const out = usageDisplay(usage);
+  // The display is identical whether the figure is native or reconstructed:
+  // both are estimates rendered the same way (issue #12); the confidence badge
+  // is a separate slice keyed off attributionSource, not the token text.
+  const sources = ["native", "reconstructed"] as const;
 
-    expect(out).toBe("~1.2k during this skill · ~35k cached");
-    expect(out.startsWith("~1.2k during this skill")).toBe(true);
-    expect(out).not.toContain("$");
-  });
+  it.each(sources)(
+    "shows ~work during this skill with cache-read segmented out, never blended or a currency (%s)",
+    (src) => {
+      const usage: UsageReport = { work: 1229, cacheWrite: 13781, cacheRead: 35154, attributionSource: src };
+      const out = usageDisplay(usage);
 
-  it("omits the cached segment when cache-read is zero", () => {
+      expect(out).toBe("~1.2k during this skill · ~35k cached");
+      expect(out.startsWith("~1.2k during this skill")).toBe(true);
+      expect(out).not.toContain("$");
+    },
+  );
+
+  it.each(sources)("omits the cached segment when cache-read is zero (%s)", (src) => {
     expect(usageDisplay({ work: 500, cacheWrite: 0, cacheRead: 0, attributionSource: src })).toBe(
       "~500 during this skill",
     );
   });
 
-  it("usageTitle carries the full comma-grouped figures and the during-not-by framing", () => {
-    const title = usageTitle({ work: 1229, cacheWrite: 13781, cacheRead: 35154, attributionSource: src });
-    expect(title).toContain("~1,229 work tokens during this skill, not by it");
-    expect(title).toContain("~35,154 cache-read");
-    expect(title).toContain("~13,781 cache-write");
-    expect(title).not.toContain("$");
-  });
+  it.each(sources)(
+    "usageTitle carries the full comma-grouped figures and the during-not-by framing (%s)",
+    (src) => {
+      const title = usageTitle({ work: 1229, cacheWrite: 13781, cacheRead: 35154, attributionSource: src });
+      expect(title).toContain("~1,229 work tokens during this skill, not by it");
+      expect(title).toContain("~35,154 cache-read");
+      expect(title).toContain("~13,781 cache-write");
+      expect(title).not.toContain("$");
+    },
+  );
 });
 
 describe("estimatedLayerCount", () => {

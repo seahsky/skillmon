@@ -610,6 +610,46 @@ mod tests {
     }
 
     #[test]
+    fn scan_all_reconstructs_usage_from_a_pre_attribution_transcript() {
+        use crate::domain::report::AttributionSource;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        write_skill(&claude_home.join("skills").join("grilling"), "grilling");
+
+        // A pre-attribution (2.1.145) transcript that registers a known repo
+        // (cwd) and, with NO native attributionSkill anywhere, invokes `grilling`
+        // and then produces a turn -- which the reconstruction walk must credit.
+        let project_dir = claude_home.join("projects").join("-tmp-repo");
+        fs::create_dir_all(&project_dir).unwrap();
+        let human = serde_json::json!({
+            "type": "user", "version": "2.1.145", "cwd": "/tmp/some-repo",
+            "message": {"role": "user", "content": "help me"}
+        });
+        let invoke = serde_json::json!({
+            "type": "assistant", "version": "2.1.145", "uuid": "m_inv",
+            "message": {"id": "m_inv", "role": "assistant",
+                "content": [{"type": "tool_use", "name": "Skill", "input": {"skill": "grilling"}}],
+                "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+        });
+        let turn = serde_json::json!({
+            "type": "assistant", "version": "2.1.145", "uuid": "m1",
+            "message": {"id": "m1", "role": "assistant",
+                "content": [{"type": "text", "text": "asking a question"}],
+                "usage": {"input_tokens": 30, "output_tokens": 10, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+        });
+        fs::write(project_dir.join("s.jsonl"), format!("{human}\n{invoke}\n{turn}\n")).unwrap();
+
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        let report = adapter.scan_all();
+
+        let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        let usage = grilling.usage.expect("grilling should have reconstructed usage");
+        assert_eq!(usage.work, 40, "the post-invoke turn (30 + 10) is credited to grilling");
+        assert_eq!(usage.attribution_source, AttributionSource::Reconstructed);
+    }
+
+    #[test]
     fn stale_exact_count_is_zero_on_a_fresh_cache() {
         let tmp = tempfile::tempdir().unwrap();
         let claude_home = tmp.path().join(".claude");

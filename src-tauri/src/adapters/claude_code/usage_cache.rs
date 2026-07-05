@@ -2,12 +2,17 @@ use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use std::collections::HashSet;
 use std::path::Path;
 
-/// Bump when the parse or bucketing logic (`usage::parse_usage_rows`) changes.
-/// Unlike `SqliteListingCache`, whose per-path `put` overwrites, `message_usage`
-/// is written INSERT OR IGNORE and can never overwrite a stale row, so a bump
-/// must WIPE both tables and rebuild (handled in `init`). This divergence is
-/// load-bearing (ADR 0024).
-pub const USAGE_LOGIC_VERSION: i64 = 1;
+/// Bump when the parse or bucketing logic (`usage::parse_usage_rows` /
+/// `reconstruct_usage_rows`) or the `message_usage` SCHEMA changes. Unlike
+/// `SqliteListingCache`, whose per-path `put` overwrites, a reconstructed
+/// `message_usage` row is written INSERT OR IGNORE and can never overwrite a
+/// stale row, so a bump must DROP both data tables and rebuild them at the new
+/// schema (handled in `init`). This divergence is load-bearing (ADR 0024).
+///
+/// v2 (issue #12): added the `attribution_source TEXT NOT NULL` column, so the
+/// migration DROPs rather than DELETEs -- a DELETE would leave the old, narrower
+/// table and fail every subsequent INSERT against the wider schema.
+pub const USAGE_LOGIC_VERSION: i64 = 2;
 
 /// One attributed `assistant` record's usage, the unit written to the store.
 /// `message_id` is the dedup key (`message.id`, never the record `uuid`);
@@ -21,6 +26,11 @@ pub struct UsageRow {
     pub work: u32,
     pub cache_write: u32,
     pub cache_read: u32,
+    /// `true` for a version-gated reconstructed credit (issue #12), `false` for
+    /// a native `attributionSkill` credit. Drives which ingest path is taken:
+    /// native rows overwrite on conflict, reconstructed rows never do, so native
+    /// always wins for a shared `message.id` regardless of ingest order.
+    pub reconstructed: bool,
 }
 
 /// Per-attribution totals, re-derived by GROUP BY on every read so a dedup can
@@ -34,6 +44,12 @@ pub struct UsageTotal {
     pub work: u64,
     pub cache_write: u64,
     pub cache_read: u64,
+    /// `true` if ANY message in this attribution group was reconstructed, so a
+    /// mixed skill is honestly downgraded to the lower-confidence label (ADR
+    /// 0003). Derived from `MAX(attribution_source)`: "reconstructed" sorts
+    /// after "native" under the default BINARY collation, so the group MAX is
+    /// "reconstructed" iff at least one row is (this ordering is load-bearing).
+    pub reconstructed: bool,
 }
 
 /// Persisted, GLOBAL attributed-usage store (issue #5, ADR 0024). Global
@@ -59,6 +75,30 @@ impl SqliteUsageCache {
     }
 
     fn init(conn: Connection) -> SqliteResult<Self> {
+        // `usage_meta` must exist before the stored logic version can be read.
+        // It survives a logic bump (only the two data tables are dropped), so
+        // the version marker itself is never lost.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS usage_meta (
+                key   TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );",
+        )?;
+
+        let stored: Option<i64> = conn
+            .query_row("SELECT value FROM usage_meta WHERE key = 'logic_version'", [], |r| r.get(0))
+            .optional()?;
+
+        // A logic bump can change the SCHEMA (v2 added `attribution_source NOT
+        // NULL`), so the migration must DROP the data tables BEFORE the CREATE
+        // below, not DELETE their rows: a DELETE keeps the old, narrower columns
+        // and every later INSERT against the wider schema would fail. DROP also
+        // resets every checkpoint, so all transcripts re-ingest under the new
+        // logic (required, else reconstructed rows would never land). ADR 0024.
+        if stored != Some(USAGE_LOGIC_VERSION) {
+            conn.execute_batch("DROP TABLE IF EXISTS message_usage; DROP TABLE IF EXISTS usage_checkpoint;")?;
+        }
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS message_usage (
                 message_id         TEXT PRIMARY KEY,
@@ -67,28 +107,18 @@ impl SqliteUsageCache {
                 is_subagent        INTEGER NOT NULL,
                 work               INTEGER NOT NULL,
                 cache_write        INTEGER NOT NULL,
-                cache_read         INTEGER NOT NULL
+                cache_read         INTEGER NOT NULL,
+                attribution_source TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS usage_checkpoint (
                 path          TEXT PRIMARY KEY,
                 mtime_nanos   INTEGER NOT NULL,
                 size          INTEGER NOT NULL,
                 logic_version INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS usage_meta (
-                key   TEXT PRIMARY KEY,
-                value INTEGER NOT NULL
             );",
         )?;
 
-        // Because INSERT OR IGNORE never overwrites, a logic-version change
-        // cannot refresh stored rows in place; the only correct migration is a
-        // wipe-and-rebuild (ADR 0024).
-        let stored: Option<i64> = conn
-            .query_row("SELECT value FROM usage_meta WHERE key = 'logic_version'", [], |r| r.get(0))
-            .optional()?;
         if stored != Some(USAGE_LOGIC_VERSION) {
-            conn.execute_batch("DELETE FROM message_usage; DELETE FROM usage_checkpoint;")?;
             conn.execute(
                 "INSERT INTO usage_meta (key, value) VALUES ('logic_version', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -133,28 +163,66 @@ impl SqliteUsageCache {
             .expect("usage_checkpoint upsert should not fail");
     }
 
-    /// Inserts each row, INSERT OR IGNORE keyed on `message_id`, so a message
-    /// already seen (in this file or any other, via a resume/compact copy) is
-    /// counted exactly once. Duplicate `message.id`s carry identical usage, so
-    /// first-wins is safe.
+    /// Inserts each row keyed on `message_id`, so a message already seen (in
+    /// this file or any other, via a resume/compact copy) is counted exactly
+    /// once. Two paths make native-wins a STRUCTURAL, order-independent property
+    /// (SHOULD-FIX 5, issue #12), because `refresh_usage` iterates transcripts
+    /// by recency, not native-first:
+    ///
+    /// - a **native** row is written `ON CONFLICT DO UPDATE`, unconditionally
+    ///   overwriting whatever is there (a duplicate native carries identical
+    ///   usage, so the overwrite is a no-op; a prior reconstructed row is
+    ///   upgraded to native).
+    /// - a **reconstructed** row is written `INSERT OR IGNORE`, so it never
+    ///   displaces a native (or an earlier reconstructed) row.
+    ///
+    /// Whichever order the two arrive in, the message ends up native if a native
+    /// row for it exists anywhere, honestly reconstructed only if none does.
     pub fn ingest(&self, rows: &[UsageRow]) {
         for row in rows {
-            self.conn
-                .execute(
-                    "INSERT OR IGNORE INTO message_usage
-                     (message_id, attribution_skill, attribution_plugin, is_subagent, work, cache_write, cache_read)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        row.message_id,
-                        row.attribution_skill,
-                        row.attribution_plugin,
-                        row.is_subagent as i64,
-                        row.work,
-                        row.cache_write,
-                        row.cache_read,
-                    ],
-                )
-                .expect("message_usage insert should not fail");
+            if row.reconstructed {
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO message_usage
+                         (message_id, attribution_skill, attribution_plugin, is_subagent, work, cache_write, cache_read, attribution_source)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'reconstructed')",
+                        params![
+                            row.message_id,
+                            row.attribution_skill,
+                            row.attribution_plugin,
+                            row.is_subagent as i64,
+                            row.work,
+                            row.cache_write,
+                            row.cache_read,
+                        ],
+                    )
+                    .expect("message_usage reconstructed insert should not fail");
+            } else {
+                self.conn
+                    .execute(
+                        "INSERT INTO message_usage
+                         (message_id, attribution_skill, attribution_plugin, is_subagent, work, cache_write, cache_read, attribution_source)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'native')
+                         ON CONFLICT(message_id) DO UPDATE SET
+                             attribution_skill  = excluded.attribution_skill,
+                             attribution_plugin = excluded.attribution_plugin,
+                             is_subagent        = excluded.is_subagent,
+                             work               = excluded.work,
+                             cache_write        = excluded.cache_write,
+                             cache_read         = excluded.cache_read,
+                             attribution_source = excluded.attribution_source",
+                        params![
+                            row.message_id,
+                            row.attribution_skill,
+                            row.attribution_plugin,
+                            row.is_subagent as i64,
+                            row.work,
+                            row.cache_write,
+                            row.cache_read,
+                        ],
+                    )
+                    .expect("message_usage native insert should not fail");
+            }
         }
     }
 
@@ -166,7 +234,8 @@ impl SqliteUsageCache {
             .conn
             .prepare(
                 "SELECT attribution_skill, attribution_plugin,
-                        SUM(work), SUM(cache_write), SUM(cache_read)
+                        SUM(work), SUM(cache_write), SUM(cache_read),
+                        MAX(attribution_source)
                  FROM message_usage WHERE is_subagent = 0
                  GROUP BY attribution_skill, attribution_plugin",
             )
@@ -179,12 +248,17 @@ impl SqliteUsageCache {
                 let work: i64 = r.get(2)?;
                 let cache_write: i64 = r.get(3)?;
                 let cache_read: i64 = r.get(4)?;
+                // "reconstructed" > "native" under BINARY collation, so the
+                // group MAX is "reconstructed" iff at least one message in it
+                // was reconstructed (the sticky downgrade, ADR 0003).
+                let source: String = r.get(5)?;
                 Ok(UsageTotal {
                     attribution_skill: r.get(0)?,
                     attribution_plugin: r.get(1)?,
                     work: work.max(0) as u64,
                     cache_write: cache_write.max(0) as u64,
                     cache_read: cache_read.max(0) as u64,
+                    reconstructed: source == "reconstructed",
                 })
             })
             .expect("usage totals query should not fail");
@@ -228,7 +302,12 @@ mod tests {
             work,
             cache_write: 0,
             cache_read: 0,
+            reconstructed: false,
         }
+    }
+
+    fn reconstructed_row(message_id: &str, skill: &str, plugin: Option<&str>, work: u32) -> UsageRow {
+        UsageRow { reconstructed: true, ..row(message_id, skill, plugin, work) }
     }
 
     #[test]
@@ -318,5 +397,118 @@ mod tests {
         let cache = SqliteUsageCache::open(&db).unwrap();
         assert!(cache.totals().is_empty(), "a logic bump must wipe message_usage");
         assert!(!cache.is_fresh("/p/a.jsonl", 1, 1), "a logic bump must wipe usage_checkpoint");
+    }
+
+    #[test]
+    fn reconstructed_row_stored_and_grouped_with_source() {
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        cache.ingest(&[reconstructed_row("m1", "grilling", None, 42)]);
+        let totals = cache.totals();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].work, 42);
+        assert!(totals[0].reconstructed, "a reconstructed row's total is flagged reconstructed");
+    }
+
+    #[test]
+    fn native_wins_after_reconstructed_same_msgid() {
+        // Reconstructed lands first, native second: the native row must
+        // overwrite it (source flips to native, usage becomes the native usage).
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        cache.ingest(&[reconstructed_row("m1", "grilling", None, 5)]);
+        cache.ingest(&[row("m1", "grilling", None, 30)]);
+        let totals = cache.totals();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].work, 30, "native usage overwrites the reconstructed guess");
+        assert!(!totals[0].reconstructed, "a native contribution wins the source label");
+    }
+
+    #[test]
+    fn native_wins_before_reconstructed_same_msgid() {
+        // Native lands first, reconstructed second: INSERT OR IGNORE must leave
+        // the native row untouched (the mirror of the case above).
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        cache.ingest(&[row("m1", "grilling", None, 30)]);
+        cache.ingest(&[reconstructed_row("m1", "grilling", None, 5)]);
+        let totals = cache.totals();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].work, 30, "the reconstructed row must not displace the native one");
+        assert!(!totals[0].reconstructed);
+    }
+
+    #[test]
+    fn skill_with_both_flagged_reconstructed() {
+        // One skill, two distinct messages: one native, one reconstructed. The
+        // group is downgraded to reconstructed (sticky), and both sums count.
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        cache.ingest(&[row("m_native", "grilling", None, 10)]);
+        cache.ingest(&[reconstructed_row("m_recon", "grilling", None, 7)]);
+        let totals = cache.totals();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].work, 17);
+        assert!(totals[0].reconstructed, "any reconstructed contribution downgrades the whole skill");
+    }
+
+    #[test]
+    fn dedup_by_message_id_holds_for_reconstructed() {
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        cache.ingest(&[reconstructed_row("m1", "grilling", None, 12)]);
+        cache.ingest(&[reconstructed_row("m1", "grilling", None, 12)]); // resume/compact copy
+        let totals = cache.totals();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].work, 12, "a repeated reconstructed message.id counts once");
+    }
+
+    #[test]
+    fn logic_version_bump_drops_and_rebuilds_with_new_column() {
+        // Stand up a v1-SHAPE table by hand: the old 7-column message_usage with
+        // NO attribution_source, plus a row and the v1 logic marker. This is the
+        // exact defect the DELETE-based migration would miss -- a DELETE keeps
+        // these narrow columns and the v2 INSERT (which supplies attribution_source)
+        // would fail at runtime.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("usage.sqlite");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE message_usage (
+                    message_id         TEXT PRIMARY KEY,
+                    attribution_skill  TEXT NOT NULL,
+                    attribution_plugin TEXT,
+                    is_subagent        INTEGER NOT NULL,
+                    work               INTEGER NOT NULL,
+                    cache_write        INTEGER NOT NULL,
+                    cache_read         INTEGER NOT NULL
+                );
+                CREATE TABLE usage_checkpoint (
+                    path          TEXT PRIMARY KEY,
+                    mtime_nanos   INTEGER NOT NULL,
+                    size          INTEGER NOT NULL,
+                    logic_version INTEGER NOT NULL
+                );
+                CREATE TABLE usage_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO message_usage
+                 (message_id, attribution_skill, attribution_plugin, is_subagent, work, cache_write, cache_read)
+                 VALUES ('old', 'grilling', NULL, 0, 99, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO usage_meta (key, value) VALUES ('logic_version', 1)", []).unwrap();
+        }
+
+        // Opening at v2 must DROP the narrow table, rebuild it with the new
+        // column, and drop the pre-migration row.
+        let cache = SqliteUsageCache::open(&db).unwrap();
+        assert!(cache.totals().is_empty(), "the v1 row must be gone after the drop-and-rebuild");
+
+        // The new column must exist and accept a reconstructed insert -- the
+        // whole point of the DROP-before-CREATE ordering.
+        cache.ingest(&[reconstructed_row("new", "grilling", None, 8)]);
+        let totals = cache.totals();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].work, 8);
+        assert!(totals[0].reconstructed);
     }
 }
