@@ -31,6 +31,12 @@ impl TokenCache {
     }
 
     fn init(conn: Connection) -> SqliteResult<Self> {
+        // WAL + a busy timeout: the on-demand background fill (issue #11) opens
+        // a SECOND connection to this same file and writes tiktoken/exact rows
+        // while the interactive scan may also be writing. WAL lets the two
+        // connections proceed without a "database is locked" error turning the
+        // `.expect()` sites below into a mutex-poisoning panic.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS token_cache (
                 content_hash   TEXT PRIMARY KEY,

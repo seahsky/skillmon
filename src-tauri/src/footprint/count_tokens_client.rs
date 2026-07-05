@@ -101,7 +101,12 @@ impl CountTokensClient for AnthropicCountTokensClient {
 #[cfg(test)]
 pub struct FakeCountTokensClient {
     outcome: FakeOutcome,
-    call_count: std::cell::RefCell<u32>,
+    // An `Arc<AtomicU32>` rather than a `RefCell` so a test that hands this
+    // client to an adapter (which takes ownership as a `Box<dyn ...>`) can
+    // still read the count afterward through a cloned handle -- and so the
+    // counter is `Send + Sync`, which a `Box<dyn CountTokensClient>` behind the
+    // scan `Mutex` needs.
+    call_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[cfg(test)]
@@ -114,28 +119,38 @@ enum FakeOutcome {
 #[cfg(test)]
 impl FakeCountTokensClient {
     pub fn always_returns(tokens: u32) -> Self {
-        Self { outcome: FakeOutcome::Succeed(tokens), call_count: std::cell::RefCell::new(0) }
+        Self { outcome: FakeOutcome::Succeed(tokens), call_count: Self::new_counter() }
     }
 
     pub fn always_fails() -> Self {
-        Self { outcome: FakeOutcome::Fail, call_count: std::cell::RefCell::new(0) }
+        Self { outcome: FakeOutcome::Fail, call_count: Self::new_counter() }
     }
 
     /// A 401, the shape of a key Anthropic refuses -- used by the API-key
     /// save-probe test (issue #4) to prove a rejected key is never stored.
     pub fn always_rejects_unauthorized() -> Self {
-        Self { outcome: FakeOutcome::RejectUnauthorized, call_count: std::cell::RefCell::new(0) }
+        Self { outcome: FakeOutcome::RejectUnauthorized, call_count: Self::new_counter() }
+    }
+
+    fn new_counter() -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))
     }
 
     pub fn call_count(&self) -> u32 {
-        *self.call_count.borrow()
+        self.call_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A shared handle to the call counter, so a test can read it after the
+    /// client has been moved into an adapter (issue #11's C1/C4 proofs).
+    pub fn call_count_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+        self.call_count.clone()
     }
 }
 
 #[cfg(test)]
 impl CountTokensClient for FakeCountTokensClient {
     fn count_tokens(&self, _text: &str, _model_id: &str, _api_key: &str) -> Result<u32, CountTokensError> {
-        *self.call_count.borrow_mut() += 1;
+        self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match self.outcome {
             FakeOutcome::Succeed(n) => Ok(n),
             FakeOutcome::Fail => Err(CountTokensError::Request("simulated failure".to_string())),

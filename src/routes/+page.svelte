@@ -119,7 +119,8 @@
       : `${base}. Always-on text reconstructed from frontmatter; no session has listed this skill yet`;
   }
 
-  function onDemandTitle(layer: LayerReport): string {
+  function onDemandTitle(layer: LayerReport | null): string {
+    if (layer === null) return "Computing on-demand ceiling…";
     const base = "Ceiling: raw size of bundled references, loaded only if the body reads them";
     return layer.exact ? base : `${base} (calibrated estimate)`;
   }
@@ -129,9 +130,13 @@
     // The registry watcher (ADR 0019) fires this when a skill/plugin surface
     // changes; re-scan so the list doesn't go stale. Enablement is read at
     // session start, so this is a freshness nudge, not a live-state mirror.
-    const unlisten = listen("registry-changed", () => load());
+    const unlistenRegistry = listen("registry-changed", () => load());
+    // The background on-demand fill (issue #11) fires this once it has computed
+    // the pending ceilings; re-scan so the "…" cells resolve to real numbers.
+    const unlistenOnDemand = listen("on-demand-ready", () => load());
     return () => {
-      unlisten.then((off) => off());
+      unlistenRegistry.then((off) => off());
+      unlistenOnDemand.then((off) => off());
     };
   });
 </script>
@@ -289,7 +294,11 @@
 
             {@render layerCell(skill.alwaysOn, alwaysOnTitle(skill), !skill.alwaysOnNative)}
             {@render layerCell(skill.onInvoke, layerTitle(skill.onInvoke))}
-            {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand))}
+            {#if skill.onDemand === null}
+              <div class="col num pending" role="cell" title={onDemandTitle(null)}>…</div>
+            {:else}
+              {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand))}
+            {/if}
           </div>
         {/each}
       </div>
@@ -521,6 +530,11 @@
   /* An estimate is muted and marked; it never blends with an exact count. */
   .col.num.estimate {
     color: var(--estimate-fg);
+  }
+  /* On-demand ceiling still being computed off the interactive scan (issue
+     #11): a faint ellipsis, never a 0 that would read as a resolved ceiling. */
+  .col.num.pending {
+    color: var(--faint);
   }
   /* Always-on text reconstructed from frontmatter (no transcript yet). */
   .col.num.reconstructed {
