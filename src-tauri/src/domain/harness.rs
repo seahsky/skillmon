@@ -30,7 +30,7 @@ pub trait HarnessAdapter {
         let skills = discovery
             .skills
             .iter()
-            .map(|skill| SkillReport::from_parts(skill, &self.compute_footprint(skill)))
+            .map(|skill| SkillReport::from_parts(skill, &self.compute_footprint(skill), None))
             .collect();
         let warnings = discovery
             .warnings

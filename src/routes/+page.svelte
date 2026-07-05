@@ -8,6 +8,8 @@
     normalizeApiKey,
     skillKey,
     sortSkills,
+    usageDisplay,
+    usageTitle,
     type LayerReport,
     type ScanReport,
     type SetKeyOutcome,
@@ -265,16 +267,23 @@
         {#each rows as skill (skillKey(skill))}
           <div class="row" role="row" class:inactive={!skill.live}>
             <div class="col name" role="cell">
-              <span class="skill-name" title={skill.name}>{skill.name}</span>
-              {#if skill.kind === "plugin"}
-                <span class="badge plugin" title="Plugin-locked: remove the whole plugin, not one skill">
-                  {skill.plugin ?? "plugin"}
-                </span>
-              {:else if skill.kind === "project" && skill.repoPath}
-                <span class="badge project" title={skill.repoPath}>{repoName(skill.repoPath)}</span>
-              {/if}
-              {#if !skill.live}
-                <span class="badge inactive-badge" title="Not live in the active context (contributes zero live footprint)">inactive</span>
+              <div class="name-line">
+                <span class="skill-name" title={skill.name}>{skill.name}</span>
+                {#if skill.kind === "plugin"}
+                  <span class="badge plugin" title="Plugin-locked: remove the whole plugin, not one skill">
+                    {skill.plugin ?? "plugin"}
+                  </span>
+                {:else if skill.kind === "project" && skill.repoPath}
+                  <span class="badge project" title={skill.repoPath}>{repoName(skill.repoPath)}</span>
+                {/if}
+                {#if !skill.live}
+                  <span class="badge inactive-badge" title="Not live in the active context (contributes zero live footprint)">inactive</span>
+                {/if}
+              </div>
+              {#if skill.usage}
+                <div class="usage" title={usageTitle(skill.usage)}>
+                  {usageDisplay(skill.usage)}
+                </div>
               {/if}
             </div>
 
@@ -441,15 +450,34 @@
   }
   .col.name {
     display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: flex-start;
+    gap: 2px;
+    overflow: hidden;
+  }
+  .name-line {
+    display: flex;
     align-items: center;
     gap: 6px;
     overflow: hidden;
+    max-width: 100%;
   }
   .skill-name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font-weight: 500;
+  }
+  /* Attributed usage: a demoted proxy below the name, never a headline column
+     and never blended with the exact footprint (ADR 0003). */
+  .usage {
+    font-size: 10px;
+    color: var(--faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
   }
   .col.num {
     text-align: right;

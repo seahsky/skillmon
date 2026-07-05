@@ -12,6 +12,7 @@ use tauri::{Emitter, Manager};
 
 use adapters::claude_code::listing_cache::SqliteListingCache;
 use adapters::claude_code::paths::default_claude_home;
+use adapters::claude_code::usage_cache::SqliteUsageCache;
 use adapters::claude_code::watcher::RegistryWatcher;
 use adapters::claude_code::{ClaudeCodeAdapter, REFERENCE_MODEL_ID};
 use domain::harness::HarnessAdapter;
@@ -44,8 +45,8 @@ struct ApiKeySettings {
 }
 type SharedApiKeySettings = Arc<Mutex<ApiKeySettings>>;
 
-// TODO(skillmon): remaining IPC surface (attributed_usage, disable/enable,
-// uninstall, remove_plugin) lands with later plans.
+// TODO(skillmon): remaining IPC surface (disable/enable, uninstall,
+// remove_plugin) lands with later plans.
 
 /// Discover every skill and compute its three-layer footprint (ADR 0019's
 /// scan). The synchronous core runs on the blocking pool via
@@ -161,10 +162,15 @@ pub fn run() {
             // (ADR 0022). Kept in its own file because it holds Claude-Code
             // transcript data, not harness-neutral token counts (ADR 0002).
             let listing_cache = SqliteListingCache::open(&data_dir.join("listing_index.sqlite"))?;
+            // Attributed-usage store (issue #5): a third persisted sqlite file
+            // beside the footprint and listing caches, holding deduped
+            // per-message usage keyed by message.id (ADR 0024).
+            let usage_cache = SqliteUsageCache::open(&data_dir.join("usage.sqlite"))?;
             let adapter = ClaudeCodeAdapter::new(
                 default_claude_home(),
                 cache,
                 listing_cache,
+                usage_cache,
                 Box::new(KeychainApiKeyStore::new()?),
                 Box::new(AnthropicCountTokensClient::new()),
             );

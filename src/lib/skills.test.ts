@@ -6,8 +6,11 @@ import {
   normalizeApiKey,
   skillKey,
   sortSkills,
+  usageDisplay,
+  usageTitle,
   type ScanReport,
   type SkillReport,
+  type UsageReport,
 } from "./skills";
 
 /** Build a SkillReport with only the fields a test cares about overridden. */
@@ -19,6 +22,7 @@ function makeSkill(overrides: Partial<SkillReport> & { name: string }): SkillRep
     alwaysOnNative: true,
     onInvoke: { tokens: 0, exact: true },
     onDemand: { tokens: 0, exact: true },
+    usage: null,
     repoPath: null,
     marketplace: null,
     plugin: null,
@@ -103,6 +107,37 @@ describe("normalizeApiKey", () => {
 
   it("returns an empty string for an all-whitespace input", () => {
     expect(normalizeApiKey("   \t\n")).toBe("");
+  });
+});
+
+describe("usageDisplay", () => {
+  const src = "native" as const;
+
+  it("renders nothing for an untouched skill, never ~0", () => {
+    expect(usageDisplay(null)).toBe("");
+  });
+
+  it("shows ~work during this skill with cache-read segmented out, never blended or a currency", () => {
+    const usage: UsageReport = { work: 1229, cacheWrite: 13781, cacheRead: 35154, attributionSource: src };
+    const out = usageDisplay(usage);
+
+    expect(out).toBe("~1.2k during this skill · ~35k cached");
+    expect(out.startsWith("~1.2k during this skill")).toBe(true);
+    expect(out).not.toContain("$");
+  });
+
+  it("omits the cached segment when cache-read is zero", () => {
+    expect(usageDisplay({ work: 500, cacheWrite: 0, cacheRead: 0, attributionSource: src })).toBe(
+      "~500 during this skill",
+    );
+  });
+
+  it("usageTitle carries the full comma-grouped figures and the during-not-by framing", () => {
+    const title = usageTitle({ work: 1229, cacheWrite: 13781, cacheRead: 35154, attributionSource: src });
+    expect(title).toContain("~1,229 work tokens during this skill, not by it");
+    expect(title).toContain("~35,154 cache-read");
+    expect(title).toContain("~13,781 cache-write");
+    expect(title).not.toContain("$");
   });
 });
 

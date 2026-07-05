@@ -30,6 +30,32 @@ pub enum SkillKind {
     Plugin,
 }
 
+/// How a usage figure was attributed (ADR 0005). Only `Native` ships in the
+/// MVP (issue #5); `Reconstructed` is reserved for the deferred parentUuid
+/// walk over pre-attribution transcripts, so the UI seam already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AttributionSource {
+    Native,
+}
+
+/// Attributed session usage for one skill (ADR 0005): a demoted, deliberately
+/// fuzzy proxy, never blended with the exact footprint (ADR 0003). `work` is
+/// input + output tokens (the headline); `cache_write` and `cache_read` are
+/// separate buckets, and `cache_read` is never folded into `work` (it
+/// dominates 10-100x). These are tokens spent *during* a skill, not *by* it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageReport {
+    // u64, not u32: these are cumulative all-time sums (ADR 0024), and cache_read
+    // dominates 10-100x, so a heavy top skill's total can exceed u32::MAX and
+    // must never silently wrap.
+    pub work: u64,
+    pub cache_write: u64,
+    pub cache_read: u64,
+    pub attribution_source: AttributionSource,
+}
+
 /// One row the tray panel renders: a skill's identity, liveness, and its
 /// three footprint layers. Harness-neutral (ADR 0002) and serializable for
 /// the Tauri IPC boundary. Deliberately thin -- field-level shaping for the
@@ -50,6 +76,11 @@ pub struct SkillReport {
     pub always_on_native: bool,
     pub on_invoke: LayerReport,
     pub on_demand: LayerReport,
+    /// Attributed session usage (issue #5), or `None` when no session has
+    /// touched this skill. `None` (a null in the panel) means "untouched," not
+    /// "attributed zero," so a zero figure is never fabricated for a skill no
+    /// session used.
+    pub usage: Option<UsageReport>,
     /// Populated for `Project` skills: the repo the skill belongs to.
     pub repo_path: Option<String>,
     /// Populated for `Plugin` skills: the owning marketplace and plugin.
@@ -58,7 +89,7 @@ pub struct SkillReport {
 }
 
 impl SkillReport {
-    pub fn from_parts(skill: &DiscoveredSkill, footprint: &Footprint) -> Self {
+    pub fn from_parts(skill: &DiscoveredSkill, footprint: &Footprint, usage: Option<UsageReport>) -> Self {
         let (kind, repo_path, marketplace, plugin) = match &skill.id {
             SkillId::Personal { .. } => (SkillKind::Personal, None, None, None),
             SkillId::Project { repo_path, .. } => {
@@ -77,6 +108,7 @@ impl SkillReport {
             always_on_native: footprint.always_on.confidence == TextConfidence::Native,
             on_invoke: footprint.on_invoke.into(),
             on_demand: footprint.on_demand.into(),
+            usage,
             repo_path,
             marketplace,
             plugin,
@@ -140,7 +172,7 @@ mod tests {
     #[test]
     fn personal_skill_report_leaves_repo_and_plugin_identity_empty() {
         let skill = skill_with_id(SkillId::Personal { name: "grilling".to_string() });
-        let report = SkillReport::from_parts(&skill, &sample_footprint());
+        let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
 
         assert_eq!(report.kind, SkillKind::Personal);
         assert_eq!(report.name, "grilling");
@@ -159,7 +191,7 @@ mod tests {
             plugin: "superpowers".to_string(),
             name: "brainstorming".to_string(),
         });
-        let report = SkillReport::from_parts(&skill, &sample_footprint());
+        let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
 
         assert_eq!(report.kind, SkillKind::Plugin);
         assert_eq!(report.marketplace.as_deref(), Some("official"));
@@ -173,10 +205,31 @@ mod tests {
             repo_path: PathBuf::from("/home/me/repo"),
             name: "deploy".to_string(),
         });
-        let report = SkillReport::from_parts(&skill, &sample_footprint());
+        let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
 
         assert_eq!(report.kind, SkillKind::Project);
         assert_eq!(report.repo_path.as_deref(), Some("/home/me/repo"));
+    }
+
+    #[test]
+    fn usage_none_serializes_null_and_some_serializes_camel_case() {
+        let skill = skill_with_id(SkillId::Personal { name: "grilling".to_string() });
+
+        let without = SkillReport::from_parts(&skill, &sample_footprint(), None);
+        assert_eq!(serde_json::to_value(&without).unwrap()["usage"], serde_json::Value::Null);
+
+        let usage = UsageReport {
+            work: 1229,
+            cache_write: 13781,
+            cache_read: 35154,
+            attribution_source: AttributionSource::Native,
+        };
+        let with = SkillReport::from_parts(&skill, &sample_footprint(), Some(usage));
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["usage"]["work"], 1229);
+        assert_eq!(json["usage"]["cacheWrite"], 13781);
+        assert_eq!(json["usage"]["cacheRead"], 35154);
+        assert_eq!(json["usage"]["attributionSource"], "native");
     }
 
     #[test]

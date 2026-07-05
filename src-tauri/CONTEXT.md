@@ -132,6 +132,14 @@ _Avoid_: cached tokens
 **Cache-write tokens**:
 The footprint entering the cache; a secondary column.
 
+**Attribution key**:
+The `(plugin, name)` pair that joins a transcript's `attributionSkill`/`attributionPlugin` to a discovered skill. A plugin skill attributes as `plugin:name` with the plugin set; a personal or project skill attributes as a bare name with no plugin. Marketplace is deliberately not in the key — attribution never carries it, and it is the plugin that tells two same-named skills apart.
+_Avoid_: skill name (ambiguous), directory name (the join is not by directory name alone)
+
+**Message id**:
+The `message.id` on an assistant record, the dedup key for usage — never the record-level `uuid`. resume, branch, and compact copy the same `message.id` into different files, so usage is summed with a global `message_id` primary key and INSERT OR IGNORE, counted exactly once (ADR 0005 / ADR 0024).
+_Avoid_: uuid, record id
+
 ### Sessions and history
 
 **Transcript**:

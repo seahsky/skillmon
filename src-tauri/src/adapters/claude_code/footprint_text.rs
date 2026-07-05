@@ -172,8 +172,9 @@ fn parse_transcript_bullets(content: &str) -> Vec<(String, String)> {
 
 /// A file's mtime as an exact integer count of nanoseconds since the Unix
 /// epoch -- the change-detector key. `None` (a pre-1970 mtime, or one past
-/// ~year 2262) forces a re-read rather than risking a false match.
-fn mtime_nanos(mtime: SystemTime) -> Option<i64> {
+/// ~year 2262) forces a re-read rather than risking a false match. Shared with
+/// the usage checkpoint (issue #5), which gates on the same key.
+pub(crate) fn mtime_nanos(mtime: SystemTime) -> Option<i64> {
     mtime.duration_since(UNIX_EPOCH).ok().and_then(|d| i64::try_from(d.as_nanos()).ok())
 }
 
