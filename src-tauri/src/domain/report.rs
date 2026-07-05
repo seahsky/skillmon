@@ -30,13 +30,17 @@ pub enum SkillKind {
     Plugin,
 }
 
-/// How a usage figure was attributed (ADR 0005). Only `Native` ships in the
-/// MVP (issue #5); `Reconstructed` is reserved for the deferred parentUuid
-/// walk over pre-attribution transcripts, so the UI seam already exists.
+/// How a usage figure was attributed (ADR 0005). `Native` trusts Claude Code's
+/// own `attributionSkill`/`attributionPlugin` (issue #5); `Reconstructed` is a
+/// version-gated in-order walk over a pre-attribution transcript that credited
+/// each turn to the skill then holding the wheel (issue #12). A skill is tagged
+/// `Reconstructed` if ANY of its contributing turns was reconstructed, so the
+/// lower-confidence framing is sticky and never overstated (ADR 0003).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AttributionSource {
     Native,
+    Reconstructed,
 }
 
 /// Attributed session usage for one skill (ADR 0005): a demoted, deliberately
@@ -234,6 +238,18 @@ mod tests {
         assert_eq!(json["usage"]["cacheWrite"], 13781);
         assert_eq!(json["usage"]["cacheRead"], 35154);
         assert_eq!(json["usage"]["attributionSource"], "native");
+
+        // The reconstructed seam (issue #12) serializes to its own camelCase
+        // tag, so the UI can flag the lower-confidence figure (ADR 0005).
+        let reconstructed = UsageReport {
+            work: 500,
+            cache_write: 0,
+            cache_read: 0,
+            attribution_source: AttributionSource::Reconstructed,
+        };
+        let with_recon = SkillReport::from_parts(&skill, &sample_footprint(), Some(reconstructed));
+        let recon_json = serde_json::to_value(&with_recon).unwrap();
+        assert_eq!(recon_json["usage"]["attributionSource"], "reconstructed");
     }
 
     #[test]
