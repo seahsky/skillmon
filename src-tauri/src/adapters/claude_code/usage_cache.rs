@@ -148,9 +148,29 @@ impl SqliteUsageCache {
             )
             .optional()
             .expect("usage_checkpoint lookup should not fail");
-        // STUB (issue #15, red phase): always Full until the real plan lands.
-        let _ = row;
-        ReadPlan::Full
+        let Some((mtime, size, byte_offset, version)) = row else {
+            return ReadPlan::Full; // never parsed
+        };
+        if version != USAGE_LOGIC_VERSION {
+            return ReadPlan::Full; // parsed under stale logic
+        }
+        if mtime == new_mtime && size == new_size {
+            return ReadPlan::Skip; // fully parsed already
+        }
+        if new_size <= size {
+            // A shrink, or a same-size in-place rewrite (a different mtime): the
+            // append assumption is void, so re-read from the top. Strict on
+            // size equality preserves ADR 0022's both-ways clock gate.
+            return ReadPlan::Full;
+        }
+        // Grew. Tail from the stored offset when we have a real line boundary to
+        // resume from; a legacy zero offset (or a file that never completed a
+        // line) has no boundary, so it must be re-read whole.
+        if byte_offset > 0 {
+            ReadPlan::Tail(byte_offset as u64)
+        } else {
+            ReadPlan::Full
+        }
     }
 
     /// Records `path` as parsed up to `byte_offset` (the byte position just past
@@ -244,9 +264,29 @@ impl SqliteUsageCache {
         seen: &HashSet<String>,
         enumerated_dirs: &HashSet<String>,
     ) -> bool {
-        // STUB (issue #15, red phase): never reports a vanish until the real
-        // dir-scoped detection lands.
-        let _ = (seen, enumerated_dirs);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM usage_checkpoint")
+            .expect("usage_checkpoint path scan prepare should not fail");
+        let paths = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("usage_checkpoint path scan should not fail");
+        for path in paths {
+            let path = path.expect("usage_checkpoint path mapping should not fail");
+            if seen.contains(&path) {
+                continue; // still present this scan
+            }
+            // Absent from the enumeration -- a vanish ONLY if its dir was
+            // actually read. A dir whose read_dir failed is "unknown": the
+            // residual risk is a single-file metadata() race within an
+            // otherwise-readable dir, which self-heals via INSERT OR IGNORE on
+            // the next scan and never corrupts totals (ADR 0024).
+            if let Some(parent) = Path::new(&path).parent() {
+                if enumerated_dirs.contains(parent.to_string_lossy().as_ref()) {
+                    return true;
+                }
+            }
+        }
         false
     }
 
