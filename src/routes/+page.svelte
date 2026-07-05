@@ -20,6 +20,12 @@
   let error = $state<string | null>(null);
   let loading = $state(true);
 
+  // Attributed-usage scope toggle (issue #13). Off by default: the headline
+  // usage metric excludes sub-agent tokens. Flipping it re-scans with the
+  // sub-agent transcripts folded in — a backend re-scan param, never a
+  // frontend filter, since the tokens must come from the deduped store.
+  let includeSubagents = $state(false);
+
   // API-key settings (issue #4). The panel is a view-swap: the gear replaces
   // the skill table with a settings pane, never a modal on this small surface.
   let view = $state<"table" | "settings">("table");
@@ -44,7 +50,7 @@
     loading = true;
     error = null;
     try {
-      report = await invoke<ScanReport>("list_skills");
+      report = await invoke<ScanReport>("list_skills", { includeSubagents });
     } catch (e) {
       error = String(e);
     } finally {
@@ -214,6 +220,21 @@
             active repo: {repoName(report.activeRepoPath)}
           </span>
         {/if}
+        <label
+          class="subagents-toggle"
+          title="Include sub-agent usage. Only sub-agents that themselves invoked a skill are credited; the rest are dropped."
+        >
+          <input
+            type="checkbox"
+            checked={includeSubagents}
+            disabled={loading}
+            onchange={(e) => {
+              includeSubagents = e.currentTarget.checked;
+              load();
+            }}
+          />
+          Sub-agents
+        </label>
         <button class="rescan" onclick={load} disabled={loading} title="Rescan now">
           {loading ? "Scanning…" : "Rescan"}
         </button>
@@ -370,6 +391,23 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* Sub-agent usage scope toggle (issue #13): a demoted, muted control that
+     sits alongside Rescan, matching the demoted framing of the usage metric
+     it widens. */
+  .subagents-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .subagents-toggle input {
+    margin: 0;
+    cursor: pointer;
   }
 
   button {

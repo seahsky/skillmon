@@ -226,20 +226,25 @@ impl SqliteUsageCache {
         }
     }
 
-    /// Per-attribution totals over the main-thread rows only (`is_subagent =
-    /// 0`); sub-agent rows are excluded from the default metric (ADR 0005).
-    /// Always a fresh GROUP BY, never a persisted aggregate.
-    pub fn totals(&self) -> Vec<UsageTotal> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT attribution_skill, attribution_plugin,
-                        SUM(work), SUM(cache_write), SUM(cache_read),
-                        MAX(attribution_source)
-                 FROM message_usage WHERE is_subagent = 0
-                 GROUP BY attribution_skill, attribution_plugin",
-            )
-            .expect("usage totals prepare should not fail");
+    /// Per-attribution totals. With `include_subagents` false (the default
+    /// metric, ADR 0005) only main-thread rows (`is_subagent = 0`) are summed;
+    /// with it true, sub-agent rows are folded in as well (issue #13's toggle).
+    /// Two explicit SQL strings rather than a dynamic predicate so the exact
+    /// query for each mode is legible at a glance. Always a fresh GROUP BY,
+    /// never a persisted aggregate, so a dedup can't leave a stale running sum.
+    pub fn totals(&self, include_subagents: bool) -> Vec<UsageTotal> {
+        let sql = if include_subagents {
+            "SELECT attribution_skill, attribution_plugin,
+                    SUM(work), SUM(cache_write), SUM(cache_read)
+             FROM message_usage
+             GROUP BY attribution_skill, attribution_plugin"
+        } else {
+            "SELECT attribution_skill, attribution_plugin,
+                    SUM(work), SUM(cache_write), SUM(cache_read)
+             FROM message_usage WHERE is_subagent = 0
+             GROUP BY attribution_skill, attribution_plugin"
+        };
+        let mut stmt = self.conn.prepare(sql).expect("usage totals prepare should not fail");
         let rows = stmt
             .query_map([], |r| {
                 // SUM() is i64 in SQLite; counts are non-negative, so widen to
@@ -315,7 +320,7 @@ mod tests {
         let cache = SqliteUsageCache::open_in_memory().unwrap();
         cache.ingest(&[row("msg_A", "grilling", None, 30)]);
         cache.ingest(&[row("msg_A", "grilling", None, 30)]); // resume/compact copy
-        let totals = cache.totals();
+        let totals = cache.totals(false);
         assert_eq!(totals.len(), 1);
         assert_eq!(totals[0].work, 30, "a repeated message.id must count once, not twice");
     }
@@ -328,7 +333,7 @@ mod tests {
             row("m2", "grilling", None, 20),
             row("m3", "executing-plans", Some("superpowers"), 5),
         ]);
-        let mut totals = cache.totals();
+        let mut totals = cache.totals(false);
         totals.sort_by(|a, b| a.attribution_skill.cmp(&b.attribution_skill));
         assert_eq!(totals.len(), 2);
         let grilling = totals.iter().find(|t| t.attribution_skill == "grilling").unwrap();
@@ -344,9 +349,25 @@ mod tests {
         let mut sub = row("m_sub", "grilling", None, 99);
         sub.is_subagent = true;
         cache.ingest(&[row("m_main", "grilling", None, 10), sub]);
-        let totals = cache.totals();
+        let totals = cache.totals(false);
         assert_eq!(totals.len(), 1);
         assert_eq!(totals[0].work, 10, "sub-agent work is excluded from the default totals");
+    }
+
+    #[test]
+    fn totals_include_subagents_true_includes_subagent_rows() {
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        let mut sub = row("m_sub", "grilling", None, 99);
+        sub.is_subagent = true;
+        cache.ingest(&[row("m_main", "grilling", None, 10), sub]);
+
+        let default = cache.totals(false);
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].work, 10, "the default metric still excludes the sub-agent row");
+
+        let with_sub = cache.totals(true);
+        assert_eq!(with_sub.len(), 1);
+        assert_eq!(with_sub[0].work, 109, "toggle on folds the sub-agent's 99 into the main 10");
     }
 
     #[test]
@@ -373,7 +394,7 @@ mod tests {
 
         assert!(cache.is_fresh("/p/here.jsonl", 1, 1));
         assert!(!cache.is_fresh("/p/gone.jsonl", 1, 1), "absent path pruned from the gate");
-        assert_eq!(cache.totals()[0].work, 10, "message history is never pruned by retain");
+        assert_eq!(cache.totals(false)[0].work, 10, "message history is never pruned by retain");
     }
 
     #[test]
@@ -384,7 +405,7 @@ mod tests {
             let cache = SqliteUsageCache::open(&db).unwrap();
             cache.ingest(&[row("m1", "grilling", None, 10)]);
             cache.mark("/p/a.jsonl", 1, 1);
-            assert_eq!(cache.totals().len(), 1);
+            assert_eq!(cache.totals(false).len(), 1);
         }
         // Simulate an old-version DB: rewrite the stored logic_version.
         {
@@ -395,7 +416,7 @@ mod tests {
         // Reopening detects the mismatch and wipes: INSERT OR IGNORE can't
         // overwrite stale rows, so the only correct migration is a wipe.
         let cache = SqliteUsageCache::open(&db).unwrap();
-        assert!(cache.totals().is_empty(), "a logic bump must wipe message_usage");
+        assert!(cache.totals(false).is_empty(), "a logic bump must wipe message_usage");
         assert!(!cache.is_fresh("/p/a.jsonl", 1, 1), "a logic bump must wipe usage_checkpoint");
     }
 

@@ -28,7 +28,8 @@ use discovery::plugin::{discover_plugin_skills, parse_installed_plugins};
 use discovery::project::discover_project_skills;
 use discovery::transcript::{enumerate_known_repos, find_active_repo, RepoInfo};
 use footprint_text::{
-    always_on_text_from_index, mtime_nanos, transcript_refs_by_recency, AlwaysOnText, ListingIndex,
+    always_on_text_from_index, subagent_transcript_refs, transcript_refs_by_recency, AlwaysOnText,
+    ListingIndex,
 };
 use listing_cache::SqliteListingCache;
 use on_demand_cache::SqliteOnDemandCache;
@@ -312,7 +313,12 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     /// always-on text from that index with the same type-scoped search dirs
     /// the single-skill path uses. Result is identical, cost drops from
     /// O(skills × transcripts) reads to O(transcripts).
-    fn scan_all(&self) -> ScanReport {
+    ///
+    /// `include_subagents` (issue #13) only widens the attributed-usage pass;
+    /// the listing index and its retain set stay MAIN-THREAD ONLY regardless
+    /// (grill D4), so a sub-agent file's own `skill_listing` can never pollute
+    /// always-on or evict the listing memo.
+    fn scan_all(&self, include_subagents: bool) -> ScanReport {
         let discovery = ClaudeCodeAdapter::discover_skills(self);
         let known_repos = enumerate_known_repos(&self.claude_home);
 
@@ -351,11 +357,16 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         }
 
         // Attributed usage (issue #5): ingest new transcript usage into the
-        // persisted, deduped store over the SAME enumeration the listing index
-        // already built, then index the totals by attribution key so each skill
-        // can look up its own.
-        usage::refresh_usage(&transcripts, &self.usage_cache);
-        let usage_index = UsageIndex::build(&self.usage_cache);
+        // persisted, deduped store over the SAME main-thread enumeration the
+        // listing index already built, then index the totals by attribution key
+        // so each skill can look up its own. When the user opts in (issue #13),
+        // the sub-agent transcripts are enumerated as a SECOND provenance-tagged
+        // list and folded in; these refs feed only the usage pass, never the
+        // listing index or its retain set above (grill D4).
+        let subagent_transcripts =
+            if include_subagents { subagent_transcript_refs(&all_project_dirs) } else { Vec::new() };
+        usage::refresh_usage(&transcripts, &subagent_transcripts, &self.usage_cache);
+        let usage_index = UsageIndex::build(&self.usage_cache, include_subagents);
 
         let skills = discovery
             .skills
@@ -767,7 +778,7 @@ mod tests {
         write_skill(&claude_home.join("skills").join("beta"), "beta");
 
         let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
-        let report = adapter.scan_all();
+        let report = adapter.scan_all(false);
 
         assert_eq!(report.skills.len(), 2);
         assert!(report.skills.iter().all(|s| s.kind == SkillKind::Personal));
@@ -809,7 +820,7 @@ mod tests {
         fs::write(project_dir.join("s.jsonl"), format!("{record}\n")).unwrap();
 
         let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
-        let report = adapter.scan_all();
+        let report = adapter.scan_all(false);
 
         let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
         assert!(grilling.always_on_native, "batched scan should source always-on from the transcript (Native)");
@@ -820,6 +831,115 @@ mod tests {
         let per_skill = adapter.compute_footprint(skill);
         assert_eq!(per_skill.always_on.confidence, TextConfidence::Native);
         assert_eq!(grilling.always_on.tokens, per_skill.always_on.count.tokens);
+    }
+
+    // ---- issue #13: the sub-agent usage include toggle end to end ----
+
+    /// A main `assistant` record attributing `work` tokens to `skill`.
+    fn assistant_usage_line(message_id: &str, skill: &str, work: u32) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "uuid": message_id,
+            "attributionSkill": skill,
+            "message": {"id": message_id, "role": "assistant", "usage": {"input_tokens": work, "output_tokens": 0}}
+        })
+        .to_string()
+    }
+
+    /// The same, written as a sub-agent record (`isSidechain: true`).
+    fn subagent_usage_line(message_id: &str, skill: &str, work: u32) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "uuid": message_id,
+            "attributionSkill": skill,
+            "isSidechain": true,
+            "message": {"id": message_id, "role": "assistant", "usage": {"input_tokens": work, "output_tokens": 0}}
+        })
+        .to_string()
+    }
+
+    /// A claude_home with a personal `grilling` skill, a main transcript that
+    /// registers the repo and attributes 10 work tokens to it, and a sub-agent
+    /// transcript under `<session>/subagents/` attributing 999.
+    fn claude_home_with_grilling_usage(tmp: &std::path::Path) -> std::path::PathBuf {
+        let claude_home = tmp.join(".claude");
+        write_skill(&claude_home.join("skills").join("grilling"), "grilling");
+
+        let project_dir = claude_home.join("projects").join("-tmp-repo");
+        fs::create_dir_all(&project_dir).unwrap();
+        let main = [
+            serde_json::json!({"type": "attachment", "cwd": "/tmp/repo", "sessionId": "s"}).to_string(),
+            assistant_usage_line("m_main", "grilling", 10),
+        ]
+        .join("\n");
+        fs::write(project_dir.join("main.jsonl"), format!("{main}\n")).unwrap();
+
+        let subagents = project_dir.join("session-x").join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(subagents.join("agent-1.jsonl"), format!("{}\n", subagent_usage_line("m_sub", "grilling", 999))).unwrap();
+
+        claude_home
+    }
+
+    #[test]
+    fn scan_all_default_excludes_subagent_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = claude_home_with_grilling_usage(tmp.path());
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+
+        let report = adapter.scan_all(false);
+        let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        assert_eq!(grilling.usage.unwrap().work, 10, "the default scan never reads the sub-agent file");
+    }
+
+    #[test]
+    fn scan_all_includes_subagent_usage_when_toggled_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = claude_home_with_grilling_usage(tmp.path());
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+
+        let report = adapter.scan_all(true);
+        let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        assert_eq!(grilling.usage.unwrap().work, 1009, "the toggle folds the sub-agent's own 999 into the main 10");
+    }
+
+    #[test]
+    fn a_subagent_skill_listing_does_not_change_always_on_when_toggled_on() {
+        // grill D4: with the toggle ON a sub-agent transcript feeds the USAGE
+        // pass, but its own `skill_listing` attachment must NEVER feed the
+        // listing index. Here the main transcript never renders grilling's
+        // bullet, so always-on must stay reconstructed from frontmatter -- if
+        // the sub-agent's bullet had leaked into the index it would flip Native.
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        write_skill(&claude_home.join("skills").join("grilling"), "grilling");
+
+        let project_dir = claude_home.join("projects").join("-tmp-repo");
+        fs::create_dir_all(&project_dir).unwrap();
+        // Registers the repo (cwd) but does NOT render grilling's bullet.
+        fs::write(
+            project_dir.join("main.jsonl"),
+            format!("{}\n", serde_json::json!({"type": "attachment", "cwd": "/tmp/repo", "sessionId": "s"})),
+        )
+        .unwrap();
+        // The sub-agent transcript DOES carry a grilling skill_listing bullet.
+        let subagents = project_dir.join("session-x").join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let listing = serde_json::json!({
+            "type": "attachment",
+            "isSidechain": true,
+            "attachment": {"type": "skill_listing", "content": "- grilling: SUB-AGENT wording", "names": ["grilling"]}
+        });
+        fs::write(subagents.join("agent-1.jsonl"), format!("{listing}\n")).unwrap();
+
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        let report = adapter.scan_all(true);
+
+        let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        assert!(
+            !grilling.always_on_native,
+            "a sub-agent skill_listing must not feed the listing index; always-on stays reconstructed"
+        );
     }
 
     #[test]
@@ -869,7 +989,7 @@ mod tests {
         write_skill(&claude_home.join("skills").join("alpha"), "alpha");
 
         let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
-        adapter.scan_all();
+        adapter.scan_all(false);
 
         // Nothing exact has ever been stored (no key), so nothing is stale.
         assert_eq!(adapter.stale_exact_count(), 0);
@@ -882,7 +1002,7 @@ mod tests {
         fs::create_dir_all(&claude_home).unwrap();
         let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
 
-        assert!(!adapter.scan_all().api_key_present);
+        assert!(!adapter.scan_all(false).api_key_present);
     }
 
     #[test]
@@ -905,7 +1025,7 @@ mod tests {
             Box::new(BpeTokenizer),
         );
 
-        assert!(adapter.scan_all().api_key_present);
+        assert!(adapter.scan_all(false).api_key_present);
     }
 
     /// Exercises the real production adapter (real keychain store, real HTTP
@@ -944,11 +1064,11 @@ mod tests {
         // cost to once-ever per unique content.
         use std::time::Instant;
         let cold = Instant::now();
-        let report = adapter.scan_all();
+        let report = adapter.scan_all(false);
         let cold_elapsed = cold.elapsed();
 
         let warm = Instant::now();
-        let _ = adapter.scan_all();
+        let _ = adapter.scan_all(false);
         let warm_elapsed = warm.elapsed();
 
         eprintln!(

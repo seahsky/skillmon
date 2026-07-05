@@ -50,7 +50,13 @@ struct UsageTokens {
 /// walked stack there would fabricate attribution Claude withheld (ADR 0005).
 /// `work = input + output` only; cache-write and cache-read are separate and
 /// cache-read is never folded into work.
-pub fn parse_usage_rows(content: &str) -> Vec<UsageRow> {
+///
+/// `force_subagent` stamps `is_subagent = true` regardless of the record's own
+/// `isSidechain` (issue #13, grill D3): rows parsed out of a sub-agent-
+/// enumerated file are sub-agent by provenance, so a record with a missing or
+/// mislabeled `isSidechain` can't leak sub-agent tokens into the default
+/// headline. Main-thread callers pass `false` and fall back to `isSidechain`.
+pub fn parse_usage_rows(content: &str, force_subagent: bool) -> Vec<UsageRow> {
     let mut rows = Vec::new();
     for line in content.lines() {
         if !line.contains(USAGE_MARKER) {
@@ -69,7 +75,7 @@ pub fn parse_usage_rows(content: &str) -> Vec<UsageRow> {
             message_id,
             attribution_skill,
             attribution_plugin: record.attribution_plugin,
-            is_subagent: record.is_sidechain,
+            is_subagent: force_subagent || record.is_sidechain,
             work: usage.input_tokens.saturating_add(usage.output_tokens),
             cache_write: usage.cache_creation_input_tokens,
             cache_read: usage.cache_read_input_tokens,
@@ -348,17 +354,53 @@ pub struct UsageStats {
     pub files_read: usize,
 }
 
-/// Incremental usage ingest over `transcripts` (issue #5). Takes the
-/// already-enumerated main-thread refs `scan_all` built for the listing index,
-/// so a scan enumerates the transcript dirs once, not twice. A file is opened
-/// only when its `(mtime, size)` changed since last scan; rows are written
-/// INSERT OR IGNORE, so a re-read is idempotent and cross-file duplicate
-/// `message.id`s (resume/branch/compact) count once. Sub-agent files live under
-/// `subagents/` subdirs, which the enumeration does not descend into, so they
-/// are excluded by default for free.
-pub fn refresh_usage(transcripts: &[TranscriptRef], cache: &SqliteUsageCache) -> UsageStats {
+/// Incremental usage ingest (issue #5, extended for the sub-agent toggle in
+/// issue #13). Takes the already-enumerated main-thread refs `scan_all` built
+/// for the listing index plus, when the user opted in, the sub-agent refs, so a
+/// scan enumerates each dir once. A file is opened only when its `(mtime, size)`
+/// changed since last scan; rows are written INSERT OR IGNORE, so a re-read is
+/// idempotent and cross-file duplicate `message.id`s (resume/branch/compact)
+/// count once.
+///
+/// The two ref lists carry provenance: `main_transcripts` parse with
+/// `force_subagent = false` (they fall back to `isSidechain`), while
+/// `subagent_transcripts` parse with `force_subagent = true` so their rows are
+/// always tagged `is_subagent` and stay out of the default headline (grill D3).
+/// The checkpoint gate is pruned over the UNION of both lists, so a toggle-off
+/// scan (empty sub-agent list) prunes the previous run's sub-agent checkpoints
+/// -- their `message_usage` rows persist (INSERT OR IGNORE never overwrites), so
+/// re-reading them on a later toggle-on stays correct, just not instant (D7).
+pub fn refresh_usage(
+    main_transcripts: &[TranscriptRef],
+    subagent_transcripts: &[TranscriptRef],
+    cache: &SqliteUsageCache,
+) -> UsageStats {
     let mut stats = UsageStats::default();
+    ingest_transcripts(main_transcripts, false, cache, &mut stats);
+    ingest_transcripts(subagent_transcripts, true, cache, &mut stats);
 
+    // Prune the checkpoint gate for vanished transcripts, but skip a wholly
+    // empty enumeration (a transient read failure) so the whole gate isn't wiped.
+    if !main_transcripts.is_empty() || !subagent_transcripts.is_empty() {
+        let seen: HashSet<String> = main_transcripts
+            .iter()
+            .chain(subagent_transcripts)
+            .map(|t| t.path.to_string_lossy().into_owned())
+            .collect();
+        cache.retain(&seen);
+    }
+    stats
+}
+
+/// Reads and ingests each changed transcript in `transcripts`, stamping every
+/// emitted row's `is_subagent` when `force_subagent` (its provenance). Shared
+/// by the main and sub-agent passes so they gate, read, and mark identically.
+fn ingest_transcripts(
+    transcripts: &[TranscriptRef],
+    force_subagent: bool,
+    cache: &SqliteUsageCache,
+    stats: &mut UsageStats,
+) {
     for transcript in transcripts {
         stats.files_total += 1;
         let path_key = transcript.path.to_string_lossy();
@@ -372,14 +414,7 @@ pub fn refresh_usage(transcripts: &[TranscriptRef], cache: &SqliteUsageCache) ->
         }
         stats.files_read += 1;
         let Ok(content) = fs::read_to_string(&transcript.path) else { continue };
-        cache.ingest(&parse_usage_rows(&content));
-        // Reconstruct attributed usage for pre-attribution builds (issue #12).
-        // Native rows land first, so a message that already has native
-        // attribution is never displaced by a reconstructed guess; within one
-        // file the two passes never emit the same `message.id` (a record either
-        // carries `attributionSkill` or is a reconstruction candidate, never
-        // both), so this only adds credits native left on the table.
-        cache.ingest(&reconstruct_usage_rows(&content));
+        cache.ingest(&parse_usage_rows(&content, force_subagent));
         // A truncated trailing line fails serde and is skipped; completing it
         // changes `(mtime, size)`, so the file re-reads and the once-partial
         // record then counts exactly once.
@@ -387,24 +422,15 @@ pub fn refresh_usage(transcripts: &[TranscriptRef], cache: &SqliteUsageCache) ->
             cache.mark(&path_key, m, size);
         }
     }
-
-    // Prune the checkpoint gate for vanished transcripts, but skip an empty
-    // enumeration (a transient read failure) so the whole gate isn't wiped.
-    if !transcripts.is_empty() {
-        let seen: HashSet<String> =
-            transcripts.iter().map(|t| t.path.to_string_lossy().into_owned()).collect();
-        cache.retain(&seen);
-    }
-    stats
 }
 
 /// The per-attribution totals folded into a lookup keyed by the join key, so
 /// `scan_all` can attach each discovered skill's usage. Attribution strings
 /// with no matching discovered skill simply never get looked up (dropped, not
 /// fabricated).
-fn usage_by_key(cache: &SqliteUsageCache) -> HashMap<UsageKey, UsageReport> {
+fn usage_by_key(cache: &SqliteUsageCache, include_subagents: bool) -> HashMap<UsageKey, UsageReport> {
     let mut map: HashMap<UsageKey, UsageReport> = HashMap::new();
-    for total in cache.totals() {
+    for total in cache.totals(include_subagents) {
         let key = UsageKey::from_attribution(&total.attribution_skill, total.attribution_plugin.as_deref());
         let entry = map.entry(key).or_insert(UsageReport {
             work: 0,
@@ -433,8 +459,8 @@ pub struct UsageIndex {
 }
 
 impl UsageIndex {
-    pub fn build(cache: &SqliteUsageCache) -> Self {
-        UsageIndex { by_key: usage_by_key(cache) }
+    pub fn build(cache: &SqliteUsageCache, include_subagents: bool) -> Self {
+        UsageIndex { by_key: usage_by_key(cache, include_subagents) }
     }
 
     /// This skill's attributed usage, or `None` if no session touched it.
@@ -445,7 +471,7 @@ impl UsageIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::super::footprint_text::transcript_refs_by_recency;
+    use super::super::footprint_text::{subagent_transcript_refs, transcript_refs_by_recency};
     use super::*;
     use crate::domain::skill::{Frontmatter, SkillId};
     use serde_json::json;
@@ -483,6 +509,16 @@ mod tests {
         rec.to_string()
     }
 
+    /// An `assistant_line` carrying `isSidechain: true` -- the shape a sub-agent
+    /// transcript actually writes (100% of real sub-agent records, 0% of main).
+    #[allow(clippy::too_many_arguments)]
+    fn subagent_assistant_line(message_id: &str, uuid: &str, skill: Option<&str>, plugin: Option<&str>, input: u32, output: u32, cw: u32, cr: u32) -> String {
+        let mut rec: serde_json::Value =
+            serde_json::from_str(&assistant_line(message_id, uuid, skill, plugin, input, output, cw, cr)).unwrap();
+        rec["isSidechain"] = json!(true);
+        rec.to_string()
+    }
+
     fn skill(id: SkillId) -> DiscoveredSkill {
         DiscoveredSkill {
             id,
@@ -504,7 +540,7 @@ mod tests {
     #[test]
     fn parses_buckets_and_never_folds_cache_read_into_work() {
         let line = assistant_line("msg_1", "u1", Some("grilling"), None, 291, 938, 13781, 35154);
-        let rows = parse_usage_rows(&line);
+        let rows = parse_usage_rows(&line, false);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].work, 1229, "work is input + output only");
         assert_eq!(rows[0].cache_write, 13781);
@@ -517,19 +553,19 @@ mod tests {
         // Null value (key present) and a Skill-invoke-shaped line still yield
         // no rows: native-only never fabricates attribution.
         let null_attr = assistant_line("msg_1", "u1", None, None, 10, 20, 0, 0);
-        assert!(parse_usage_rows(&null_attr).is_empty());
+        assert!(parse_usage_rows(&null_attr, false).is_empty());
         // A line with usage but type != assistant is ignored too.
         let user_line = json!({"type":"user","message":{"id":"m","usage":{"input_tokens":5}}}).to_string();
-        assert!(parse_usage_rows(&user_line).is_empty());
+        assert!(parse_usage_rows(&user_line, false).is_empty());
     }
 
     #[test]
     fn dedup_is_by_message_id_not_record_uuid() {
         let cache = SqliteUsageCache::open_in_memory().unwrap();
         // Same message.id, DIFFERENT record uuid (a resume copy): count once.
-        cache.ingest(&parse_usage_rows(&assistant_line("msg_A", "uuid-1", Some("grilling"), None, 10, 20, 0, 0)));
-        cache.ingest(&parse_usage_rows(&assistant_line("msg_A", "uuid-2", Some("grilling"), None, 10, 20, 0, 0)));
-        let totals = cache.totals();
+        cache.ingest(&parse_usage_rows(&assistant_line("msg_A", "uuid-1", Some("grilling"), None, 10, 20, 0, 0), false));
+        cache.ingest(&parse_usage_rows(&assistant_line("msg_A", "uuid-2", Some("grilling"), None, 10, 20, 0, 0), false));
+        let totals = cache.totals(false);
         assert_eq!(totals.len(), 1);
         assert_eq!(totals[0].work, 30, "keying on uuid would double this to 60");
     }
@@ -544,18 +580,18 @@ mod tests {
         ]
         .join("\n");
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        cache.ingest(&parse_usage_rows(&content));
-        assert_eq!(cache.totals()[0].work, 30, "one message must count once, not 90");
+        cache.ingest(&parse_usage_rows(&content, false));
+        assert_eq!(cache.totals(false)[0].work, 30, "one message must count once, not 90");
     }
 
     #[test]
     fn native_join_credits_personal_and_plugin_skills() {
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        cache.ingest(&parse_usage_rows(&assistant_line("m1", "u1", Some("grilling"), None, 100, 0, 0, 0)));
+        cache.ingest(&parse_usage_rows(&assistant_line("m1", "u1", Some("grilling"), None, 100, 0, 0, 0), false));
         cache.ingest(&parse_usage_rows(&assistant_line(
             "m2", "u2", Some("superpowers:executing-plans"), Some("superpowers"), 50, 0, 0, 0,
-        )));
-        let index = UsageIndex::build(&cache);
+        ), false));
+        let index = UsageIndex::build(&cache, false);
 
         let personal = skill(SkillId::Personal { name: "grilling".to_string() });
         assert_eq!(index.for_skill(&personal).unwrap().work, 100);
@@ -572,9 +608,9 @@ mod tests {
     #[test]
     fn two_plugins_with_the_same_skill_name_are_told_apart_by_plugin() {
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        cache.ingest(&parse_usage_rows(&assistant_line("m1", "u1", Some("impeccable:frontend-design"), Some("impeccable"), 43, 0, 0, 0)));
-        cache.ingest(&parse_usage_rows(&assistant_line("m2", "u2", Some("frontend-design:frontend-design"), Some("frontend-design"), 187, 0, 0, 0)));
-        let index = UsageIndex::build(&cache);
+        cache.ingest(&parse_usage_rows(&assistant_line("m1", "u1", Some("impeccable:frontend-design"), Some("impeccable"), 43, 0, 0, 0), false));
+        cache.ingest(&parse_usage_rows(&assistant_line("m2", "u2", Some("frontend-design:frontend-design"), Some("frontend-design"), 187, 0, 0, 0), false));
+        let index = UsageIndex::build(&cache, false);
 
         let a = skill(SkillId::Plugin { marketplace: "mp".to_string(), plugin: "impeccable".to_string(), name: "frontend-design".to_string() });
         let b = skill(SkillId::Plugin { marketplace: "mp".to_string(), plugin: "frontend-design".to_string(), name: "frontend-design".to_string() });
@@ -585,8 +621,8 @@ mod tests {
     #[test]
     fn attribution_with_no_matching_skill_is_dropped_not_fabricated() {
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        cache.ingest(&parse_usage_rows(&assistant_line("m1", "u1", Some("loop"), None, 100, 0, 0, 0)));
-        let index = UsageIndex::build(&cache);
+        cache.ingest(&parse_usage_rows(&assistant_line("m1", "u1", Some("loop"), None, 100, 0, 0, 0), false));
+        let index = UsageIndex::build(&cache, false);
         // A discovered skill that was never attributed gets None, not a zero row.
         let other = skill(SkillId::Personal { name: "grilling".to_string() });
         assert!(index.for_skill(&other).is_none());
@@ -604,13 +640,13 @@ mod tests {
         write_transcript(&dir, "s.jsonl", &[assistant_line("m1", "u1", Some("grilling"), None, 10, 5, 0, 0)]);
         let cache = SqliteUsageCache::open_in_memory().unwrap();
 
-        let cold = refresh_usage(&refs(&dir), &cache);
+        let cold = refresh_usage(&refs(&dir), &[], &cache);
         assert_eq!(cold.files_read, 1);
-        let cold_total = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
+        let cold_total = UsageIndex::build(&cache, false).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
 
-        let warm = refresh_usage(&refs(&dir), &cache);
+        let warm = refresh_usage(&refs(&dir), &[], &cache);
         assert_eq!(warm.files_read, 0, "an unchanged transcript is not re-read");
-        let warm_total = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
+        let warm_total = UsageIndex::build(&cache, false).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(cold_total, warm_total, "warm totals must be byte-identical (idempotent)");
         assert_eq!(warm_total, 15);
     }
@@ -623,15 +659,15 @@ mod tests {
         let path = dir.join("s.jsonl");
         write_transcript(&dir, "s.jsonl", &[assistant_line("m1", "u1", Some("grilling"), None, 10, 0, 0, 0)]);
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        refresh_usage(&refs(&dir), &cache);
+        refresh_usage(&refs(&dir), &[], &cache);
 
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(f, "{}", assistant_line("m2", "u2", Some("grilling"), None, 7, 0, 0, 0)).unwrap();
         drop(f);
 
-        let stats = refresh_usage(&refs(&dir), &cache);
+        let stats = refresh_usage(&refs(&dir), &[], &cache);
         assert_eq!(stats.files_read, 1, "the grown file is re-read");
-        let total = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
+        let total = UsageIndex::build(&cache, false).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(total, 17, "m1 (10) counted once + m2 (7); no double count of m1 on the re-read");
     }
 
@@ -645,15 +681,15 @@ mod tests {
         // Second line is a truncated (mid-write) JSON object.
         fs::write(&path, format!("{good}\n{{\"type\":\"assist")).unwrap();
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        refresh_usage(&refs(&dir), &cache);
-        let after_partial = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
+        refresh_usage(&refs(&dir), &[], &cache);
+        let after_partial = UsageIndex::build(&cache, false).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(after_partial, 10, "the partial line is skipped, not counted");
 
         // Complete the file; the once-partial record now counts exactly once.
         let m2 = assistant_line("m2", "u2", Some("grilling"), None, 5, 0, 0, 0);
         fs::write(&path, format!("{good}\n{m2}\n")).unwrap();
-        refresh_usage(&refs(&dir), &cache);
-        let after_complete = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
+        refresh_usage(&refs(&dir), &[], &cache);
+        let after_complete = UsageIndex::build(&cache, false).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(after_complete, 15);
     }
 
@@ -673,9 +709,9 @@ mod tests {
             ],
         );
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        refresh_usage(&refs(&dir), &cache);
+        refresh_usage(&refs(&dir), &[], &cache);
 
-        let total = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
+        let total = UsageIndex::build(&cache, false).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(total, 17, "msg_A (10) counted once across both files + msg_B (7)");
     }
 
@@ -690,263 +726,157 @@ mod tests {
         write_transcript(&sub_dir, "agent-1.jsonl", &[assistant_line("m_sub", "u2", Some("grilling"), None, 999, 0, 0, 0)]);
 
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        let stats = refresh_usage(&refs(&dir), &cache);
+        let stats = refresh_usage(&refs(&dir), &[], &cache);
 
         assert_eq!(stats.files_read, 1, "only the depth-1 main.jsonl is enumerated, never the subagents/ file");
-        let total = UsageIndex::build(&cache).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
+        let total = UsageIndex::build(&cache, false).for_skill(&skill(SkillId::Personal { name: "grilling".to_string() })).unwrap().work;
         assert_eq!(total, 10, "the sub-agent file's 999 tokens are excluded by default");
     }
 
-    // ---- issue #12: version gate ----
+    // ---- issue #13: sub-agent enumeration + the include toggle ----
 
-    #[test]
-    fn below_gate_is_true_only_strictly_under_2_1_146() {
-        assert!(is_below_gate(Some("2.1.145")), "2.1.145 is below the gate");
-        assert!(!is_below_gate(Some("2.1.146")), "the gate itself is NOT below (exclusive)");
-        assert!(!is_below_gate(Some("2.1.200")), "a later build is not below");
+    fn grilling() -> DiscoveredSkill {
+        skill(SkillId::Personal { name: "grilling".to_string() })
     }
 
     #[test]
-    fn version_compare_is_numeric_not_lexical() {
-        // The whole reason `parse_version` returns a numeric tuple: a string
-        // compare would order "2.1.9" AFTER "2.1.146" and wrongly gate it out.
-        assert!(is_below_gate(Some("2.1.9")), "9 < 146 numerically, so 2.1.9 is below the gate");
+    fn subagent_transcript_refs_collects_agent_files_at_both_depths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("repo-a");
+        let subagents = project_dir.join("session-x").join("subagents");
+        // Depth 1: <session>/subagents/agent-*.jsonl
+        write_transcript(&subagents, "agent-1.jsonl", &[subagent_assistant_line("m1", "u1", Some("grilling"), None, 1, 0, 0, 0)]);
+        // Depth 2: <session>/subagents/workflows/wf_*/agent-*.jsonl
+        let wf = subagents.join("workflows").join("wf_abc");
+        write_transcript(&wf, "agent-2.jsonl", &[subagent_assistant_line("m2", "u2", Some("grilling"), None, 1, 0, 0, 0)]);
+
+        let refs = subagent_transcript_refs(std::slice::from_ref(&project_dir));
+        assert_eq!(refs.len(), 2, "collects agent-*.jsonl from subagents/ and subagents/workflows/wf_*/");
     }
 
     #[test]
-    fn missing_or_malformed_version_is_not_below_gate() {
-        assert!(!is_below_gate(None), "a missing version never reconstructs");
-        assert!(!is_below_gate(Some("garbage")));
-        assert!(!is_below_gate(Some("2.1")), "a two-component version is malformed");
-        assert!(!is_below_gate(Some("2.1.x")));
-        assert!(!is_below_gate(Some("2.1.146-rc1")), "a suffixed build is malformed, not below");
-        assert!(!is_below_gate(Some("2.1.100.1")), "a four-component build is malformed");
-    }
+    fn subagent_enumeration_excludes_journal_and_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("repo-a");
+        let subagents = project_dir.join("session-x").join("subagents");
+        write_transcript(&subagents, "agent-1.jsonl", &[subagent_assistant_line("m1", "u1", Some("grilling"), None, 1, 0, 0, 0)]);
+        // A sibling meta file (wrong extension) and a journal (wrong prefix)
+        // both live in the same dir and must be skipped.
+        fs::write(subagents.join("agent-1.meta.json"), "{}").unwrap();
+        fs::write(subagents.join("journal.jsonl"), "{}\n").unwrap();
 
-    /// A below-gate `assistant` record with NO `attributionSkill`, a
-    /// `message.id` + `usage`, and optionally a `Skill` tool_use block.
-    fn recon_assistant(message_id: &str, version: &str, invokes: Option<&str>, input: u32, output: u32) -> String {
-        let mut content = vec![json!({"type": "text", "text": "working"})];
-        if let Some(sk) = invokes {
-            content.push(json!({"type": "tool_use", "name": "Skill", "input": {"skill": sk}}));
-        }
-        json!({
-            "type": "assistant",
-            "version": version,
-            "uuid": message_id,
-            "message": {
-                "id": message_id,
-                "role": "assistant",
-                "content": content,
-                "usage": {
-                    "input_tokens": input,
-                    "output_tokens": output,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
-                }
-            }
-        })
-        .to_string()
-    }
-
-    /// A fresh human turn: a typed prompt (string content), which clears the
-    /// active skill.
-    fn human_turn(version: &str, text: &str) -> String {
-        json!({"type": "user", "version": version, "message": {"role": "user", "content": text}}).to_string()
-    }
-
-    /// A user record carrying a `tool_result` block -- the harness returning a
-    /// tool's output, NOT the user taking the wheel back, so it must not clear.
-    fn tool_result_turn(version: &str) -> String {
-        json!({
-            "type": "user",
-            "version": version,
-            "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}
-        })
-        .to_string()
-    }
-
-    /// The versionless leading record a real transcript opens with (a `mode` or
-    /// `last-prompt` line): the file gate must scan PAST it to the first real
-    /// version, not conclude "no version" from the first line.
-    fn mode_record() -> String {
-        json!({"type": "mode", "mode": "default"}).to_string()
-    }
-
-    fn recon_total(rows: &[UsageRow], skill: &str) -> u32 {
-        rows.iter().filter(|r| r.attribution_skill == skill).map(|r| r.work).sum()
-    }
-
-    // ---- issue #12: the reconstruction walk (AC1) ----
-
-    #[test]
-    fn pre_attribution_skill_invoke_credits_following_turns_reconstructed() {
-        let content = [
-            human_turn("2.1.100", "please help"),
-            recon_assistant("m_invoke", "2.1.100", Some("grilling"), 3, 4), // invokes; own tokens credited to prior (none)
-            recon_assistant("m1", "2.1.100", None, 10, 5),
-            recon_assistant("m2", "2.1.100", None, 20, 0),
-        ]
-        .join("\n");
-        let rows = reconstruct_usage_rows(&content);
-
-        assert_eq!(recon_total(&rows, "grilling"), 35, "m1 (15) + m2 (20) credited to grilling");
-        assert!(rows.iter().all(|r| r.reconstructed), "every reconstructed row is flagged");
-        assert!(!rows.iter().any(|r| r.message_id == "m_invoke"), "the invoking turn had no prior skill, so no row");
+        let refs = subagent_transcript_refs(std::slice::from_ref(&project_dir));
+        assert_eq!(refs.len(), 1, "only agent-*.jsonl counts; agent-*.meta.json and journal.jsonl are excluded");
+        assert!(refs[0].path.ends_with("agent-1.jsonl"));
     }
 
     #[test]
-    fn reconstructed_plugin_skill_derives_plugin_from_prefix() {
-        let content = [
-            human_turn("2.1.100", "go"),
-            recon_assistant("m_invoke", "2.1.100", Some("superpowers:executing-plans"), 0, 0),
-            recon_assistant("m1", "2.1.100", None, 40, 0),
-        ]
-        .join("\n");
-        let rows = reconstruct_usage_rows(&content);
+    fn included_subagent_work_is_credited_via_native_attribution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        write_transcript(&dir, "main.jsonl", &[assistant_line("m_main", "u1", Some("grilling"), None, 10, 0, 0, 0)]);
+        let subagents = dir.join("session-x").join("subagents");
+        write_transcript(&subagents, "agent-1.jsonl", &[subagent_assistant_line("m_sub", "u2", Some("grilling"), None, 999, 0, 0, 0)]);
 
-        let credited = rows.iter().find(|r| r.message_id == "m1").unwrap();
-        assert_eq!(credited.attribution_skill, "superpowers:executing-plans");
-        assert_eq!(credited.attribution_plugin.as_deref(), Some("superpowers"), "plugin derived from the prefix");
-    }
-
-    #[test]
-    fn invoking_turn_credited_to_prior_top_not_new_skill_when_none_active() {
-        // No human turn, no prior skill: the first assistant record invokes a
-        // skill, but its own tokens have no prior owner, so nothing is credited.
-        let content = recon_assistant("m_invoke", "2.1.100", Some("grilling"), 100, 100);
-        let rows = reconstruct_usage_rows(&content);
-        assert!(rows.is_empty(), "credit-before-push with an empty current emits no row");
-    }
-
-    #[test]
-    fn a_fresh_human_turn_clears_the_active_skill() {
-        let content = [
-            human_turn("2.1.100", "start"),
-            recon_assistant("m_invoke", "2.1.100", Some("grilling"), 0, 0),
-            recon_assistant("m1", "2.1.100", None, 10, 0), // credited to grilling
-            human_turn("2.1.100", "new task"),             // clears
-            recon_assistant("m2", "2.1.100", None, 50, 0), // no active skill -> not credited
-        ]
-        .join("\n");
-        let rows = reconstruct_usage_rows(&content);
-
-        assert_eq!(recon_total(&rows, "grilling"), 10, "only m1 (before the fresh turn) is credited");
-        assert!(!rows.iter().any(|r| r.message_id == "m2"), "post-clear turn is uncredited");
-    }
-
-    #[test]
-    fn a_tool_result_user_record_does_not_clear() {
-        let content = [
-            human_turn("2.1.100", "start"),
-            recon_assistant("m_invoke", "2.1.100", Some("grilling"), 0, 0),
-            tool_result_turn("2.1.100"),                   // must NOT clear grilling
-            recon_assistant("m1", "2.1.100", None, 12, 0), // still credited to grilling
-        ]
-        .join("\n");
-        let rows = reconstruct_usage_rows(&content);
-        assert_eq!(recon_total(&rows, "grilling"), 12, "a tool_result turn leaves the active skill in place");
-    }
-
-    #[test]
-    fn a_nested_skill_invoke_switches_credit_to_the_innermost() {
-        let content = [
-            human_turn("2.1.100", "start"),
-            recon_assistant("m_outer", "2.1.100", Some("outer"), 0, 0),
-            recon_assistant("m1", "2.1.100", None, 10, 0), // credited to outer
-            recon_assistant("m_inner", "2.1.100", Some("inner"), 0, 0), // credit-before-push: to outer, then switch
-            recon_assistant("m2", "2.1.100", None, 30, 0), // credited to inner
-        ]
-        .join("\n");
-        let rows = reconstruct_usage_rows(&content);
-
-        assert_eq!(recon_total(&rows, "outer"), 10, "turns before the inner invoke stay with outer");
-        assert_eq!(recon_total(&rows, "inner"), 30, "turns after switch to inner");
-    }
-
-    // ---- issue #12: version gating (AC2) ----
-
-    #[test]
-    fn a_current_build_with_absent_attribution_credits_nothing() {
-        // 2.1.168 is at/above the gate: an absent attributionSkill means "no
-        // skill active," so even a Skill-invoke-shaped file reconstructs nothing.
-        let content = [
-            human_turn("2.1.168", "start"),
-            recon_assistant("m_invoke", "2.1.168", Some("grilling"), 0, 0),
-            recon_assistant("m1", "2.1.168", None, 999, 0),
-        ]
-        .join("\n");
-        let rows = reconstruct_usage_rows(&content);
-        assert!(rows.is_empty(), "at/above the gate, absence is never reconstructed");
-    }
-
-    #[test]
-    fn the_file_gate_is_read_from_the_first_non_null_version() {
-        // MUST-FIX 4: the gate is a FILE-level decision from the first non-null
-        // `version`, scanning past a versionless leading `mode` record. Here that
-        // first real version is below-gate, so the file reconstructs.
-        let content = [
-            mode_record(), // no version -- must not be read as "no build"
-            human_turn("2.1.100", "start"),
-            recon_assistant("m_invoke", "2.1.100", Some("grilling"), 0, 0),
-            recon_assistant("m1", "2.1.100", None, 15, 0),
-        ]
-        .join("\n");
-        let rows = reconstruct_usage_rows(&content);
-        assert_eq!(recon_total(&rows, "grilling"), 15, "a versionless leading record does not hide the below-gate build");
-    }
-
-    #[test]
-    fn an_at_gate_first_version_blocks_the_whole_file() {
-        // The gate is exclusive at the FILE level: a build exactly at 2.1.146
-        // reconstructs nothing, even with a Skill-invoke-shaped body.
-        let content = [
-            human_turn("2.1.146", "start"),
-            recon_assistant("m_invoke", "2.1.146", Some("grilling"), 0, 0),
-            recon_assistant("m1", "2.1.146", None, 50, 0),
-        ]
-        .join("\n");
-        assert!(reconstruct_usage_rows(&content).is_empty(), "at-gate file is never walked");
-    }
-
-    // ---- issue #12: end-to-end through the store and index (AC4) ----
-
-    #[test]
-    fn reconstructed_usage_flows_through_index_with_reconstructed_source() {
-        let content = [
-            human_turn("2.1.100", "start"),
-            recon_assistant("m_invoke", "2.1.100", Some("grilling"), 0, 0),
-            recon_assistant("m1", "2.1.100", None, 25, 0),
-        ]
-        .join("\n");
         let cache = SqliteUsageCache::open_in_memory().unwrap();
-        cache.ingest(&reconstruct_usage_rows(&content));
+        refresh_usage(&refs(&dir), &subagent_transcript_refs(std::slice::from_ref(&dir)), &cache);
 
-        let report = UsageIndex::build(&cache)
-            .for_skill(&skill(SkillId::Personal { name: "grilling".to_string() }))
-            .unwrap();
-        assert_eq!(report.work, 25);
-        assert_eq!(report.attribution_source, AttributionSource::Reconstructed, "the index surfaces the reconstructed source");
+        let default = UsageIndex::build(&cache, false).for_skill(&grilling()).unwrap().work;
+        assert_eq!(default, 10, "sub-agent work stays out of the default headline");
+        let included = UsageIndex::build(&cache, true).for_skill(&grilling()).unwrap().work;
+        assert_eq!(included, 1009, "toggle on adds the sub-agent file's own 999 to the main 10");
     }
 
     #[test]
-    fn a_skill_with_both_native_and_reconstructed_rows_reports_reconstructed() {
-        // Native credit for one message, reconstructed for another, same skill:
-        // the folded report is downgraded to Reconstructed (sticky, ADR 0003).
-        let cache = SqliteUsageCache::open_in_memory().unwrap();
-        cache.ingest(&parse_usage_rows(&assistant_line("m_native", "u1", Some("grilling"), None, 10, 0, 0, 0)));
-        let recon = [
-            human_turn("2.1.100", "start"),
-            recon_assistant("m_invoke", "2.1.100", Some("grilling"), 0, 0),
-            recon_assistant("m_recon", "2.1.100", None, 7, 0),
-        ]
-        .join("\n");
-        cache.ingest(&reconstruct_usage_rows(&recon));
+    fn an_unattributed_subagent_record_contributes_nothing_even_when_included() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        let subagents = dir.join("session-x").join("subagents");
+        // isSidechain true but attributionSkill null: native-first credits it nothing.
+        let mut rec: serde_json::Value =
+            serde_json::from_str(&assistant_line("m_sub", "u1", None, None, 999, 0, 0, 0)).unwrap();
+        rec["isSidechain"] = json!(true);
+        write_transcript(&subagents, "agent-1.jsonl", &[rec.to_string()]);
 
-        let report = UsageIndex::build(&cache)
-            .for_skill(&skill(SkillId::Personal { name: "grilling".to_string() }))
-            .unwrap();
-        assert_eq!(report.work, 17);
-        assert_eq!(report.attribution_source, AttributionSource::Reconstructed);
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        refresh_usage(&[], &subagent_transcript_refs(std::slice::from_ref(&dir)), &cache);
+
+        assert!(
+            UsageIndex::build(&cache, true).for_skill(&grilling()).is_none(),
+            "an unattributed sub-agent record credits nothing, even with the toggle on"
+        );
+    }
+
+    #[test]
+    fn subagent_provenance_forces_is_subagent_even_when_the_sidechain_flag_is_absent() {
+        // grill D3: a row parsed out of a sub-agent-enumerated file is
+        // sub-agent by provenance, so even a main-shaped record (no isSidechain)
+        // must stay out of the default headline and surface only when included.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        let subagents = dir.join("session-x").join("subagents");
+        write_transcript(&subagents, "agent-1.jsonl", &[assistant_line("m_sub", "u1", Some("grilling"), None, 777, 0, 0, 0)]);
+
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        refresh_usage(&[], &subagent_transcript_refs(std::slice::from_ref(&dir)), &cache);
+
+        assert!(
+            UsageIndex::build(&cache, false).for_skill(&grilling()).is_none(),
+            "provenance stamps is_subagent=true, so the default headline excludes it despite the missing flag"
+        );
+        assert_eq!(
+            UsageIndex::build(&cache, true).for_skill(&grilling()).unwrap().work,
+            777,
+            "it is credited only when sub-agents are included"
+        );
+    }
+
+    #[test]
+    fn subagent_dedup_is_by_message_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        let subagents = dir.join("session-x").join("subagents");
+        write_transcript(
+            &subagents,
+            "agent-1.jsonl",
+            &[
+                subagent_assistant_line("m_sub", "u1", Some("grilling"), None, 50, 0, 0, 0),
+                subagent_assistant_line("m_sub", "u2", Some("grilling"), None, 50, 0, 0, 0), // same message.id
+            ],
+        );
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        refresh_usage(&[], &subagent_transcript_refs(std::slice::from_ref(&dir)), &cache);
+
+        assert_eq!(
+            UsageIndex::build(&cache, true).for_skill(&grilling()).unwrap().work,
+            50,
+            "a repeated sub-agent message.id counts once, not twice"
+        );
+    }
+
+    #[test]
+    fn subagent_cost_is_summed_from_the_file_not_parent_tool_use_result() {
+        // Regression guard (grill D9): usage is summed from the sub-agent file's
+        // OWN message.usage, never a parent's toolUseResult.totalTokens. It holds
+        // by construction (the parser never reads toolUseResult); this pins it so
+        // a future change that starts reading toolUseResult trips a red test.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo-a");
+        let subagents = dir.join("session-x").join("subagents");
+        let own = subagent_assistant_line("m_sub", "u1", Some("grilling"), None, 999, 0, 0, 0);
+        // A parent-style toolUseResult carrying a wildly larger total that must
+        // never be credited (it passes the "usage" prefilter but is type=user).
+        let tool_use_result =
+            json!({"type":"user","toolUseResult":{"totalTokens":999_999,"usage":{"input_tokens":999_999,"output_tokens":0}}}).to_string();
+        write_transcript(&subagents, "agent-1.jsonl", &[own, tool_use_result]);
+
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        refresh_usage(&[], &subagent_transcript_refs(std::slice::from_ref(&dir)), &cache);
+
+        assert_eq!(
+            UsageIndex::build(&cache, true).for_skill(&grilling()).unwrap().work,
+            999,
+            "credited from the file's own usage (999), never the toolUseResult total (999,999)"
+        );
     }
 }

@@ -56,22 +56,25 @@ type SharedApiKeySettings = Arc<Mutex<ApiKeySettings>>;
 /// command never stalls the runtime on I/O or a network call. Each scan also
 /// re-syncs the registry watcher, so a repo that appeared since the last
 /// scan starts being watched without waiting for a restart.
+///
+/// `include_subagents` (issue #13) widens the attributed-usage pass to fold in
+/// sub-agent transcripts. Tauri v2 maps the JS key `includeSubagents` to this
+/// snake_case parameter, so the frontend must invoke with that exact camelCase
+/// key or the command errors on a missing argument.
 #[tauri::command]
 async fn list_skills(
+    include_subagents: bool,
     app: tauri::AppHandle,
     adapter: tauri::State<'_, SharedAdapter>,
     watcher: tauri::State<'_, SharedWatcher>,
 ) -> Result<ScanReport, String> {
     let adapter = adapter.inner().clone();
     let watcher = watcher.inner().clone();
-    let report = tauri::async_runtime::spawn_blocking({
-        let adapter = adapter.clone();
-        move || {
-            let adapter = adapter.lock().expect("adapter mutex poisoned");
-            let report = adapter.scan_all();
-            adapter.sync_watcher(&mut watcher.lock().expect("watcher mutex poisoned"));
-            report
-        }
+    tauri::async_runtime::spawn_blocking(move || {
+        let adapter = adapter.lock().expect("adapter mutex poisoned");
+        let report = adapter.scan_all(include_subagents);
+        adapter.sync_watcher(&mut watcher.lock().expect("watcher mutex poisoned"));
+        report
     })
     .await
     .map_err(|e| e.to_string())?;
