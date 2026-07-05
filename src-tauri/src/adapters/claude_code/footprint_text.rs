@@ -126,9 +126,7 @@ impl ListingIndex {
 /// A transcript file paired with the project dir it belongs to, its mtime, and
 /// its size. `(mtime, size)` is the incremental index's change-detector key
 /// (ADR 0022); both come from the one `metadata()` call the enumeration
-/// already makes. `Clone` so `scan_all` can reuse the main-thread refs as the
-/// base of the usage pass's ref list without re-enumerating (issue #13).
-#[derive(Clone)]
+/// already makes.
 pub struct TranscriptRef {
     pub path: PathBuf,
     pub project_dir: PathBuf,
