@@ -139,11 +139,23 @@ describe("usageDisplay", () => {
     expect(title).toContain("~13,781 cache-write");
     expect(title).not.toContain("$");
   });
+
+  it("labels the window when a rolling window is active", () => {
+    const usage: UsageReport = { work: 35000, cacheWrite: 0, cacheRead: 0, attributionSource: src };
+    expect(usageDisplay(usage, 24)).toBe("~35k during this skill · last 24h");
+  });
+
+  it("shows no window label for the all-time view", () => {
+    const usage: UsageReport = { work: 35000, cacheWrite: 0, cacheRead: 0, attributionSource: src };
+    expect(usageDisplay(usage, null)).toBe("~35k during this skill");
+    // And the default (no window argument) stays all-time, so existing callers are unchanged.
+    expect(usageDisplay(usage)).toBe("~35k during this skill");
+  });
 });
 
 describe("estimatedLayerCount", () => {
   function makeReport(overrides: Partial<ScanReport>): ScanReport {
-    return { skills: [], warnings: [], activeRepoPath: null, apiKeyPresent: true, ...overrides };
+    return { skills: [], warnings: [], activeRepoPath: null, apiKeyPresent: true, usageWindowHours: null, ...overrides };
   }
 
   it("returns 0 when no key is present, even if every layer is an estimate", () => {
