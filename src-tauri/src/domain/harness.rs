@@ -5,6 +5,14 @@ use crate::domain::skill::{DiscoveredSkill, DiscoveryResult};
 /// Abstracts everything agent-specific: where skills live, how footprint is
 /// read, how enable/disable is mutated (mutation methods land in a later
 /// plan). v1 ships a single implementation, `ClaudeCodeAdapter` (ADR 0002).
+///
+/// The MVP's runtime path calls the concrete adapter's inherent `scan`
+/// directly (for the windowed usage + toasts of issue #14), so the generic
+/// trait methods here are no longer dispatched from the cdylib entry point.
+/// They are the harness seam reserved for a second adapter and are exercised
+/// by the test suite (`StubAdapter`), so `allow(dead_code)` keeps them without
+/// masking a real regression.
+#[allow(dead_code)]
 pub trait HarnessAdapter {
     fn discover_skills(&self) -> DiscoveryResult;
     fn compute_footprint(&self, skill: &DiscoveredSkill) -> Footprint;
@@ -25,7 +33,12 @@ pub trait HarnessAdapter {
     /// reuse is inherent: `compute_footprint` hashes each layer's text and the
     /// cache serves an unchanged hash without re-tokenizing, so an unchanged
     /// skill costs a lookup, not a recompute (ADR 0019).
-    fn scan_all(&self) -> ScanReport {
+    ///
+    /// `include_subagents` (issue #13) is part of the trait signature so the
+    /// IPC command can thread it uniformly; the default impl ignores it,
+    /// because a harness with no attributed-usage pass has no sub-agent tokens
+    /// to include. The Claude Code adapter overrides this to honor the flag.
+    fn scan_all(&self, _include_subagents: bool) -> ScanReport {
         let discovery = self.discover_skills();
         let skills = discovery
             .skills
@@ -42,6 +55,10 @@ pub trait HarnessAdapter {
             warnings,
             active_repo_path: discovery.active_repo_path.map(|p| p.display().to_string()),
             api_key_present: self.api_key_present(),
+            // The trait default has no transcript access, so it can only ever
+            // report all-time usage (`None`). A harness that windows usage does
+            // so in its own `scan` override, not here (issue #14).
+            usage_window_hours: None,
         }
     }
 }
@@ -63,6 +80,6 @@ mod tests {
     #[test]
     fn default_scan_all_reports_no_api_key_until_an_adapter_overrides() {
         assert!(!StubAdapter.api_key_present(), "the trait default must claim no key");
-        assert!(!StubAdapter.scan_all().api_key_present, "the default scan_all must wire the field");
+        assert!(!StubAdapter.scan_all(false).api_key_present, "the default scan_all must wire the field");
     }
 }

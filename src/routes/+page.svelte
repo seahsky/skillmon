@@ -14,11 +14,18 @@
     type ScanReport,
     type SetKeyOutcome,
     type SkillReport,
+    type UsageSettings,
   } from "$lib/skills";
 
   let report = $state<ScanReport | null>(null);
   let error = $state<string | null>(null);
   let loading = $state(true);
+
+  // Attributed-usage scope toggle (issue #13). Off by default: the headline
+  // usage metric excludes sub-agent tokens. Flipping it re-scans with the
+  // sub-agent transcripts folded in — a backend re-scan param, never a
+  // frontend filter, since the tokens must come from the deduped store.
+  let includeSubagents = $state(false);
 
   // API-key settings (issue #4). The panel is a view-swap: the gear replaces
   // the skill table with a settings pane, never a modal on this small surface.
@@ -30,6 +37,15 @@
   // True only while the first post-save rescan is running, so we can explain
   // the long count_tokens burst instead of the plain "Scanning…" (looks hung).
   let firstKeyScan = $state(false);
+
+  // Rolling-window toggle (issue #14). The panel defaults to all-time (issue
+  // #5's shipped cumulative figures); 24h is opt-in. The budget toast is always
+  // evaluated on a 24h window regardless of this view.
+  let windowHours = $state<number | null>(null);
+
+  // Usage-toast settings (issue #14), loaded lazily when the settings pane opens.
+  let usageSettings = $state<UsageSettings | null>(null);
+  let savingUsage = $state(false);
 
   const apiKeyPresent = $derived(report?.apiKeyPresent ?? false);
   const trimmedKey = $derived(normalizeApiKey(keyInput));
@@ -44,12 +60,19 @@
     loading = true;
     error = null;
     try {
-      report = await invoke<ScanReport>("list_skills");
+      report = await invoke<ScanReport>("list_skills", { includeSubagents, usageWindowHours: windowHours });
     } catch (e) {
       error = String(e);
     } finally {
       loading = false;
     }
+  }
+
+  // Switch the displayed usage window and rescan. No-op if already selected.
+  async function setWindow(hours: number | null) {
+    if (windowHours === hours) return;
+    windowHours = hours;
+    await load();
   }
 
   // Validate + store the key, then rescan so the exact/estimate badges flip.
@@ -91,10 +114,32 @@
     }
   }
 
+  async function loadUsageSettings() {
+    try {
+      usageSettings = await invoke<UsageSettings>("get_usage_settings");
+    } catch (e) {
+      keyError = String(e);
+    }
+  }
+
+  async function saveUsageSettings() {
+    if (!usageSettings || savingUsage) return;
+    savingUsage = true;
+    keyError = null;
+    try {
+      await invoke("set_usage_settings", { settings: usageSettings });
+    } catch (e) {
+      keyError = String(e);
+    } finally {
+      savingUsage = false;
+    }
+  }
+
   function openSettings() {
     setOutcome = null;
     keyError = null;
     view = "settings";
+    loadUsageSettings();
   }
 
   function closeSettings() {
@@ -119,7 +164,8 @@
       : `${base}. Always-on text reconstructed from frontmatter; no session has listed this skill yet`;
   }
 
-  function onDemandTitle(layer: LayerReport): string {
+  function onDemandTitle(layer: LayerReport | null): string {
+    if (layer === null) return "Computing on-demand ceiling…";
     const base = "Ceiling: raw size of bundled references, loaded only if the body reads them";
     return layer.exact ? base : `${base} (calibrated estimate)`;
   }
@@ -129,9 +175,13 @@
     // The registry watcher (ADR 0019) fires this when a skill/plugin surface
     // changes; re-scan so the list doesn't go stale. Enablement is read at
     // session start, so this is a freshness nudge, not a live-state mirror.
-    const unlisten = listen("registry-changed", () => load());
+    const unlistenRegistry = listen("registry-changed", () => load());
+    // The background on-demand fill (issue #11) fires this once it has computed
+    // the pending ceilings; re-scan so the "…" cells resolve to real numbers.
+    const unlistenOnDemand = listen("on-demand-ready", () => load());
     return () => {
-      unlisten.then((off) => off());
+      unlistenRegistry.then((off) => off());
+      unlistenOnDemand.then((off) => off());
     };
   });
 </script>
@@ -200,6 +250,37 @@
         <p class="notice rejected">Couldn't save the key. <code>{keyError}</code></p>
       {/if}
     </section>
+
+    {#if usageSettings}
+      <section class="settings usage-settings">
+        <h2 class="settings-heading">Usage toasts</h2>
+        <label class="check">
+          <input type="checkbox" bind:checked={usageSettings.budgetEnabled} disabled={savingUsage} />
+          <span>Warn when 24h attributed work goes over a budget</span>
+        </label>
+        <label class="field indented">
+          <span class="field-label">Budget (work tokens per 24h)</span>
+          <input
+            type="number"
+            min="0"
+            step="1000"
+            bind:value={usageSettings.budgetWorkTokens}
+            disabled={savingUsage || !usageSettings.budgetEnabled}
+          />
+        </label>
+        <label class="check">
+          <input type="checkbox" bind:checked={usageSettings.anomalyEnabled} disabled={savingUsage} />
+          <span>Also warn when one skill spikes above its usual daily average</span>
+        </label>
+        <button class="primary" onclick={saveUsageSettings} disabled={savingUsage}>
+          {savingUsage ? "Saving…" : "Save usage settings"}
+        </button>
+        <p class="hint why">
+          An estimate of tokens spent while skills were active, not a bill. The check runs each time the panel opens,
+          not in real time.
+        </p>
+      </section>
+    {/if}
   {:else}
     <header class="topbar">
       <h1>Skills</h1>
@@ -209,6 +290,37 @@
             active repo: {repoName(report.activeRepoPath)}
           </span>
         {/if}
+        <div class="window-toggle" role="group" aria-label="Usage window">
+          <button
+            class="seg"
+            class:active={windowHours === null}
+            onclick={() => setWindow(null)}
+            disabled={loading}
+            title="Show all-time attributed usage"
+          >All-time</button>
+          <button
+            class="seg"
+            class:active={windowHours === 24}
+            onclick={() => setWindow(24)}
+            disabled={loading}
+            title="Show attributed usage from the last 24 hours"
+          >Last 24h</button>
+        </div>
+        <label
+          class="subagents-toggle"
+          title="Include sub-agent usage. Only sub-agents that themselves invoked a skill are credited; the rest are dropped."
+        >
+          <input
+            type="checkbox"
+            checked={includeSubagents}
+            disabled={loading}
+            onchange={(e) => {
+              includeSubagents = e.currentTarget.checked;
+              load();
+            }}
+          />
+          Sub-agents
+        </label>
         <button class="rescan" onclick={load} disabled={loading} title="Rescan now">
           {loading ? "Scanning…" : "Rescan"}
         </button>
@@ -282,14 +394,18 @@
               </div>
               {#if skill.usage}
                 <div class="usage" title={usageTitle(skill.usage)}>
-                  {usageDisplay(skill.usage)}
+                  {usageDisplay(skill.usage, report?.usageWindowHours ?? null)}
                 </div>
               {/if}
             </div>
 
             {@render layerCell(skill.alwaysOn, alwaysOnTitle(skill), !skill.alwaysOnNative)}
             {@render layerCell(skill.onInvoke, layerTitle(skill.onInvoke))}
-            {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand))}
+            {#if skill.onDemand === null}
+              <div class="col num pending" role="cell" title={onDemandTitle(null)}>…</div>
+            {:else}
+              {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand))}
+            {/if}
           </div>
         {/each}
       </div>
@@ -361,6 +477,48 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* Segmented All-time / Last 24h control (issue #14). */
+  .window-toggle {
+    display: inline-flex;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .window-toggle .seg {
+    border: none;
+    border-radius: 0;
+    padding: 3px 8px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .window-toggle .seg + .seg {
+    border-left: 1px solid var(--line);
+  }
+  .window-toggle .seg.active {
+    background: var(--accent);
+    color: #fff;
+  }
+  .window-toggle .seg.active:hover:not(:disabled) {
+    color: #fff;
+  }
+
+  /* Sub-agent usage scope toggle (issue #13): a demoted, muted control that
+     sits alongside Rescan, matching the demoted framing of the usage metric
+     it widens. */
+  .subagents-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .subagents-toggle input {
+    margin: 0;
+    cursor: pointer;
   }
 
   button {
@@ -522,6 +680,11 @@
   .col.num.estimate {
     color: var(--estimate-fg);
   }
+  /* On-demand ceiling still being computed off the interactive scan (issue
+     #11): a faint ellipsis, never a 0 that would read as a resolved ceiling. */
+  .col.num.pending {
+    color: var(--faint);
+  }
   /* Always-on text reconstructed from frontmatter (no transcript yet). */
   .col.num.reconstructed {
     text-decoration: underline dotted;
@@ -610,6 +773,34 @@
   .settings button.danger:hover:not(:disabled) {
     color: #b3261e;
     border-color: #b3261e;
+  }
+  .usage-settings {
+    border-top: 1px solid var(--line);
+    padding-top: 12px;
+  }
+  .settings-heading {
+    font-size: 12px;
+    font-weight: 600;
+    margin: 0;
+  }
+  .check {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--fg);
+    cursor: pointer;
+  }
+  .check input {
+    margin-top: 1px;
+  }
+  .field.indented {
+    margin-left: 22px;
+  }
+  /* The number input inherits base styling (incl. dark mode) from `.settings
+     input`; it only needs its own width. */
+  .usage-settings input[type="number"] {
+    max-width: 160px;
   }
   .set-status {
     font-weight: 500;

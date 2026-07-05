@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::footprint::{Footprint, TextConfidence, TokenSource};
 use super::skill::{DiscoveredSkill, SkillId};
@@ -30,13 +30,17 @@ pub enum SkillKind {
     Plugin,
 }
 
-/// How a usage figure was attributed (ADR 0005). Only `Native` ships in the
-/// MVP (issue #5); `Reconstructed` is reserved for the deferred parentUuid
-/// walk over pre-attribution transcripts, so the UI seam already exists.
+/// How a usage figure was attributed (ADR 0005). `Native` trusts Claude Code's
+/// own `attributionSkill`/`attributionPlugin` (issue #5); `Reconstructed` is a
+/// version-gated in-order walk over a pre-attribution transcript that credited
+/// each turn to the skill then holding the wheel (issue #12). A skill is tagged
+/// `Reconstructed` if ANY of its contributing turns was reconstructed, so the
+/// lower-confidence framing is sticky and never overstated (ADR 0003).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AttributionSource {
     Native,
+    Reconstructed,
 }
 
 /// Attributed session usage for one skill (ADR 0005): a demoted, deliberately
@@ -75,7 +79,11 @@ pub struct SkillReport {
     /// skill yet (ADR 0016). Only the always-on layer carries this.
     pub always_on_native: bool,
     pub on_invoke: LayerReport,
-    pub on_demand: LayerReport,
+    /// `None` (a JSON `null`) means the on-demand ceiling is still being
+    /// computed off the interactive scan (issue #11); the panel renders a
+    /// pending affordance, never a `0`. `Some(LayerReport { tokens: 0, .. })`
+    /// is the resolved "no bundled files" state, kept distinct from pending.
+    pub on_demand: Option<LayerReport>,
     /// Attributed session usage (issue #5), or `None` when no session has
     /// touched this skill. `None` (a null in the panel) means "untouched," not
     /// "attributed zero," so a zero figure is never fabricated for a skill no
@@ -107,7 +115,7 @@ impl SkillReport {
             always_on: footprint.always_on.count.into(),
             always_on_native: footprint.always_on.confidence == TextConfidence::Native,
             on_invoke: footprint.on_invoke.into(),
-            on_demand: footprint.on_demand.into(),
+            on_demand: footprint.on_demand.map(Into::into),
             usage,
             repo_path,
             marketplace,
@@ -131,6 +139,25 @@ pub struct ScanReport {
     /// key-presence UI flips from one `list_skills` payload (issue #4). Only a
     /// boolean crosses the IPC boundary; the key itself never does.
     pub api_key_present: bool,
+    /// Which window the per-skill `usage` figures cover: `None` = all-time
+    /// (issue #5's shipped cumulative numbers, the default view), `Some(24)` =
+    /// the last 24h. Lets the panel label the usage sub-line honestly (issue
+    /// #14). The 24h budget toast is independent of this and always 24h.
+    pub usage_window_hours: Option<u32>,
+}
+
+/// The user-configurable usage-toast settings (issue #14), round-tripped by the
+/// `get_usage_settings` / `set_usage_settings` commands. Deserialized on the way
+/// in, so it derives `Deserialize` unlike the other read-only report DTOs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSettings {
+    /// The rolling-24h attributed-work budget toast, on by default.
+    pub budget_enabled: bool,
+    /// The attributed work-token ceiling per 24h.
+    pub budget_work_tokens: u64,
+    /// Per-skill anomaly toasts, off by default (DESIGN.md UX #4).
+    pub anomaly_enabled: bool,
 }
 
 #[cfg(test)]
@@ -165,7 +192,7 @@ mod tests {
                 confidence: TextConfidence::Native,
             },
             on_invoke: LayerCount { tokens: 200, source: TokenSource::Estimate },
-            on_demand: LayerCount { tokens: 0, source: TokenSource::Exact },
+            on_demand: Some(LayerCount { tokens: 0, source: TokenSource::Exact }),
         }
     }
 
@@ -230,6 +257,40 @@ mod tests {
         assert_eq!(json["usage"]["cacheWrite"], 13781);
         assert_eq!(json["usage"]["cacheRead"], 35154);
         assert_eq!(json["usage"]["attributionSource"], "native");
+
+        // The reconstructed seam (issue #12) serializes to its own camelCase
+        // tag, so the UI can flag the lower-confidence figure (ADR 0005).
+        let reconstructed = UsageReport {
+            work: 500,
+            cache_write: 0,
+            cache_read: 0,
+            attribution_source: AttributionSource::Reconstructed,
+        };
+        let with_recon = SkillReport::from_parts(&skill, &sample_footprint(), Some(reconstructed));
+        let recon_json = serde_json::to_value(&with_recon).unwrap();
+        assert_eq!(recon_json["usage"]["attributionSource"], "reconstructed");
+    }
+
+    #[test]
+    fn a_pending_on_demand_serializes_to_json_null_not_zero() {
+        // The pending contract at the IPC boundary (issue #11): a `None`
+        // on-demand must reach the panel as `null` so it can render the
+        // "computing…" affordance, never as a `0` that would read as an exact
+        // "nothing to load" ceiling.
+        let skill = skill_with_id(SkillId::Personal { name: "grilling".to_string() });
+        let footprint = Footprint {
+            always_on: AlwaysOnFootprint {
+                count: LayerCount { tokens: 10, source: TokenSource::Estimate },
+                confidence: TextConfidence::Native,
+            },
+            on_invoke: LayerCount { tokens: 20, source: TokenSource::Estimate },
+            on_demand: None,
+        };
+        let report = SkillReport::from_parts(&skill, &footprint, None);
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["onDemand"], serde_json::Value::Null);
+        assert!(json.get("onDemand").is_some(), "the key is present, just null");
     }
 
     #[test]
@@ -239,10 +300,40 @@ mod tests {
             warnings: vec!["a warning".to_string()],
             active_repo_path: Some("/repo".to_string()),
             api_key_present: true,
+            usage_window_hours: None,
         };
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["activeRepoPath"], "/repo");
         assert_eq!(json["warnings"][0], "a warning");
         assert_eq!(json["apiKeyPresent"], true);
+    }
+
+    #[test]
+    fn scan_report_serializes_usage_window_hours() {
+        let all_time = ScanReport {
+            skills: vec![],
+            warnings: vec![],
+            active_repo_path: None,
+            api_key_present: false,
+            usage_window_hours: None,
+        };
+        // All-time serializes as an explicit null, not an omitted key, so the
+        // panel can distinguish "all-time" from a malformed payload.
+        assert_eq!(serde_json::to_value(&all_time).unwrap()["usageWindowHours"], serde_json::Value::Null);
+
+        let windowed = ScanReport { usage_window_hours: Some(24), ..all_time };
+        assert_eq!(serde_json::to_value(&windowed).unwrap()["usageWindowHours"], 24);
+    }
+
+    #[test]
+    fn usage_settings_round_trips_camel_case() {
+        let settings = UsageSettings { budget_enabled: true, budget_work_tokens: 250_000, anomaly_enabled: false };
+        let json = serde_json::to_value(settings).unwrap();
+        assert_eq!(json["budgetEnabled"], true);
+        assert_eq!(json["budgetWorkTokens"], 250_000);
+        assert_eq!(json["anomalyEnabled"], false);
+        // The set command deserializes the same shape back.
+        let back: UsageSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(back, settings);
     }
 }

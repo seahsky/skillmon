@@ -4,7 +4,7 @@ use crate::domain::skill::DiscoveredSkill;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct AlwaysOnText {
@@ -218,6 +218,62 @@ pub fn transcript_refs_by_recency(project_dirs: &[PathBuf]) -> (Vec<TranscriptRe
     }
     refs.sort_by_key(|r| std::cmp::Reverse(r.mtime));
     (refs, enumerated_dirs)
+}
+
+/// Gathers the sub-agent transcripts under each project dir, for the opt-in
+/// include-sub-agents usage pass (issue #13). Claude Code writes a session's
+/// sub-agent files at `<project_dir>/<session-uuid>/subagents/agent-<id>.jsonl`,
+/// with workflow sub-agents one level deeper under
+/// `subagents/workflows/wf_<id>/`. Only `agent-*.jsonl` files are collected:
+/// the sibling `agent-<id>.meta.json` (wrong extension) and `journal.jsonl`
+/// (wrong prefix) are deliberately excluded.
+///
+/// These refs feed ONLY the usage pass, never the listing index (grill D4 /
+/// ADR 0005): the vast majority of sub-agent files carry their own
+/// `skill_listing` attachment, so routing them through the index would pollute
+/// always-on and evict the memo. Ordering is irrelevant here (usage dedups by
+/// `message.id` and totals GROUP BY), so unlike `transcript_refs_by_recency`
+/// this does not sort.
+pub fn subagent_transcript_refs(project_dirs: &[PathBuf]) -> Vec<TranscriptRef> {
+    let mut refs: Vec<TranscriptRef> = Vec::new();
+    for dir in project_dirs {
+        let Ok(sessions) = fs::read_dir(dir) else { continue };
+        for session in sessions.flatten() {
+            let subagents_dir = session.path().join("subagents");
+            // Depth 1: <session>/subagents/agent-*.jsonl
+            collect_agent_files(&subagents_dir, dir, &mut refs);
+            // Depth 2: <session>/subagents/workflows/wf_*/agent-*.jsonl
+            let Ok(workflows) = fs::read_dir(subagents_dir.join("workflows")) else { continue };
+            for wf in workflows.flatten() {
+                let wf_path = wf.path();
+                let is_wf_dir = wf_path.is_dir()
+                    && wf_path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("wf_"));
+                if is_wf_dir {
+                    collect_agent_files(&wf_path, dir, &mut refs);
+                }
+            }
+        }
+    }
+    refs
+}
+
+/// Pushes every `agent-*.jsonl` directly inside `dir` onto `refs`, tagged with
+/// `project_dir` and its `(mtime, size)`. Non-`agent-` files and non-`.jsonl`
+/// extensions are skipped, so `agent-<id>.meta.json` and `journal.jsonl` never
+/// enter the usage pass.
+fn collect_agent_files(dir: &Path, project_dir: &Path, refs: &mut Vec<TranscriptRef>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_agent = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("agent-"));
+        let is_jsonl = path.extension().and_then(|e| e.to_str()) == Some("jsonl");
+        if !(is_agent && is_jsonl) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        refs.push(TranscriptRef { path, project_dir: project_dir.to_path_buf(), mtime, size: meta.len() });
+    }
 }
 
 #[derive(Debug, Deserialize)]

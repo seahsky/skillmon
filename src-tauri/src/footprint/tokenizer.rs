@@ -11,6 +11,26 @@ pub fn estimate_tokens(text: &str) -> u32 {
     bpe_openai::o200k_base().count(text) as u32
 }
 
+/// The calibrated-estimate tokenizer as an injectable seam. Production wires
+/// `BpeTokenizer` (a thin call through to `estimate_tokens`); a test can
+/// substitute a spy to prove which texts a scan actually tokenizes -- the
+/// negative proof behind issue #11's "interactive scan does zero on-demand
+/// tokenization." `Send + Sync` so the adapter can hold it as `Box<dyn
+/// Tokenizer>` behind the scan `Mutex` and a background pass can hold its own.
+pub trait Tokenizer: Send + Sync {
+    fn estimate(&self, text: &str) -> u32;
+}
+
+/// The one production `Tokenizer`: identical output to the free
+/// `estimate_tokens`, so wiring it changes no displayed count.
+pub struct BpeTokenizer;
+
+impl Tokenizer for BpeTokenizer {
+    fn estimate(&self, text: &str) -> u32 {
+        estimate_tokens(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18,6 +38,17 @@ mod tests {
     #[test]
     fn empty_string_is_zero_tokens() {
         assert_eq!(estimate_tokens(""), 0);
+    }
+
+    /// The injectable `BpeTokenizer` must be byte-identical to the free
+    /// function it wraps, or wiring the seam (issue #11) would silently shift
+    /// every estimate-tier count.
+    #[test]
+    fn bpe_tokenizer_estimate_matches_the_free_function() {
+        let tok = BpeTokenizer;
+        for text in edge_case_corpus() {
+            assert_eq!(tok.estimate(&text), estimate_tokens(&text), "drift on {text:?}");
+        }
     }
 
     #[test]
