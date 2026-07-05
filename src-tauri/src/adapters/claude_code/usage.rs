@@ -79,7 +79,234 @@ pub fn parse_usage_rows(content: &str, force_subagent: bool) -> Vec<UsageRow> {
             work: usage.input_tokens.saturating_add(usage.output_tokens),
             cache_write: usage.cache_creation_input_tokens,
             cache_read: usage.cache_read_input_tokens,
+            reconstructed: false,
         });
+    }
+    rows
+}
+
+/// Reconstruct attributed usage only for a transcript record whose Claude Code
+/// build is STRICTLY below this version (issue #12). Conservative and
+/// corpus-inferred: the changelog has no explicit entry for when
+/// `attributionSkill` first shipped on main-thread `assistant` records, and its
+/// earliest published coverage is 2.1.145, so builds at or above 2.1.146 are
+/// assumed to compute native attribution. At or above the gate, an absent
+/// `attributionSkill` means "no skill was active," and reconstructing there
+/// would fabricate attribution the build deliberately withheld (ADR 0005). Err
+/// LOWER, not higher: a lower gate reconstructs fewer builds and so can only
+/// ever under-credit, never fabricate.
+const ATTRIBUTION_GATE: (u32, u32, u32) = (2, 1, 146);
+
+/// Parses a `major.minor.patch` version into a numeric tuple, or `None` for
+/// anything that is not exactly three dot-separated integers (missing,
+/// malformed, suffixed like `2.1.146-rc1`, or a 4+-component build). Numeric,
+/// never lexical: string comparison mis-orders "2.1.9" as greater than
+/// "2.1.146", so the components must be compared as numbers.
+fn parse_version(version: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    // A fourth component means this isn't a plain major.minor.patch; treat it as
+    // malformed rather than silently ignoring the tail.
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Whether a `version` string is strictly below the attribution gate. A missing
+/// or unparseable version is treated as NOT below the gate, so an ambiguous
+/// build never triggers reconstruction (the safe direction: a miss, never a
+/// fabrication).
+fn is_below_gate(version: Option<&str>) -> bool {
+    match version.and_then(parse_version) {
+        Some(v) => v < ATTRIBUTION_GATE,
+        None => false,
+    }
+}
+
+/// A minimal probe for the file-level version gate: just the top-level
+/// `version`, so finding the build costs a small parse per candidate line
+/// rather than a full `ReconRecord` deserialize.
+#[derive(Deserialize)]
+struct VersionProbe {
+    version: Option<String>,
+}
+
+/// Whether the transcript's build is below the attribution gate, read from its
+/// FIRST non-null `version` (MUST-FIX 4). Scans past a leading versionless
+/// `mode`/`last-prompt` record and stops at the first version found -- so a
+/// current-build file (the common case) returns `false` after only a line or
+/// two, never a whole-file parse. No version anywhere is NOT below gate.
+fn file_is_below_gate(content: &str) -> bool {
+    for line in content.lines() {
+        // Skip lines that can't carry a top-level version without paying a parse
+        // (the `version` key is present on every real record that has one).
+        if !line.contains("\"version\"") {
+            continue;
+        }
+        let Ok(probe) = serde_json::from_str::<VersionProbe>(line) else { continue };
+        if let Some(version) = probe.version {
+            return is_below_gate(Some(&version));
+        }
+    }
+    false
+}
+
+/// A transcript record, parsed for the RECONSTRUCTION walk (issue #12). Unlike
+/// the native `UsageRecord`, this also carries the `isMeta` flag and the
+/// `message.content` blocks needed to spot a `Skill` invoke and a fresh human
+/// turn. The build `version` is not here: the gate is decided once per file via
+/// the lighter `VersionProbe` before the walk begins. Kept a separate struct so
+/// the hot native path (`parse_usage_rows`) stays lean and does not deserialize
+/// content on every line (SHOULD-FIX 6).
+#[derive(Deserialize)]
+struct ReconRecord {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(rename = "attributionSkill")]
+    attribution_skill: Option<String>,
+    #[serde(rename = "isSidechain", default)]
+    is_sidechain: bool,
+    #[serde(rename = "isMeta", default)]
+    is_meta: bool,
+    message: Option<ReconMessage>,
+}
+
+#[derive(Deserialize)]
+struct ReconMessage {
+    id: Option<String>,
+    usage: Option<UsageTokens>,
+    content: Option<ReconContent>,
+}
+
+/// A record's `message.content`: a bare string for a typed human prompt, or an
+/// array of blocks for an assistant turn (or a tool_result-bearing user turn).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReconContent {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+#[derive(Deserialize)]
+struct ContentBlock {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    name: Option<String>,
+    input: Option<BlockInput>,
+}
+
+#[derive(Deserialize)]
+struct BlockInput {
+    /// The invoked skill's attribution string on a `Skill` tool_use block --
+    /// byte-identical to the native `attributionSkill` (verified), so the same
+    /// `UsageKey::from_attribution` join applies.
+    skill: Option<String>,
+}
+
+/// Is this `user` record a fresh human turn (which clears the active skill)?
+/// True only for a typed prompt (`content` is a string) or a block turn with no
+/// `tool_result`, and never for a meta record (a caveat/system injection) --
+/// those are not the user taking the wheel back, so they must not clear the
+/// current skill.
+fn is_fresh_human_turn(record: &ReconRecord) -> bool {
+    if record.is_meta {
+        return false;
+    }
+    match record.message.as_ref().and_then(|m| m.content.as_ref()) {
+        // A typed prompt (text the user actually sent) hands the wheel back. An
+        // empty string is a degenerate non-turn, so it does not clear -- the
+        // conservative direction, and never seen from a real prompt.
+        Some(ReconContent::Text(text)) => !text.trim().is_empty(),
+        // A block turn is the user only when it carries no `tool_result` (a
+        // tool_result is the harness returning a tool's output, not the user).
+        Some(ReconContent::Blocks(blocks)) => {
+            !blocks.iter().any(|b| b.kind.as_deref() == Some("tool_result"))
+        }
+        None => false,
+    }
+}
+
+/// Reconstructs attributed usage for a PRE-ATTRIBUTION transcript (issue #12),
+/// the version-gated fallback to native attribution. Walks the file IN APPEND
+/// ORDER (not the `parentUuid` tree: append order is causally sound and the
+/// pre-attribution target files are monotonic), tracking the single skill
+/// currently holding the wheel:
+///
+/// - a fresh human turn clears it (the user took the wheel back);
+/// - each `assistant` record is credited BEFORE any skill it invokes, so an
+///   invoking turn's own tokens belong to the skill that was already active,
+///   not the one it is about to start -- matching native semantics exactly;
+/// - a credit is emitted only when native attribution is ABSENT (else native
+///   handles it) and a skill is active.
+///
+/// The build gate is checked ONCE, at the FILE level, from the first non-null
+/// `version` (the leading `mode`/`last-prompt` record often has none) --
+/// MUST-FIX 4. This is both correct (files are single-version) and the
+/// performance guard: a current-build transcript bails after that cheap early
+/// scan and never pays the every-line parse. Only for a genuinely below-gate
+/// file is the prefilter dropped and every line walked -- there a missed `Skill`
+/// push or human-turn clear would silently miscredit the whole tail, and such
+/// files are rare and tiny (SHOULD-FIX 6).
+///
+/// Every emitted row is flagged `reconstructed: true`.
+pub fn reconstruct_usage_rows(content: &str) -> Vec<UsageRow> {
+    if !file_is_below_gate(content) {
+        return Vec::new();
+    }
+
+    let mut rows = Vec::new();
+    // The single skill currently holding the wheel (never a stack: we only ever
+    // read the top and clear the whole thing, so the stack framing would only
+    // invite a future "pop on tool_result" bug -- SHOULD-FIX 7).
+    let mut current_skill: Option<String> = None;
+
+    for line in content.lines() {
+        let Ok(record) = serde_json::from_str::<ReconRecord>(line) else { continue };
+        match record.kind.as_deref() {
+            Some("user") => {
+                if is_fresh_human_turn(&record) {
+                    current_skill = None;
+                }
+            }
+            Some("assistant") => {
+                // CREDIT BEFORE PUSH: this record's tokens belong to whatever
+                // skill was active when it was produced, not to one it invokes.
+                // The whole file is below-gate, so an absent attributionSkill is
+                // a reconstruction candidate (never a "no skill active" signal a
+                // current build would have emitted).
+                if record.attribution_skill.is_none() {
+                    if let (Some(skill), Some(message)) = (&current_skill, &record.message) {
+                        if let (Some(id), Some(usage)) = (&message.id, &message.usage) {
+                            rows.push(UsageRow {
+                                message_id: id.clone(),
+                                attribution_skill: skill.clone(),
+                                attribution_plugin: skill.split_once(':').map(|(p, _)| p.to_string()),
+                                is_subagent: record.is_sidechain,
+                                work: usage.input_tokens.saturating_add(usage.output_tokens),
+                                cache_write: usage.cache_creation_input_tokens,
+                                cache_read: usage.cache_read_input_tokens,
+                                reconstructed: true,
+                            });
+                        }
+                    }
+                }
+                // THEN push: a `Skill` invoke in this record switches the active
+                // skill for the turns that follow it.
+                if let Some(ReconContent::Blocks(blocks)) = record.message.as_ref().and_then(|m| m.content.as_ref()) {
+                    for block in blocks {
+                        if block.kind.as_deref() == Some("tool_use") && block.name.as_deref() == Some("Skill") {
+                            if let Some(skill) = block.input.as_ref().and_then(|i| i.skill.as_ref()) {
+                                current_skill = Some(skill.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     rows
 }
@@ -214,6 +441,14 @@ fn usage_by_key(cache: &SqliteUsageCache, include_subagents: bool) -> HashMap<Us
         entry.work = entry.work.saturating_add(total.work);
         entry.cache_write = entry.cache_write.saturating_add(total.cache_write);
         entry.cache_read = entry.cache_read.saturating_add(total.cache_read);
+        // Reconstructed is sticky across a fold: a key stays Native only while
+        // every contributing total is native, and any reconstructed one
+        // downgrades it for good (it is never upgraded back). This holds even
+        // when two distinct attribution strings collapse to one `UsageKey`
+        // (ADR 0003 honesty).
+        if total.reconstructed {
+            entry.attribution_source = AttributionSource::Reconstructed;
+        }
     }
     map
 }
