@@ -7,7 +7,7 @@ mod domain;
 mod footprint;
 
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::{Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
@@ -218,6 +218,35 @@ async fn delete_api_key(settings: tauri::State<'_, SharedApiKeySettings>) -> Res
     .map_err(|e| e.to_string())?
 }
 
+/// Show or hide the tray panel, with the macOS double-toggle guard.
+///
+/// Shared by the tray left-click and the global hotkey. If the panel is up,
+/// hide it. If it is down, anchor it under the tray icon and show it -- UNLESS
+/// a blur-driven hide fired in the last 200ms. That means this very click is
+/// the one that dismissed an already-open panel: on macOS the click first
+/// steals focus from the panel (firing `Focused(false)`, which hides it) and
+/// only then arrives as a tray Click, so without the guard the toggle would
+/// see a hidden window and immediately re-show the panel the user meant to
+/// close. `Instant`/`Duration` are real wall-clock on purpose -- this is UI
+/// input timing, unrelated to the injected-"now" the scan core stays clockless
+/// about.
+fn toggle_panel(app: &tauri::AppHandle, last_blur_hide: &Arc<Mutex<Instant>>) {
+    use tauri_plugin_positioner::{Position, WindowExt};
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.hide();
+        return;
+    }
+    if last_blur_hide.lock().expect("last_blur_hide mutex poisoned").elapsed() < Duration::from_millis(200) {
+        return;
+    }
+    let _ = window.move_window(Position::TrayBottomCenter);
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -246,16 +275,59 @@ pub fn run() {
             .plugin(tauri_plugin_autostart::Builder::new().build());
     }
 
+    // Shared timestamp for the macOS double-toggle guard (see toggle_panel):
+    // the blur handler stamps it the instant it hides the panel, and the tray
+    // toggle reads it to swallow the dismiss-click that would otherwise re-open
+    // the panel the user just closed. Cloned into the window-event handler and
+    // moved into `.setup` for the tray + hotkey toggles.
+    let last_blur_hide = Arc::new(Mutex::new(Instant::now()));
+
+    // Blur-to-dismiss: clicking anywhere outside the panel drops its focus,
+    // which hides it -- the standard menu-bar dropdown behavior. Stamp
+    // last_blur_hide BEFORE hiding so a tray click that triggered this blur is
+    // recognizable as a dismiss rather than a fresh open.
+    let blur_guard = last_blur_hide.clone();
+    builder = builder.on_window_event(move |window, event| {
+        if window.label() == "main" {
+            if let tauri::WindowEvent::Focused(false) = event {
+                *blur_guard.lock().expect("last_blur_hide mutex poisoned") = Instant::now();
+                let _ = window.hide();
+            }
+        }
+    });
+
     builder
-        .setup(|app| {
+        .setup(move |app| {
             // Core tray icon (no plugin — TrayIconBuilder lives in tauri core).
-            use tauri::tray::TrayIconBuilder;
+            use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+            // The tray glyph is a macOS *template* image: pre-decoded raw RGBA
+            // (44x44) compiled straight in. Raw bytes rather than the source
+            // PNG so there is no runtime decode (which would pull the whole
+            // `image` crate in for one icon) and no resource-path lookup that
+            // could fail at launch. Regenerate icons/tray.rgba from tray.png if
+            // the glyph changes. icon_as_template(true) lets macOS recolor it
+            // for light and dark menu bars.
+            const TRAY_ICON_RGBA: &[u8] = include_bytes!("../icons/tray.rgba");
+            let tray_guard = last_blur_hide.clone();
             let _tray = TrayIconBuilder::with_id("skillmon")
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tauri::image::Image::new(TRAY_ICON_RGBA, 44, 44))
+                .icon_as_template(true)
                 .tooltip("skillmon")
-                .on_tray_icon_event(|tray, event| {
+                .on_tray_icon_event(move |tray, event| {
                     // anchor the panel to the tray icon on both OSes
                     tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
+                    // Left-click *release* toggles the panel: matching the
+                    // button-up fires once per click and ignores a press that
+                    // drags off the icon. (MouseButtonState's Up/Down doc
+                    // comments are swapped upstream; Up is the release.)
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        toggle_panel(tray.app_handle(), &tray_guard);
+                    }
                 })
                 .build(app)?;
 
@@ -337,6 +409,22 @@ pub fn run() {
             app.manage(adapter);
             app.manage(watcher);
             app.manage(api_key_settings);
+
+            // Global hotkey: Cmd/Ctrl+Shift+K toggles the panel from anywhere.
+            // A conflict (another app already owns the combo) is non-fatal --
+            // log it and carry on, never crash the tray over a hotkey.
+            #[cfg(desktop)]
+            {
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+                let shortcut_guard = last_blur_hide.clone();
+                if let Err(e) = app.global_shortcut().on_shortcut("CommandOrControl+Shift+K", move |app, _shortcut, event| {
+                    if event.state == ShortcutState::Pressed {
+                        toggle_panel(app, &shortcut_guard);
+                    }
+                }) {
+                    eprintln!("[skillmon] global shortcut CommandOrControl+Shift+K not registered (already taken?): {e}");
+                }
+            }
 
             Ok(())
         })
