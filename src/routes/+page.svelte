@@ -1,11 +1,23 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
+  import {
+    enable as autostartEnable,
+    disable as autostartDisable,
+    isEnabled as autostartIsEnabled,
+  } from "@tauri-apps/plugin-autostart";
   import { onMount } from "svelte";
   import {
+    coResidentAlwaysOn,
+    DEFAULT_SORT,
     estimatedLayerCount,
+    groupByPlugin,
+    groupProjectsByRepo,
     layerDisplay,
+    mainSkills,
     normalizeApiKey,
+    repoBasename,
+    scannedPaths,
     skillKey,
     sortSkills,
     usageDisplay,
@@ -14,6 +26,8 @@
     type ScanReport,
     type SetKeyOutcome,
     type SkillReport,
+    type SortColumn,
+    type SortState,
     type UsageSettings,
   } from "$lib/skills";
 
@@ -47,14 +61,36 @@
   let usageSettings = $state<UsageSettings | null>(null);
   let savingUsage = $state(false);
 
+  // Click-to-sort state (DESIGN.md UX #2). Purely client-side over the last
+  // scan — changing the sort never re-invokes the backend. A shallow copy of the
+  // default so re-sorting is a fresh object each time and Svelte tracks it.
+  let sort = $state<SortState>({ ...DEFAULT_SORT });
+
+  // Group-by-plugin toggle (DESIGN.md UX #2), opt-in. Clusters the main list
+  // under plugin/personal headers; the flat list is the default.
+  let groupByPluginOn = $state(false);
+
+  // Launch-at-login (the autostart plugin), surfaced in the settings pane. The
+  // checkbox mirrors the real OS state, loaded lazily when settings opens.
+  let autostartOn = $state(false);
+  let autostartLoading = $state(false);
+
   const apiKeyPresent = $derived(report?.apiKeyPresent ?? false);
   const trimmedKey = $derived(normalizeApiKey(keyInput));
   const estimatedLayers = $derived(report ? estimatedLayerCount(report) : 0);
 
-  // Rows are shown in the panel's default order: always-on footprint
-  // descending (DESIGN.md UX decision #2). Click-to-sort on other columns is a
-  // later slice, deliberately out of scope for issue #1.
-  const rows = $derived(sortSkills(report?.skills ?? []));
+  const allSkills = $derived(report?.skills ?? []);
+  const activeRepoPath = $derived(report?.activeRepoPath ?? null);
+  // The main list is personal + plugin skills (project skills live in their own
+  // per-repo sections, DESIGN.md UX #5), sorted by the current column/direction.
+  const mainRows = $derived(sortSkills(mainSkills(allSkills), sort));
+  const pluginGroups = $derived(groupByPlugin(allSkills, sort));
+  const repoSections = $derived(groupProjectsByRepo(allSkills, activeRepoPath, sort));
+  // The global always-on total: personal + live plugins + the active repo's
+  // project skills only (DESIGN.md UX #5). `~`-marked when any part is estimated.
+  const alwaysOnTotal = $derived(coResidentAlwaysOn(allSkills, activeRepoPath));
+  const hasSkills = $derived(allSkills.length > 0);
+  const hasMain = $derived(mainRows.length > 0);
 
   async function load() {
     loading = true;
@@ -73,6 +109,21 @@
     if (windowHours === hours) return;
     windowHours = hours;
     await load();
+  }
+
+  // Toggle sort: same column flips direction; a new column starts descending
+  // for numbers (heaviest first) and ascending for the name (A→Z).
+  function onSort(column: SortColumn) {
+    if (sort.column === column) {
+      sort = { column, direction: sort.direction === "asc" ? "desc" : "asc" };
+    } else {
+      sort = { column, direction: column === "name" ? "asc" : "desc" };
+    }
+  }
+
+  function ariaSort(column: SortColumn): "ascending" | "descending" | "none" {
+    if (sort.column !== column) return "none";
+    return sort.direction === "asc" ? "ascending" : "descending";
   }
 
   // Validate + store the key, then rescan so the exact/estimate badges flip.
@@ -135,20 +186,44 @@
     }
   }
 
+  // Reflect the OS autostart state into the checkbox. Non-fatal on failure:
+  // launch-at-login is a convenience, so a read error leaves the toggle off
+  // rather than blocking the settings pane.
+  async function loadAutostart() {
+    try {
+      autostartOn = await autostartIsEnabled();
+    } catch (e) {
+      keyError = String(e);
+    }
+  }
+
+  async function toggleAutostart(next: boolean) {
+    if (autostartLoading) return;
+    autostartLoading = true;
+    keyError = null;
+    try {
+      if (next) await autostartEnable();
+      else await autostartDisable();
+      autostartOn = await autostartIsEnabled();
+    } catch (e) {
+      keyError = String(e);
+      // Re-sync to the real state so the checkbox never lies about what the OS did.
+      await loadAutostart();
+    } finally {
+      autostartLoading = false;
+    }
+  }
+
   function openSettings() {
     setOutcome = null;
     keyError = null;
     view = "settings";
     loadUsageSettings();
+    loadAutostart();
   }
 
   function closeSettings() {
     view = "table";
-  }
-
-  function repoName(path: string): string {
-    const parts = path.replace(/\/+$/, "").split("/");
-    return parts[parts.length - 1] || path;
   }
 
   // Each footprint cell carries a tooltip stating whether the number is exact
@@ -192,15 +267,70 @@
   </div>
 {/snippet}
 
+{#snippet numHeader(column: SortColumn, label: string)}
+  <div class="col num colhead" role="columnheader" aria-sort={ariaSort(column)}>
+    <button class="sort-btn" class:sorted={sort.column === column} onclick={() => onSort(column)}>
+      {#if sort.column === column}<span class="ind">{sort.direction === "desc" ? "▼" : "▲"}</span>{/if}{label}
+    </button>
+  </div>
+{/snippet}
+
+{#snippet tableHeader()}
+  <div class="row header" role="row">
+    <div class="col name colhead" role="columnheader" aria-sort={ariaSort("name")}>
+      <button class="sort-btn" class:sorted={sort.column === "name"} onclick={() => onSort("name")}>
+        Skill{#if sort.column === "name"}<span class="ind">{sort.direction === "desc" ? "▼" : "▲"}</span>{/if}
+      </button>
+    </div>
+    {@render numHeader("alwaysOn", "Always-on")}
+    {@render numHeader("onInvoke", "On-invoke")}
+    {@render numHeader("onDemand", "On-demand")}
+  </div>
+{/snippet}
+
+{#snippet skillRow(skill: SkillReport, inRepoSection = false)}
+  <div class="row" role="row" class:inactive={!skill.live}>
+    <div class="col name" role="cell">
+      <div class="name-line">
+        <span class="skill-name" title={skill.name}>{skill.name}</span>
+        {#if skill.kind === "plugin"}
+          <span class="badge plugin" title="Plugin-locked: remove the whole plugin, not one skill">
+            {skill.plugin ?? "plugin"}
+          </span>
+        {:else if skill.kind === "project" && skill.repoPath && !inRepoSection}
+          <span class="badge project" title={skill.repoPath}>{repoBasename(skill.repoPath)}</span>
+        {/if}
+        {#if !skill.live}
+          <span class="badge inactive-badge" title="Not live in the active context (contributes zero live footprint)">inactive</span>
+        {/if}
+      </div>
+      {#if skill.usage}
+        <div class="usage" title={usageTitle(skill.usage)}>
+          {usageDisplay(skill.usage, report?.usageWindowHours ?? null)}
+        </div>
+      {/if}
+    </div>
+
+    {@render layerCell(skill.alwaysOn, alwaysOnTitle(skill), !skill.alwaysOnNative)}
+    {@render layerCell(skill.onInvoke, layerTitle(skill.onInvoke))}
+    {#if skill.onDemand === null}
+      <div class="col num pending" role="cell" title={onDemandTitle(null)}>…</div>
+    {:else}
+      {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand))}
+    {/if}
+  </div>
+{/snippet}
+
 <main>
   {#if view === "settings"}
     <header class="topbar">
       <button class="icon-btn back" onclick={closeSettings} aria-label="Back to skills" title="Back">‹</button>
-      <h1>API key</h1>
+      <h1>Settings</h1>
       <span class="spacer"></span>
     </header>
 
     <section class="settings">
+      <h2 class="settings-heading">API key</h2>
       {#if apiKeyPresent}
         <p class="set-status">API key set.</p>
         <button class="danger" onclick={removeKey} disabled={saving}>
@@ -247,7 +377,7 @@
         <p class="notice ok">Key saved. Counting exact footprints now.</p>
       {/if}
       {#if keyError}
-        <p class="notice rejected">Couldn't save the key. <code>{keyError}</code></p>
+        <p class="notice rejected">Something went wrong. <code>{keyError}</code></p>
       {/if}
     </section>
 
@@ -281,46 +411,26 @@
         </p>
       </section>
     {/if}
+
+    <section class="settings startup-settings">
+      <h2 class="settings-heading">Startup</h2>
+      <label class="check">
+        <input
+          type="checkbox"
+          checked={autostartOn}
+          disabled={autostartLoading}
+          onchange={(e) => toggleAutostart(e.currentTarget.checked)}
+        />
+        <span>Launch skillmon at login</span>
+      </label>
+      <p class="hint why">
+        Toggle the panel from anywhere with <kbd>⌘⇧K</kbd>.
+      </p>
+    </section>
   {:else}
     <header class="topbar">
       <h1>Skills</h1>
       <div class="topbar-right">
-        {#if report?.activeRepoPath}
-          <span class="active-repo" title={report.activeRepoPath}>
-            active repo: {repoName(report.activeRepoPath)}
-          </span>
-        {/if}
-        <div class="window-toggle" role="group" aria-label="Usage window">
-          <button
-            class="seg"
-            class:active={windowHours === null}
-            onclick={() => setWindow(null)}
-            disabled={loading}
-            title="Show all-time attributed usage"
-          >All-time</button>
-          <button
-            class="seg"
-            class:active={windowHours === 24}
-            onclick={() => setWindow(24)}
-            disabled={loading}
-            title="Show attributed usage from the last 24 hours"
-          >Last 24h</button>
-        </div>
-        <label
-          class="subagents-toggle"
-          title="Include sub-agent usage. Only sub-agents that themselves invoked a skill are credited; the rest are dropped."
-        >
-          <input
-            type="checkbox"
-            checked={includeSubagents}
-            disabled={loading}
-            onchange={(e) => {
-              includeSubagents = e.currentTarget.checked;
-              load();
-            }}
-          />
-          Sub-agents
-        </label>
         <button class="rescan" onclick={load} disabled={loading} title="Rescan now">
           {loading ? "Scanning…" : "Rescan"}
         </button>
@@ -332,6 +442,48 @@
         </button>
       </div>
     </header>
+
+    <div class="controls">
+      <div class="window-toggle" role="group" aria-label="Usage window">
+        <button
+          class="seg"
+          class:active={windowHours === null}
+          onclick={() => setWindow(null)}
+          disabled={loading}
+          title="Show all-time attributed usage"
+        >All-time</button>
+        <button
+          class="seg"
+          class:active={windowHours === 24}
+          onclick={() => setWindow(24)}
+          disabled={loading}
+          title="Show attributed usage from the last 24 hours"
+        >Last 24h</button>
+      </div>
+      <label
+        class="inline-toggle"
+        title="Include sub-agent usage. Only sub-agents that themselves invoked a skill are credited; the rest are dropped."
+      >
+        <input
+          type="checkbox"
+          checked={includeSubagents}
+          disabled={loading}
+          onchange={(e) => {
+            includeSubagents = e.currentTarget.checked;
+            load();
+          }}
+        />
+        Sub-agents
+      </label>
+      <label class="inline-toggle" title="Group skills under their plugin; personal skills grouped together">
+        <input type="checkbox" bind:checked={groupByPluginOn} />
+        Group by plugin
+      </label>
+      <span class="controls-spacer"></span>
+      {#if activeRepoPath}
+        <span class="active-repo" title={activeRepoPath}>active: {repoBasename(activeRepoPath)}</span>
+      {/if}
+    </div>
 
     {#if report?.warnings?.length}
       <ul class="warnings">
@@ -360,57 +512,61 @@
       </div>
     {:else if loading && !report}
       <div class="state muted">Scanning skills…</div>
-    {:else if rows.length === 0}
+    {:else if !hasSkills}
       <div class="state muted empty">
-        <p>No skills found.</p>
+        <p>No skills found. skillmon scanned:</p>
+        <ul class="scanned-paths">
+          {#each scannedPaths(activeRepoPath) as path (path)}
+            <li><code>{path}</code></li>
+          {/each}
+        </ul>
         <button onclick={load}>Rescan</button>
       </div>
     {:else}
-      <div class="table" role="table" aria-label="Installed skills">
-        <div class="row header" role="row">
-          <div class="col name" role="columnheader">Skill</div>
-          <div class="col num sorted" role="columnheader" aria-sort="descending">
-            <span class="ind">▼</span> Always-on
-          </div>
-          <div class="col num" role="columnheader">On-invoke</div>
-          <div class="col num" role="columnheader">On-demand</div>
+      {#if hasMain}
+        <div class="table" role="table" aria-label="Installed skills">
+          {@render tableHeader()}
+          {#if groupByPluginOn}
+            {#each pluginGroups as group (group.key)}
+              <div class="group-label" role="row"><span role="cell">{group.label}</span></div>
+              {#each group.skills as skill (skillKey(skill))}
+                {@render skillRow(skill)}
+              {/each}
+            {/each}
+          {:else}
+            {#each mainRows as skill (skillKey(skill))}
+              {@render skillRow(skill)}
+            {/each}
+          {/if}
         </div>
+      {/if}
 
-        {#each rows as skill (skillKey(skill))}
-          <div class="row" role="row" class:inactive={!skill.live}>
-            <div class="col name" role="cell">
-              <div class="name-line">
-                <span class="skill-name" title={skill.name}>{skill.name}</span>
-                {#if skill.kind === "plugin"}
-                  <span class="badge plugin" title="Plugin-locked: remove the whole plugin, not one skill">
-                    {skill.plugin ?? "plugin"}
-                  </span>
-                {:else if skill.kind === "project" && skill.repoPath}
-                  <span class="badge project" title={skill.repoPath}>{repoName(skill.repoPath)}</span>
-                {/if}
-                {#if !skill.live}
-                  <span class="badge inactive-badge" title="Not live in the active context (contributes zero live footprint)">inactive</span>
-                {/if}
+      {#if repoSections.length}
+        <section class="repo-sections" aria-label="Project skills by repo">
+          {#each repoSections as repo (repo.repoPath)}
+            <details class="repo-section" open={repo.isActive}>
+              <summary>
+                <span class="repo-summary-name" title={repo.repoPath}>{repo.repoName}</span>
+                <span class="repo-count">{repo.skills.length} {repo.skills.length === 1 ? "skill" : "skills"}</span>
+                {#if repo.isActive}<span class="badge project">active</span>{/if}
+              </summary>
+              <div class="table" role="table" aria-label={`Project skills in ${repo.repoName}`}>
+                {#each repo.skills as skill (skillKey(skill))}
+                  {@render skillRow(skill, true)}
+                {/each}
               </div>
-              {#if skill.usage}
-                <div class="usage" title={usageTitle(skill.usage)}>
-                  {usageDisplay(skill.usage, report?.usageWindowHours ?? null)}
-                </div>
-              {/if}
-            </div>
-
-            {@render layerCell(skill.alwaysOn, alwaysOnTitle(skill), !skill.alwaysOnNative)}
-            {@render layerCell(skill.onInvoke, layerTitle(skill.onInvoke))}
-            {#if skill.onDemand === null}
-              <div class="col num pending" role="cell" title={onDemandTitle(null)}>…</div>
-            {:else}
-              {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand))}
-            {/if}
-          </div>
-        {/each}
-      </div>
+            </details>
+          {/each}
+        </section>
+      {/if}
 
       <footer class="legend">
+        <span
+          class="total"
+          title="Always-on tokens co-resident now: personal + live plugins + the active repo's project skills (DESIGN #5). Other repos are shown but not summed."
+        >
+          Always-on now: <strong>{layerDisplay(alwaysOnTotal)}</strong>
+        </span>
         {#if apiKeyPresent}
           <span><span class="swatch estimate">~</span> calibrated estimate</span>
         {:else}
@@ -470,10 +626,24 @@
     gap: 8px;
   }
 
+  /* Controls bar under the title — the toggles wrap here so the narrow panel
+     never overflows its topbar. */
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .controls-spacer {
+    flex: 1 1 auto;
+  }
+
   .active-repo {
     color: var(--muted);
     font-size: 11px;
-    max-width: 140px;
+    max-width: 150px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -504,10 +674,9 @@
     color: #fff;
   }
 
-  /* Sub-agent usage scope toggle (issue #13): a demoted, muted control that
-     sits alongside Rescan, matching the demoted framing of the usage metric
-     it widens. */
-  .subagents-toggle {
+  /* Demoted, muted inline checkbox controls (sub-agents scope, group-by-plugin):
+     they sit in the controls bar, matching the demoted framing of what they change. */
+  .inline-toggle {
     display: inline-flex;
     align-items: center;
     gap: 4px;
@@ -516,7 +685,7 @@
     white-space: nowrap;
     cursor: pointer;
   }
-  .subagents-toggle input {
+  .inline-toggle input {
     margin: 0;
     cursor: pointer;
   }
@@ -573,6 +742,23 @@
     margin-top: 8px;
   }
 
+  /* Empty-state: the exact paths a scan looked at (DESIGN.md UX #7). */
+  .scanned-paths {
+    list-style: none;
+    margin: 8px auto;
+    padding: 0;
+    display: inline-block;
+    text-align: left;
+  }
+  .scanned-paths li {
+    font-size: 11px;
+    margin: 2px 0;
+  }
+  .scanned-paths code {
+    color: var(--muted);
+    word-break: break-all;
+  }
+
   .table {
     display: flex;
     flex-direction: column;
@@ -595,12 +781,24 @@
     color: var(--muted);
     font-size: 11px;
     font-weight: 600;
+    z-index: 1;
   }
   .row:not(.header):hover {
     background: rgba(57, 108, 216, 0.06);
   }
   .row.inactive {
     opacity: 0.55;
+  }
+
+  /* A plugin/personal cluster label in the grouped view (DESIGN.md UX #2). */
+  .group-label {
+    padding: 8px 12px 3px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    border-bottom: 1px solid var(--line);
   }
 
   .col {
@@ -626,6 +824,10 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-weight: 500;
+    /* Never let a row's badges squeeze the name to nothing on the narrow panel:
+       the name keeps a legible floor and the badges shrink/ellipsize first. */
+    flex: 0 1 auto;
+    min-width: 2.75rem;
   }
   /* Attributed usage: a demoted proxy below the name, never a headline column
      and never blended with the exact footprint (ADR 0003). */
@@ -643,7 +845,34 @@
     font-feature-settings: "tnum";
     white-space: nowrap;
   }
-  .row.header .col.sorted {
+
+  /* Sortable column headers: the whole header cell is a button (DESIGN.md UX #2). */
+  .colhead {
+    padding: 0;
+  }
+  .sort-btn {
+    border: none;
+    background: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+    width: 100%;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .col.name .sort-btn {
+    justify-content: flex-start;
+  }
+  .col.num .sort-btn {
+    justify-content: flex-end;
+  }
+  .sort-btn:hover:not(:disabled) {
+    color: var(--accent);
+  }
+  .sort-btn.sorted {
     color: var(--fg);
   }
   .ind {
@@ -652,7 +881,10 @@
   }
 
   .badge {
-    flex: none;
+    /* Shrinkable (not flex:none) so a badge ellipsizes before it can starve the
+       skill name of width; a small floor keeps it from vanishing entirely. */
+    flex: 0 1 auto;
+    min-width: 1.75rem;
     font-size: 10px;
     padding: 1px 6px;
     border-radius: 999px;
@@ -691,13 +923,64 @@
     text-underline-offset: 3px;
   }
 
+  /* Per-repo collapsed project sections (DESIGN.md UX #5). */
+  .repo-sections {
+    display: flex;
+    flex-direction: column;
+  }
+  .repo-section {
+    border-bottom: 1px solid var(--line);
+  }
+  .repo-section > summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--muted);
+    list-style: none;
+    user-select: none;
+  }
+  .repo-section > summary::-webkit-details-marker {
+    display: none;
+  }
+  .repo-section > summary::before {
+    content: "▸";
+    font-size: 9px;
+    color: var(--faint);
+  }
+  .repo-section[open] > summary::before {
+    content: "▾";
+  }
+  .repo-summary-name {
+    font-weight: 600;
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .repo-count {
+    color: var(--faint);
+    flex: none;
+  }
+
   .legend {
     display: flex;
     flex-wrap: wrap;
     gap: 12px;
+    align-items: baseline;
     padding: 8px 12px 10px;
     color: var(--faint);
     font-size: 10px;
+  }
+  .total {
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .total strong {
+    color: var(--fg);
+    font-variant-numeric: tabular-nums;
   }
   .swatch.estimate {
     color: var(--estimate-fg);
@@ -774,7 +1057,8 @@
     color: #b3261e;
     border-color: #b3261e;
   }
-  .usage-settings {
+  .usage-settings,
+  .startup-settings {
     border-top: 1px solid var(--line);
     padding-top: 12px;
   }
@@ -801,6 +1085,14 @@
      input`; it only needs its own width. */
   .usage-settings input[type="number"] {
     max-width: 160px;
+  }
+  kbd {
+    font-family: inherit;
+    font-size: 11px;
+    background: var(--badge-bg);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 0 4px;
   }
   .set-status {
     font-weight: 500;
