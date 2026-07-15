@@ -711,10 +711,10 @@ mod tests {
                 declared_name: "x".to_string(),
                 description: "d".to_string(),
                 raw_block: String::new(),
+                model_invocable: true,
             },
             body: String::new(),
-            is_symlink: false,
-            symlink_target: None,
+            manager_root: None,
             on_demand_files: vec![],
             live: true,
         }

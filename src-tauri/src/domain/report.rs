@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::footprint::{Footprint, TextConfidence, TokenSource};
+use super::footprint::{AlwaysOnTextKind, Footprint, TokenSource};
 use super::skill::{DiscoveredSkill, SkillId};
 
 /// One footprint layer, flattened for the IPC boundary. `exact` collapses
@@ -74,10 +74,11 @@ pub struct SkillReport {
     pub name: String,
     pub live: bool,
     pub always_on: LayerReport,
-    /// `true` when always-on text came from a real transcript, `false` when
-    /// reconstructed from frontmatter because no session has listed the
-    /// skill yet (ADR 0016). Only the always-on layer carries this.
-    pub always_on_native: bool,
+    /// Where the always-on text came from (ADR 0016). Only the always-on layer
+    /// carries this. `notListed` means the skill is kept out of the listing by
+    /// `disable-model-invocation`, so `always_on.tokens` is a certain zero
+    /// rather than a low-confidence guess (issue #24).
+    pub always_on_text: AlwaysOnTextKind,
     pub on_invoke: LayerReport,
     /// `None` (a JSON `null`) means the on-demand ceiling is still being
     /// computed off the interactive scan (issue #11); the panel renders a
@@ -113,7 +114,7 @@ impl SkillReport {
             name: skill.directory_name().to_string(),
             live: skill.live,
             always_on: footprint.always_on.count.into(),
-            always_on_native: footprint.always_on.confidence == TextConfidence::Native,
+            always_on_text: footprint.always_on.text_kind,
             on_invoke: footprint.on_invoke.into(),
             on_demand: footprint.on_demand.map(Into::into),
             usage,
@@ -176,10 +177,10 @@ mod tests {
                 declared_name: "x".to_string(),
                 description: "d".to_string(),
                 raw_block: "name: x\ndescription: d".to_string(),
+                model_invocable: true,
             },
             body: "body".to_string(),
-            is_symlink: false,
-            symlink_target: None,
+            manager_root: None,
             on_demand_files: vec![],
             live: true,
         }
@@ -189,7 +190,7 @@ mod tests {
         Footprint {
             always_on: AlwaysOnFootprint {
                 count: LayerCount { tokens: 10, source: TokenSource::Exact },
-                confidence: TextConfidence::Native,
+                text_kind: AlwaysOnTextKind::Native,
             },
             on_invoke: LayerCount { tokens: 200, source: TokenSource::Estimate },
             on_demand: Some(LayerCount { tokens: 0, source: TokenSource::Exact }),
@@ -204,7 +205,7 @@ mod tests {
         assert_eq!(report.kind, SkillKind::Personal);
         assert_eq!(report.name, "grilling");
         assert!(report.always_on.exact);
-        assert!(report.always_on_native);
+        assert_eq!(report.always_on_text, AlwaysOnTextKind::Native);
         assert!(!report.on_invoke.exact);
         assert_eq!(report.repo_path, None);
         assert_eq!(report.marketplace, None);
@@ -281,7 +282,7 @@ mod tests {
         let footprint = Footprint {
             always_on: AlwaysOnFootprint {
                 count: LayerCount { tokens: 10, source: TokenSource::Estimate },
-                confidence: TextConfidence::Native,
+                text_kind: AlwaysOnTextKind::Native,
             },
             on_invoke: LayerCount { tokens: 20, source: TokenSource::Estimate },
             on_demand: None,

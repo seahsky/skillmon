@@ -42,6 +42,52 @@ _Avoid_: current repo, cwd
 A skill shipped inside a plugin, removable only by removing the whole plugin.
 _Avoid_: bundled skill
 
+**Manager root**:
+The directory that owns a skill's real content, when that content does not live in the skill's own entry under the scan root (ADR 0026).
+_Avoid_: source, owner, provider, origin (upstream provenance is deliberately not modeled)
+
+**Managed skill**:
+A skill whose content resolves out to a manager root.
+Its managing tool, not the user, decides whether it exists, so removing it from the scan root lasts only until that tool next runs.
+_Avoid_: linked skill, external skill, symlinked skill
+
+**Unmanaged skill**:
+A skill whose content genuinely lives in its own entry under the scan root.
+The only kind whose removal is durable, and only when nothing depends on it.
+_Avoid_: custom skill, own skill, hand-installed skill
+
+**Managing tool**:
+The external program that owns a manager root and rebuilds the entries under it.
+Never itself discovered; skillmon models it by one property only — whether it can make a source removal stick (ADR 0027).
+_Avoid_: manager (a tool is not a skill), package manager, installer
+
+**Dependent skill**:
+A skill whose manager root lies at or under *another discovered skill's* directory, so removing that skill breaks this one.
+The relation that makes "unmanaged" insufficient on its own: a skill can be unmanaged and still be the one thing other skills resolve into, making it at once the safest and the most destructive entry to remove.
+A manager root need not belong to a skill at all — one can own entries without ever being a row.
+_Avoid_: child skill, sub-skill
+
+**Entry**:
+What a skill occupies in the scan root — its own real directory, a symlink to a directory elsewhere, or a real directory whose `SKILL.md` is a symlink.
+The unit skillmon removes, and always removed *as* the entry: skillmon never resolves through one (ADR 0027).
+_Avoid_: link, folder, row (a row is UI)
+
+**Entry removal**:
+Removing a skill's entry from the scan root, leaving any manager root's content untouched.
+Un-discovers the skill and reclaims its always-on footprint; durable only until the managing tool next runs.
+_Avoid_: unlink, detach
+
+**Source removal**:
+Removing the content a managed skill's entry resolves to, together with whatever bookkeeping its managing tool keeps.
+Offered only where that tool can make it stick.
+_Avoid_: deep delete, purge (reserved for the trash's second phase)
+
+**Tool uninstall**:
+Removing an entry other skills depend on, cascading to every dependent as one reversible unit.
+A different act from skill removal rather than a variant of it, because the entry of a skill that is also a manager root *is* the managing tool: there is no way to remove that row alone.
+Its dependent count is a floor, never a total — a managing tool may own entries for other agents, which skillmon does not scan.
+_Avoid_: cascade delete, bulk delete
+
 **Plugin**:
 A distributable bundle of skills (and optionally commands, agents, MCP servers) installed from a marketplace.
 _Avoid_: extension, package, add-on
@@ -85,12 +131,22 @@ _Avoid_: skill body, body cost
 Bundled reference files that load only if the body tells the agent to read them; reported as a ceiling, never in the headline. Measured as raw file bytes, not whatever tool-specific wrapper the agent happens to read them through (e.g. Read's line-numbered output) — which wrapper applies is a runtime choice, not a fact about the skill, so the ceiling deliberately doesn't chase it.
 
 **Token source**:
-Whether a layer's count is `Exact` (a live `count_tokens` call, cache-hit or fresh) or `Estimate` (calibrated `tiktoken`, used whenever no API key is present or a `count_tokens` call fails — the two collapse to the same fallback path, since either way exact wasn't available). Orthogonal to text confidence, which only the always-on layer carries.
-_Avoid_: exactness, confidence (reserved for text confidence below)
+Whether a layer's count is `Exact` or `Estimate` (calibrated `tiktoken`, used whenever no API key is present or a `count_tokens` call fails — the two collapse to the same fallback path, since either way exact wasn't available).
+`Exact` means the count is not an estimate, which is ordinarily earned by a `count_tokens` call, cache-hit or fresh, and in exactly one case is free: a not-listed skill's always-on zero, where there is no text to send or estimate.
+Orthogonal to always-on text kind, which only the always-on layer carries.
+_Avoid_: exactness, confidence
 
-**Text confidence**:
-Only meaningful for the always-on layer: `Native` (the literal transcript-rendered line, ADR 0016) or `Reconstructed` (built from raw frontmatter because no transcript has ever included the skill yet). Independent of token source — a reconstructed line can still be counted exactly.
-_Avoid_: accuracy
+**Always-on text kind**:
+Which listing line a skill has, and so what its always-on layer measures: `Native` (the literal transcript-rendered line, ADR 0016), `Reconstructed` (built from raw frontmatter because no transcript has ever included the skill yet), or `NotListed`.
+Independent of token source — a reconstructed line can still be counted exactly.
+Deliberately not a *confidence*: the first two are degrees of belief about a line that exists, while the third is the absence of one.
+_Avoid_: text confidence, accuracy
+
+**Not listed**:
+A skill declaring `disable-model-invocation: true`, which Claude Code keeps out of the model-facing listing entirely: it stays invokable as a slash command but costs zero always-on tokens.
+A measured absence rather than a low-confidence guess, so it is never rendered like `Reconstructed`.
+The declaration describes what the harness does now, so it outranks a bullet left behind in a transcript written before the flag was added.
+_Avoid_: disabled (that is quarantine), hidden
 
 **Token cache**:
 The content-addressed store keyed by `sha256(canonical content)` alone (ADR 0006). One row per hash holds the always-computed `tiktoken` count plus, once available, the exact `count_tokens` value and the reference model it was measured against. A skill's per-layer footprint is a lookup of that layer's current text hash, not a row keyed by skill or layer — identical content (e.g. two skills sharing a reference file) shares one row for free, and an edit's new hash is simply a fresh cache miss with no explicit invalidation step.

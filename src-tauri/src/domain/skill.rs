@@ -19,6 +19,11 @@ pub struct Frontmatter {
     pub declared_name: String,
     pub description: String,
     pub raw_block: String,
+    /// `false` when the skill declares `disable-model-invocation: true`, which
+    /// keeps Claude Code from listing it to the model at all -- it stays
+    /// slash-invokable, but costs no always-on tokens (issue #24). Defaults to
+    /// `true`: absence of the key means an ordinary, listed skill.
+    pub model_invocable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -31,12 +36,15 @@ pub struct DiscoveredSkill {
     pub skill_md_path: PathBuf,
     pub frontmatter: Frontmatter,
     pub body: String,
-    /// Populated by discovery; consumed by symlink-aware disable/uninstall
-    /// (ADR 0007) and a UI "managed elsewhere" badge in a later plan.
+    /// The directory owning this skill's real content when that content does
+    /// not live in the skill's own entry under the scan root; `None` means
+    /// unmanaged (ADR 0026). Derived structurally, from where `SKILL.md`
+    /// actually resolves -- which covers both shapes a managed skill takes: a
+    /// symlinked directory, and a real directory holding a symlinked
+    /// `SKILL.md`. Read by the source column (issue #30) and by removal, which
+    /// must know whether deleting an entry is durable (issue #31, ADR 0027).
     #[allow(dead_code)]
-    pub is_symlink: bool,
-    #[allow(dead_code)]
-    pub symlink_target: Option<PathBuf>,
+    pub manager_root: Option<PathBuf>,
     pub on_demand_files: Vec<PathBuf>,
     pub live: bool,
 }
@@ -88,10 +96,10 @@ mod tests {
                 declared_name: declared_name.to_string(),
                 description: "does things".to_string(),
                 raw_block: format!("name: {declared_name}\ndescription: does things"),
+                model_invocable: true,
             },
             body: "body text".to_string(),
-            is_symlink: false,
-            symlink_target: None,
+            manager_root: None,
             on_demand_files: vec![],
             live: true,
         }

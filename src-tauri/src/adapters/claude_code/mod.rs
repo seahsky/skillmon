@@ -13,7 +13,7 @@ use crate::domain::budget::{
     detect_anomaly, evaluate_budget, BudgetConfig, ToastRequest, ANOMALY_WINDOW_DAYS, DEFAULT_ANOMALY_FLOOR,
     DEFAULT_ANOMALY_MULTIPLIER, DEFAULT_BUDGET_WORK_TOKENS,
 };
-use crate::domain::footprint::{AlwaysOnFootprint, Footprint, LayerCount, TokenSource};
+use crate::domain::footprint::{AlwaysOnFootprint, Footprint, LayerCount, AlwaysOnTextKind, TokenSource};
 use crate::domain::harness::HarnessAdapter;
 use crate::domain::report::{ScanReport, SkillReport, UsageSettings};
 use crate::domain::scan::{ScanOutcome, ScanParams, UsageWindow, DAY_MILLIS, HOUR_MILLIS};
@@ -214,10 +214,18 @@ impl ClaudeCodeAdapter {
         always_on: AlwaysOnText,
         on_demand: Option<LayerCount>,
     ) -> Footprint {
-        let always_on_count = self.count(&always_on.text);
+        // A never-listed skill (issue #24) is a known zero, so it is built
+        // rather than counted: `count` would hash and, with a key configured,
+        // send empty text to `count_tokens`. The zero is Exact because it is
+        // certain -- it is the one count that needs no measuring.
+        let always_on_count = if always_on.kind == AlwaysOnTextKind::NotListed {
+            LayerCount { tokens: 0, source: TokenSource::Exact }
+        } else {
+            self.count(&always_on.text)
+        };
         let on_invoke_count = self.count(&footprint_text::on_invoke_text(skill));
         Footprint {
-            always_on: AlwaysOnFootprint { count: always_on_count, confidence: always_on.confidence },
+            always_on: AlwaysOnFootprint { count: always_on_count, text_kind: always_on.kind },
             on_invoke: on_invoke_count,
             on_demand,
         }
@@ -859,7 +867,7 @@ mod tests {
 
     #[test]
     fn compute_footprint_assembles_all_three_layers_end_to_end() {
-        use crate::domain::footprint::TextConfidence;
+        use crate::domain::footprint::AlwaysOnTextKind;
         use crate::footprint::tokenizer::estimate_tokens;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -898,7 +906,7 @@ mod tests {
 
         let footprint = adapter.compute_footprint(skill);
 
-        assert_eq!(footprint.always_on.confidence, TextConfidence::Native);
+        assert_eq!(footprint.always_on.text_kind, AlwaysOnTextKind::Native);
         assert_eq!(footprint.always_on.count.source, TokenSource::Estimate);
         assert_eq!(footprint.always_on.count.tokens, estimate_tokens("- grilling: Interview the user relentlessly."));
 
@@ -939,7 +947,7 @@ mod tests {
 
     #[test]
     fn batched_scan_all_resolves_native_always_on_like_the_per_skill_path() {
-        use crate::domain::footprint::TextConfidence;
+        use crate::domain::footprint::AlwaysOnTextKind;
 
         let tmp = tempfile::tempdir().unwrap();
         let claude_home = tmp.path().join(".claude");
@@ -971,13 +979,17 @@ mod tests {
         let report = adapter.scan_all(false);
 
         let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
-        assert!(grilling.always_on_native, "batched scan should source always-on from the transcript (Native)");
+        assert_eq!(
+            grilling.always_on_text,
+            AlwaysOnTextKind::Native,
+            "batched scan should source always-on from the transcript (Native)"
+        );
 
         // And it agrees with the single-skill path's confidence + tokens.
         let discovery = adapter.discover_skills();
         let skill = discovery.skills.iter().find(|s| s.directory_name() == "grilling").unwrap();
         let per_skill = adapter.compute_footprint(skill);
-        assert_eq!(per_skill.always_on.confidence, TextConfidence::Native);
+        assert_eq!(per_skill.always_on.text_kind, AlwaysOnTextKind::Native);
         assert_eq!(grilling.always_on.tokens, per_skill.always_on.count.tokens);
     }
 
@@ -1084,8 +1096,9 @@ mod tests {
         let report = adapter.scan_all(true);
 
         let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
-        assert!(
-            !grilling.always_on_native,
+        assert_eq!(
+            grilling.always_on_text,
+            AlwaysOnTextKind::Reconstructed,
             "a sub-agent skill_listing must not feed the listing index; always-on stays reconstructed"
         );
     }
@@ -1320,6 +1333,81 @@ mod tests {
         }
     }
 
+    /// Reports how this machine's real `~/.claude` breaks down by always-on
+    /// text kind (issue #24) and manager root (issue #25) -- the CLAUDE.md
+    /// verification bar for both, which unit tests over tempdirs cannot meet.
+    /// The populations are printed rather than asserted, being one developer's
+    /// disk rather than an invariant; what *is* asserted is the per-skill
+    /// invariant #24 turns on, which holds on any machine. Run by hand:
+    /// `cargo test --manifest-path src-tauri/Cargo.toml
+    /// adapters::claude_code::tests::real_claude_home_skill_provenance -- --ignored --exact --nocapture`
+    #[test]
+    #[ignore]
+    fn real_claude_home_skill_provenance() {
+        use std::collections::BTreeMap;
+
+        let claude_home = crate::adapters::claude_code::paths::default_claude_home();
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        let discovery = adapter.discover_skills();
+
+        let mut by_root: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for skill in &discovery.skills {
+            let root = match &skill.manager_root {
+                Some(root) => root.display().to_string(),
+                None => "<unmanaged>".to_string(),
+            };
+            by_root.entry(root).or_default().push(skill.directory_name());
+        }
+        eprintln!("\n=== manager roots (issue #25) ===");
+        for (root, mut names) in by_root {
+            names.sort_unstable();
+            eprintln!("  {:>3}  {}", names.len(), root);
+            eprintln!("       e.g. {}", names.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
+        }
+
+        let never_listed: Vec<&str> = discovery
+            .skills
+            .iter()
+            .filter(|s| !s.frontmatter.model_invocable)
+            .map(|s| s.directory_name())
+            .collect();
+        eprintln!("\n=== never listed, so always-on is zero (issue #24) ===");
+        eprintln!("  {} of {} skills: {:?}", never_listed.len(), discovery.skills.len(), never_listed);
+
+        // The bug itself: these used to be billed a reconstructed bullet. The
+        // populations above are one machine's facts, but this is an invariant
+        // that holds on any -- vacuously, on a machine with no such skill.
+        eprintln!("\n=== their real footprints ===");
+        for skill in discovery.skills.iter().filter(|s| !s.frontmatter.model_invocable) {
+            let footprint = adapter.compute_footprint(skill);
+            eprintln!(
+                "  {:<28} always_on={} tokens (exact={}, {:?})  on_invoke={}",
+                skill.directory_name(),
+                footprint.always_on.count.tokens,
+                footprint.always_on.count.source == TokenSource::Exact,
+                footprint.always_on.text_kind,
+                footprint.on_invoke.tokens,
+            );
+            assert_eq!(
+                footprint.always_on.text_kind,
+                AlwaysOnTextKind::NotListed,
+                "{} declares disable-model-invocation, so it has no listing line",
+                skill.directory_name()
+            );
+            assert_eq!(footprint.always_on.count.tokens, 0, "a never-listed skill costs no always-on");
+            assert_eq!(
+                footprint.always_on.count.source,
+                TokenSource::Exact,
+                "the zero is certain, so it must not be marked an estimate"
+            );
+            assert!(
+                footprint.on_invoke.tokens > 0,
+                "it is still slash-invokable, so on-invoke is untouched"
+            );
+        }
+        eprintln!();
+    }
+
     /// Exercises the real production adapter (real keychain store, real HTTP
     /// client, real `default_claude_home()`) against this machine's actual
     /// `~/.claude` -- the CLAUDE.md verification bar for this flow. Not run by
@@ -1396,12 +1484,12 @@ mod tests {
 
         for skill in resolved.skills.iter().take(10) {
             eprintln!(
-                "  [{:?}] {:<28} always_on={:>4} (exact={}, native={})  on_invoke={:>5}  on_demand={:?}  usage={:?}",
+                "  [{:?}] {:<28} always_on={:>4} (exact={}, text={:?})  on_invoke={:>5}  on_demand={:?}  usage={:?}",
                 skill.kind,
                 skill.name,
                 skill.always_on.tokens,
                 skill.always_on.exact,
-                skill.always_on_native,
+                skill.always_on_text,
                 skill.on_invoke.tokens,
                 skill.on_demand.map(|l| l.tokens),
                 skill.usage.map(|u| u.work),

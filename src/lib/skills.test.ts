@@ -26,7 +26,7 @@ function makeSkill(overrides: Partial<SkillReport> & { name: string }): SkillRep
     kind: "personal",
     live: true,
     alwaysOn: { tokens: 0, exact: true },
-    alwaysOnNative: true,
+    alwaysOnText: "native",
     onInvoke: { tokens: 0, exact: true },
     onDemand: { tokens: 0, exact: true },
     usage: null,
@@ -392,6 +392,22 @@ describe("coResidentAlwaysOn", () => {
 
     // 100 + 200 + 30; the disabled plugin and the other repo are excluded.
     expect(coResidentAlwaysOn(skills, "/repo/active")).toEqual({ tokens: 330, exact: true });
+  });
+
+  it("a never-listed skill adds nothing, and does not drag the total to an estimate (issue #24)", () => {
+    const skills = [
+      makeSkill({ name: "listed", alwaysOn: { tokens: 100, exact: true } }),
+      makeSkill({
+        name: "grill-with-docs",
+        alwaysOnText: "notListed",
+        // Deliberately NOT the { tokens: 0, exact: true } the backend really
+        // sends: the total must exclude a never-listed skill because it is not
+        // in the listing, not because its numbers happen to be harmless.
+        alwaysOn: { tokens: 999, exact: false },
+      }),
+    ];
+
+    expect(coResidentAlwaysOn(skills, null)).toEqual({ tokens: 100, exact: true });
   });
 
   it("marks the total as an estimate if any contributing layer is an estimate (never blends tiers)", () => {
