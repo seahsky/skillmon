@@ -1,5 +1,6 @@
 use crate::adapters::claude_code::frontmatter::parse_skill_md;
 use crate::domain::skill::{DiscoveredSkill, DiscoveryWarning, SkillId};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -126,25 +127,74 @@ fn resolve_manager_root(canonical_root: &Path, name: &str, skill_md_path: &Path)
     Some(resolved_dir.parent()?.to_path_buf())
 }
 
+/// Directory names whose contents are never bundled references. A skill
+/// directory that is also a project checkout carries a VCS object store and a
+/// dependency tree, and no `SKILL.md` body tells the agent to read either
+/// (ADR 0028). A slice, not a fixed-size array: this list is expected to grow.
+const NON_REFERENCE_DIR_NAMES: &[&str] = &[".git", "node_modules"];
+
 fn list_on_demand_files(dir_path: &Path, skip: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    collect_files_recursive(dir_path, skip, &mut files);
+    let mut visited = HashSet::new();
+    collect_files_recursive(dir_path, skip, &mut visited, &mut files);
     files
 }
 
-fn collect_files_recursive(dir: &Path, skip: &Path, out: &mut Vec<PathBuf>) {
+/// `visited` holds canonical directory paths, so a symlink pointing back at an
+/// ancestor terminates the walk instead of recursing until the stack overflows,
+/// and a directory reachable through two links is counted once rather than
+/// twice. Canonicalizing per directory is the guard's whole cost, and it is
+/// noise next to reading every file the walk yields.
+fn collect_files_recursive(dir: &Path, skip: &Path, visited: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
+    // Bailing on a canonicalize failure is part of the guard, not just error
+    // handling: resolving a symlink loop is exactly what fails here (ELOOP).
+    let Ok(real_dir) = fs::canonicalize(dir) else { return };
+    if !visited.insert(real_dir) {
+        return;
+    }
+
     let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    // Sorted so `visited`'s alias tie-break is deterministic rather than left
+    // to `read_dir` order: where a link and a real path reach the same content,
+    // whichever is walked first wins and the other is skipped, which decides
+    // the path recorded (and so the memo's signature). Real directories sort
+    // before symlinked ones, making the real path the winner and the honest one
+    // to record. Walk order alone is otherwise invisible -- `on_demand_signature`
+    // sorts its tuples before hashing.
+    let mut children: Vec<(bool, PathBuf)> = entries
+        .flatten()
+        .map(|entry| {
+            let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
+            (is_symlink, entry.path())
+        })
+        .collect();
+    children.sort();
+
+    for (_, path) in children {
         if path == skip {
             continue;
         }
         if path.is_dir() {
-            collect_files_recursive(&path, skip, out);
+            if is_reference_dir(&path) {
+                collect_files_recursive(&path, skip, visited, out);
+            }
         } else if path.is_file() {
             out.push(path);
         }
     }
+}
+
+/// Whether a nested directory's contents can enter context through *this*
+/// skill. A nested `SKILL.md` marks the subtree as another skill's: that
+/// content reaches context (if at all) as that skill's own layers, loaded by
+/// the skill mechanism, never because this skill's body said to read it
+/// (ADR 0028). Testing `SKILL.md` through `is_file()` sees a shim -- a real
+/// directory whose `SKILL.md` is a symlink -- as readily as a plain skill dir,
+/// which is what matters in practice: the shim is the dominant managed shape on
+/// disk (issue #25).
+fn is_reference_dir(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    !NON_REFERENCE_DIR_NAMES.contains(&name) && !path.join("SKILL.md").is_file()
 }
 
 #[cfg(test)]
@@ -370,6 +420,128 @@ mod tests {
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].on_demand_files.len(), 2);
+    }
+
+    #[test]
+    fn vcs_and_dependency_dirs_are_excluded_from_on_demand_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "gstack", "gstack", "a skill that is also a checkout", "Body.");
+        let skill_dir = tmp.path().join("gstack");
+        fs::write(skill_dir.join("REFERENCE.md"), "a real reference").unwrap();
+
+        for junk in [
+            skill_dir.join(".git").join("objects").join("ab"),
+            skill_dir.join("node_modules").join(".pnpm").join("left-pad@1.0.0"),
+        ] {
+            fs::create_dir_all(&junk).unwrap();
+            fs::write(junk.join("blob"), "not a reference file").unwrap();
+        }
+
+        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+
+        assert_eq!(skills[0].on_demand_files, vec![skill_dir.join("REFERENCE.md")]);
+    }
+
+    #[test]
+    fn nested_skill_subtree_is_excluded_from_on_demand_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "gstack", "gstack", "ships nested skills", "Body.");
+        let skill_dir = tmp.path().join("gstack");
+        fs::write(skill_dir.join("REFERENCE.md"), "a real reference").unwrap();
+
+        // A nested skill's own content is its own row's three layers; counting
+        // it here too would double-count it (issue #26).
+        write_skill(&skill_dir.join("skills"), "browse", "browse", "drives a browser", "Body.");
+        fs::write(skill_dir.join("skills").join("browse").join("PLAYBOOK.md"), "nested ref").unwrap();
+
+        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+
+        assert_eq!(skills[0].on_demand_files, vec![skill_dir.join("REFERENCE.md")]);
+    }
+
+    #[test]
+    fn nested_skill_whose_skill_md_is_a_symlink_is_still_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "gstack", "gstack", "ships nested skills", "Body.");
+        let skill_dir = tmp.path().join("gstack");
+        fs::write(skill_dir.join("REFERENCE.md"), "a real reference").unwrap();
+
+        // The dominant managed shape on a real machine is a shim: a real
+        // directory whose SKILL.md is a symlink, not a symlinked directory
+        // (46 of 66 managed skills, issue #25). The prune must see through it.
+        let real = tmp.path().join("elsewhere").join("browse");
+        write_skill(&tmp.path().join("elsewhere"), "browse", "browse", "drives a browser", "Body.");
+        let shim = skill_dir.join("skills").join("browse");
+        fs::create_dir_all(&shim).unwrap();
+        symlink(real.join("SKILL.md"), shim.join("SKILL.md")).unwrap();
+        fs::write(shim.join("PLAYBOOK.md"), "the shim's own bundled ref").unwrap();
+
+        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let gstack = skills.iter().find(|s| s.directory_name() == "gstack").unwrap();
+
+        assert_eq!(gstack.on_demand_files, vec![skill_dir.join("REFERENCE.md")]);
+    }
+
+    #[test]
+    fn files_beside_and_below_a_nested_skill_are_still_collected() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "gstack", "gstack", "ships nested skills", "Body.");
+        let skill_dir = tmp.path().join("gstack");
+        let skills_subdir = skill_dir.join("skills");
+        write_skill(&skills_subdir, "browse", "browse", "drives a browser", "Body.");
+        // Only the nested skill's own directory is pruned, not its parent --
+        // an ordinary reference file sharing that parent still counts.
+        fs::write(skills_subdir.join("INDEX.md"), "index of the nested skills").unwrap();
+
+        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+
+        assert_eq!(skills[0].on_demand_files, vec![skills_subdir.join("INDEX.md")]);
+    }
+
+    #[test]
+    fn ordinary_nested_reference_dirs_are_still_collected() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "domain-modeling", "domain-modeling", "models domains", "Body.");
+        let refs = tmp.path().join("domain-modeling").join("references");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("ADR-FORMAT.md"), "adr doc").unwrap();
+
+        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+
+        assert_eq!(skills[0].on_demand_files, vec![refs.join("ADR-FORMAT.md")]);
+    }
+
+    #[test]
+    fn symlinked_directory_loop_terminates() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "looping", "looping", "links to itself", "Body.");
+        let refs = tmp.path().join("looping").join("references");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("ADR-FORMAT.md"), "adr doc").unwrap();
+        // The loop is kept clear of any SKILL.md so it exercises the cycle
+        // guard rather than the nested-skill prune: without the guard `is_dir()`
+        // follows the link and the walk recurses until the stack overflows
+        // (issue #26).
+        symlink(&refs, refs.join("self")).unwrap();
+
+        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+
+        assert_eq!(skills[0].on_demand_files, vec![refs.join("ADR-FORMAT.md")]);
+    }
+
+    #[test]
+    fn directory_reached_twice_via_a_symlink_is_collected_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "linking", "linking", "links a sibling dir", "Body.");
+        let skill_dir = tmp.path().join("linking");
+        let refs = skill_dir.join("references");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("ADR-FORMAT.md"), "adr doc").unwrap();
+        symlink(&refs, skill_dir.join("also-references")).unwrap();
+
+        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+
+        assert_eq!(skills[0].on_demand_files, vec![refs.join("ADR-FORMAT.md")]);
     }
 
     #[test]
