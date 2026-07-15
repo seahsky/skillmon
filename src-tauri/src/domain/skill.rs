@@ -41,25 +41,35 @@ pub struct DiscoveredSkill {
     /// unmanaged (ADR 0026). Derived structurally, from where `SKILL.md`
     /// actually resolves -- which covers both shapes a managed skill takes: a
     /// symlinked directory, and a real directory holding a symlinked
-    /// `SKILL.md`. Read by the source column (issue #30) and by removal, which
-    /// must know whether deleting an entry is durable (issue #31, ADR 0027).
-    #[allow(dead_code)]
+    /// `SKILL.md`. Crosses to the panel on `SkillReport` (issue #27) for the
+    /// manager-root column (issue #30), and is read by removal, which must know
+    /// whether deleting an entry is durable (issue #31, ADR 0027).
     pub manager_root: Option<PathBuf>,
     pub on_demand_files: Vec<PathBuf>,
     pub live: bool,
 }
 
-impl DiscoveredSkill {
-    pub fn directory_name(&self) -> &str {
-        match &self.id {
+impl SkillId {
+    /// The directory name every variant carries, so reading it costs callers no
+    /// match on the kind.
+    pub fn name(&self) -> &str {
+        match self {
             SkillId::Personal { name } => name,
             SkillId::Project { name, .. } => name,
             SkillId::Plugin { name, .. } => name,
         }
     }
+}
 
-    /// Read by a UI "directory name ≠ declared name" badge in a later plan.
-    #[allow(dead_code)]
+impl DiscoveredSkill {
+    pub fn directory_name(&self) -> &str {
+        self.id.name()
+    }
+
+    /// Crosses to the panel as `SkillReport::name_mismatch` (issue #27), which
+    /// shows both names rather than silently picking one (CONTEXT.md "Declared
+    /// name"). The rule for what counts as divergence stays here, in the
+    /// domain, rather than being re-derived in the panel.
     pub fn name_mismatch(&self) -> bool {
         self.directory_name() != self.frontmatter.declared_name
     }

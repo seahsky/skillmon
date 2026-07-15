@@ -19,6 +19,7 @@
     repoBasename,
     scannedPaths,
     skillKey,
+    skillNameTitle,
     sortSkills,
     usageDisplay,
     usageTitle,
@@ -297,13 +298,13 @@
   <div class="row" role="row" class:inactive={!skill.live}>
     <div class="col name" role="cell">
       <div class="name-line">
-        <span class="skill-name" title={skill.name}>{skill.name}</span>
-        {#if skill.kind === "plugin"}
+        <span class="skill-name" title={skillNameTitle(skill)}>{skill.id.name}</span>
+        {#if skill.id.kind === "plugin"}
           <span class="badge plugin" title="Plugin-locked: remove the whole plugin, not one skill">
-            {skill.plugin ?? "plugin"}
+            {skill.id.plugin}
           </span>
-        {:else if skill.kind === "project" && skill.repoPath && !inRepoSection}
-          <span class="badge project" title={skill.repoPath}>{repoBasename(skill.repoPath)}</span>
+        {:else if skill.id.kind === "project" && !inRepoSection}
+          <span class="badge project" title={skill.id.repoPath}>{repoBasename(skill.id.repoPath)}</span>
         {/if}
         {#if !skill.live}
           <span class="badge inactive-badge" title="Not live in the active context (contributes zero live footprint)">inactive</span>

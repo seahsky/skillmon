@@ -12,30 +12,49 @@ import {
   repoBasename,
   scannedPaths,
   skillKey,
+  skillNameTitle,
   sortSkills,
   usageDisplay,
   usageTitle,
   type ScanReport,
   type SkillReport,
+  type SkillRef,
   type UsageReport,
 } from "./skills";
 
-/** Build a SkillReport with only the fields a test cares about overridden. */
-function makeSkill(overrides: Partial<SkillReport> & { name: string }): SkillReport {
+/**
+ * Build a SkillReport with only the fields a test cares about overridden. The
+ * identity defaults to a personal skill named `name`; pass `id` (via
+ * `pluginId`/`projectId`) for the other two kinds.
+ */
+function makeSkill({
+  name,
+  id,
+  ...overrides
+}: Partial<Omit<SkillReport, "id">> & { name: string; id?: SkillRef }): SkillReport {
   return {
-    kind: "personal",
+    id: id ?? { kind: "personal", name },
     live: true,
     alwaysOn: { tokens: 0, exact: true },
     alwaysOnText: "native",
     onInvoke: { tokens: 0, exact: true },
     onDemand: { tokens: 0, exact: true },
     usage: null,
-    repoPath: null,
-    marketplace: null,
-    plugin: null,
+    declaredName: name,
+    nameMismatch: false,
+    managerRoot: null,
     ...overrides,
   };
 }
+
+const pluginId = (name: string, plugin: string, marketplace = "official"): SkillRef => ({
+  kind: "plugin",
+  marketplace,
+  plugin,
+  name,
+});
+
+const projectId = (name: string, repoPath: string): SkillRef => ({ kind: "project", repoPath, name });
 
 describe("sortSkills", () => {
   it("orders by always-on tokens, descending", () => {
@@ -45,7 +64,7 @@ describe("sortSkills", () => {
       makeSkill({ name: "mid", alwaysOn: { tokens: 100, exact: true } }),
     ];
 
-    expect(sortSkills(skills).map((s) => s.name)).toEqual(["big", "mid", "small"]);
+    expect(sortSkills(skills).map((s) => s.id.name)).toEqual(["big", "mid", "small"]);
   });
 
   it("breaks ties by name ascending", () => {
@@ -54,7 +73,7 @@ describe("sortSkills", () => {
       makeSkill({ name: "alpha", alwaysOn: { tokens: 100, exact: true } }),
     ];
 
-    expect(sortSkills(skills).map((s) => s.name)).toEqual(["alpha", "zulu"]);
+    expect(sortSkills(skills).map((s) => s.id.name)).toEqual(["alpha", "zulu"]);
   });
 
   it("does not mutate the input array", () => {
@@ -62,11 +81,11 @@ describe("sortSkills", () => {
       makeSkill({ name: "a", alwaysOn: { tokens: 1, exact: true } }),
       makeSkill({ name: "b", alwaysOn: { tokens: 2, exact: true } }),
     ];
-    const before = skills.map((s) => s.name);
+    const before = skills.map((s) => s.id.name);
 
     sortSkills(skills);
 
-    expect(skills.map((s) => s.name)).toEqual(before);
+    expect(skills.map((s) => s.id.name)).toEqual(before);
   });
 
   it("sorts ascending by a chosen numeric column", () => {
@@ -76,7 +95,7 @@ describe("sortSkills", () => {
       makeSkill({ name: "mid", onInvoke: { tokens: 100, exact: true } }),
     ];
 
-    expect(sortSkills(skills, { column: "onInvoke", direction: "asc" }).map((s) => s.name)).toEqual([
+    expect(sortSkills(skills, { column: "onInvoke", direction: "asc" }).map((s) => s.id.name)).toEqual([
       "small",
       "mid",
       "big",
@@ -86,12 +105,12 @@ describe("sortSkills", () => {
   it("sorts by name ascending and descending", () => {
     const skills = [makeSkill({ name: "bravo" }), makeSkill({ name: "alpha" }), makeSkill({ name: "charlie" })];
 
-    expect(sortSkills(skills, { column: "name", direction: "asc" }).map((s) => s.name)).toEqual([
+    expect(sortSkills(skills, { column: "name", direction: "asc" }).map((s) => s.id.name)).toEqual([
       "alpha",
       "bravo",
       "charlie",
     ]);
-    expect(sortSkills(skills, { column: "name", direction: "desc" }).map((s) => s.name)).toEqual([
+    expect(sortSkills(skills, { column: "name", direction: "desc" }).map((s) => s.id.name)).toEqual([
       "charlie",
       "bravo",
       "alpha",
@@ -105,12 +124,12 @@ describe("sortSkills", () => {
       makeSkill({ name: "high", onDemand: { tokens: 900, exact: true } }),
     ];
 
-    expect(sortSkills(skills, { column: "onDemand", direction: "desc" }).map((s) => s.name)).toEqual([
+    expect(sortSkills(skills, { column: "onDemand", direction: "desc" }).map((s) => s.id.name)).toEqual([
       "high",
       "low",
       "pending",
     ]);
-    expect(sortSkills(skills, { column: "onDemand", direction: "asc" }).map((s) => s.name)).toEqual([
+    expect(sortSkills(skills, { column: "onDemand", direction: "asc" }).map((s) => s.id.name)).toEqual([
       "low",
       "high",
       "pending",
@@ -122,12 +141,12 @@ describe("sortSkills", () => {
       makeSkill({ name, usage: { work, cacheWrite: 0, cacheRead: 0, attributionSource: "native" } });
     const skills = [withUsage("busy", 5000), makeSkill({ name: "idle", usage: null }), withUsage("quiet", 100)];
 
-    expect(sortSkills(skills, { column: "usageWork", direction: "desc" }).map((s) => s.name)).toEqual([
+    expect(sortSkills(skills, { column: "usageWork", direction: "desc" }).map((s) => s.id.name)).toEqual([
       "busy",
       "quiet",
       "idle",
     ]);
-    expect(sortSkills(skills, { column: "usageWork", direction: "asc" }).map((s) => s.name)).toEqual([
+    expect(sortSkills(skills, { column: "usageWork", direction: "asc" }).map((s) => s.id.name)).toEqual([
       "quiet",
       "busy",
       "idle",
@@ -137,8 +156,8 @@ describe("sortSkills", () => {
 
 describe("skillKey", () => {
   it("distinguishes same-named plugins from different marketplaces", () => {
-    const a = makeSkill({ name: "brainstorming", kind: "plugin", marketplace: "official", plugin: "sp" });
-    const b = makeSkill({ name: "brainstorming", kind: "plugin", marketplace: "community", plugin: "sp" });
+    const a = makeSkill({ name: "brainstorming", id: pluginId("brainstorming", "sp", "official") });
+    const b = makeSkill({ name: "brainstorming", id: pluginId("brainstorming", "sp", "community") });
 
     expect(skillKey(a)).not.toBe(skillKey(b));
   });
@@ -147,6 +166,62 @@ describe("skillKey", () => {
     const s = makeSkill({ name: "grilling" });
 
     expect(skillKey(s)).toBe(skillKey({ ...s }));
+  });
+
+  it("distinguishes same-named project skills in different repos", () => {
+    const a = makeSkill({ name: "deploy", id: projectId("deploy", "/repos/alpha") });
+    const b = makeSkill({ name: "deploy", id: projectId("deploy", "/repos/beta") });
+
+    expect(skillKey(a)).not.toBe(skillKey(b));
+  });
+
+  it("distinguishes a personal skill from a same-named skill of another kind", () => {
+    const personal = makeSkill({ name: "ship" });
+    const project = makeSkill({ name: "ship", id: projectId("ship", "/repos/alpha") });
+    const plugin = makeSkill({ name: "ship", id: pluginId("ship", "gstack") });
+
+    expect(new Set([skillKey(personal), skillKey(project), skillKey(plugin)]).size).toBe(3);
+  });
+
+  // The key is built by concatenation, so a separator that could occur inside a
+  // name or a path would let two distinct identities collide. NUL cannot.
+  it("does not collide when a name contains the key's other field values", () => {
+    const a = makeSkill({ name: "sp", id: pluginId("sp", "a") });
+    const b = makeSkill({ name: "a", id: pluginId("a", "sp") });
+
+    expect(skillKey(a)).not.toBe(skillKey(b));
+  });
+
+  it("ignores fields outside the identity, so a re-scan keeps the row keyed the same", () => {
+    const before = makeSkill({ name: "ship", alwaysOn: { tokens: 10, exact: false }, onDemand: null });
+    const after = makeSkill({
+      name: "ship",
+      alwaysOn: { tokens: 4200, exact: true },
+      onDemand: { tokens: 99, exact: true },
+      usage: { work: 5, cacheWrite: 0, cacheRead: 0, attributionSource: "native" },
+      managerRoot: "/home/me/.claude/skills/gstack",
+    });
+
+    expect(skillKey(before)).toBe(skillKey(after));
+  });
+});
+
+describe("skillNameTitle", () => {
+  it("shows both names when the frontmatter name diverges from the directory", () => {
+    // The real divergence on the reference machine (CONTEXT.md "Declared name").
+    const skill = makeSkill({
+      name: "connect-chrome",
+      declaredName: "open-gstack-browser",
+      nameMismatch: true,
+    });
+
+    const title = skillNameTitle(skill);
+    expect(title).toContain("connect-chrome");
+    expect(title).toContain("open-gstack-browser");
+  });
+
+  it("shows the directory name alone when the two agree", () => {
+    expect(skillNameTitle(makeSkill({ name: "grilling" }))).toBe("grilling");
   });
 });
 
@@ -320,11 +395,11 @@ describe("mainSkills", () => {
   it("keeps personal and plugin skills but drops project skills (they get per-repo sections)", () => {
     const skills = [
       makeSkill({ name: "personal-one" }),
-      makeSkill({ name: "plug", kind: "plugin", marketplace: "official", plugin: "sp" }),
-      makeSkill({ name: "proj", kind: "project", repoPath: "/repo/a" }),
+      makeSkill({ name: "plug", id: pluginId("plug", "sp") }),
+      makeSkill({ name: "proj", id: projectId("proj", "/repo/a") }),
     ];
 
-    expect(mainSkills(skills).map((s) => s.name).sort()).toEqual(["personal-one", "plug"]);
+    expect(mainSkills(skills).map((s) => s.id.name).sort()).toEqual(["personal-one", "plug"]);
   });
 });
 
@@ -333,12 +408,12 @@ describe("groupByPlugin", () => {
     const skills = [
       makeSkill({ name: "p-small", alwaysOn: { tokens: 10, exact: true } }),
       makeSkill({ name: "p-big", alwaysOn: { tokens: 900, exact: true } }),
-      makeSkill({ name: "sp-a", kind: "plugin", marketplace: "official", plugin: "sp", alwaysOn: { tokens: 500, exact: true } }),
-      makeSkill({ name: "gs-a", kind: "plugin", marketplace: "community", plugin: "gs", alwaysOn: { tokens: 50, exact: true } }),
+      makeSkill({ name: "sp-a", id: pluginId("sp-a", "sp"), alwaysOn: { tokens: 500, exact: true } }),
+      makeSkill({ name: "gs-a", id: pluginId("gs-a", "gs", "community"), alwaysOn: { tokens: 50, exact: true } }),
     ];
 
     const groups = groupByPlugin(skills);
-    const byLabel = Object.fromEntries(groups.map((g) => [g.label, g.skills.map((s) => s.name)]));
+    const byLabel = Object.fromEntries(groups.map((g) => [g.label, g.skills.map((s) => s.id.name)]));
 
     expect(byLabel["Personal"]).toEqual(["p-big", "p-small"]); // sorted always-on desc within group
     expect(byLabel["sp"]).toEqual(["sp-a"]);
@@ -349,8 +424,8 @@ describe("groupByPlugin", () => {
 
   it("keeps same-named plugins from different marketplaces in separate groups", () => {
     const skills = [
-      makeSkill({ name: "x", kind: "plugin", marketplace: "official", plugin: "sp" }),
-      makeSkill({ name: "y", kind: "plugin", marketplace: "community", plugin: "sp" }),
+      makeSkill({ name: "x", id: pluginId("x", "sp") }),
+      makeSkill({ name: "y", id: pluginId("y", "sp", "community") }),
     ];
 
     expect(groupByPlugin(skills)).toHaveLength(2);
@@ -360,10 +435,10 @@ describe("groupByPlugin", () => {
 describe("groupProjectsByRepo", () => {
   it("groups project skills by repo, active repo first, then others alphabetically", () => {
     const skills = [
-      makeSkill({ name: "z-proj", kind: "project", repoPath: "/repos/zeta" }),
-      makeSkill({ name: "a-proj", kind: "project", repoPath: "/repos/alpha" }),
-      makeSkill({ name: "active-proj", kind: "project", repoPath: "/repos/active" }),
-      makeSkill({ name: "personal", kind: "personal" }),
+      makeSkill({ name: "z-proj", id: projectId("z-proj", "/repos/zeta") }),
+      makeSkill({ name: "a-proj", id: projectId("a-proj", "/repos/alpha") }),
+      makeSkill({ name: "active-proj", id: projectId("active-proj", "/repos/active") }),
+      makeSkill({ name: "personal" }),
     ];
 
     const sections = groupProjectsByRepo(skills, "/repos/active");
@@ -372,7 +447,7 @@ describe("groupProjectsByRepo", () => {
     expect(sections[0].isActive).toBe(true);
     expect(sections[1].isActive).toBe(false);
     // Personal skills never land in a repo section.
-    expect(sections.flatMap((s) => s.skills.map((k) => k.name))).not.toContain("personal");
+    expect(sections.flatMap((s) => s.skills.map((k) => k.id.name))).not.toContain("personal");
   });
 
   it("returns no sections when there are no project skills", () => {
@@ -384,10 +459,10 @@ describe("coResidentAlwaysOn", () => {
   it("sums personal + live plugins + only the active repo's project skills (DESIGN #5)", () => {
     const skills = [
       makeSkill({ name: "personal", alwaysOn: { tokens: 100, exact: true } }),
-      makeSkill({ name: "live-plugin", kind: "plugin", live: true, alwaysOn: { tokens: 200, exact: true } }),
-      makeSkill({ name: "dead-plugin", kind: "plugin", live: false, alwaysOn: { tokens: 999, exact: true } }),
-      makeSkill({ name: "active-proj", kind: "project", repoPath: "/repo/active", alwaysOn: { tokens: 30, exact: true } }),
-      makeSkill({ name: "other-proj", kind: "project", repoPath: "/repo/other", alwaysOn: { tokens: 777, exact: true } }),
+      makeSkill({ name: "live-plugin", id: pluginId("live-plugin", "sp"), live: true, alwaysOn: { tokens: 200, exact: true } }),
+      makeSkill({ name: "dead-plugin", id: pluginId("dead-plugin", "sp"), live: false, alwaysOn: { tokens: 999, exact: true } }),
+      makeSkill({ name: "active-proj", id: projectId("active-proj", "/repo/active"), alwaysOn: { tokens: 30, exact: true } }),
+      makeSkill({ name: "other-proj", id: projectId("other-proj", "/repo/other"), alwaysOn: { tokens: 777, exact: true } }),
     ];
 
     // 100 + 200 + 30; the disabled plugin and the other repo are excluded.
