@@ -83,6 +83,7 @@ _Avoid_: skill body, body cost
 
 **On-demand layer**:
 Bundled reference files that load only if the body tells the agent to read them; reported as a ceiling, never in the headline. Measured as raw file bytes, not whatever tool-specific wrapper the agent happens to read them through (e.g. Read's line-numbered output) — which wrapper applies is a runtime choice, not a fact about the skill, so the ceiling deliberately doesn't chase it.
+"Bundled reference" excludes content that cannot enter context through this skill, even when it sits inside the skill directory (ADR 0028): a VCS object store, a dependency tree, and any nested `SKILL.md` subtree — that subtree is another skill, and its content reaches context as that skill's own layers rather than because this body said to read it (and where the nested skill is separately discovered, as gstack's symlinked-in skills are, counting it here double-counts it). A skill directory that is also a project checkout is the common case, not a corner one.
 
 **Token source**:
 Whether a layer's count is `Exact` (a live `count_tokens` call, cache-hit or fresh) or `Estimate` (calibrated `tiktoken`, used whenever no API key is present or a `count_tokens` call fails — the two collapse to the same fallback path, since either way exact wasn't available). Orthogonal to text confidence, which only the always-on layer carries.
