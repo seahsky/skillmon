@@ -1001,8 +1001,8 @@ mod tests {
         // value has to be resolved too.
         let expected = |p: &std::path::Path| Some(fs::canonicalize(p).unwrap().display().to_string());
 
-        assert_eq!(root_of("ship"), expected(&checkout.parent().unwrap().to_path_buf()));
-        assert_eq!(root_of("tdd"), expected(&agents.parent().unwrap().to_path_buf()));
+        assert_eq!(root_of("ship"), expected(checkout.parent().unwrap()));
+        assert_eq!(root_of("tdd"), expected(agents.parent().unwrap()));
         assert_eq!(root_of("vercel-react"), None, "a skill owning its own content has no manager root");
     }
 
