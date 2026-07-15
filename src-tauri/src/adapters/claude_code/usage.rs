@@ -186,6 +186,10 @@ struct ReconRecord {
     kind: Option<String>,
     #[serde(rename = "attributionSkill")]
     attribution_skill: Option<String>,
+    /// Read only by the parent-spawn walk (issue #19), which must carry a
+    /// natively-attributed spawn's plugin through to the rolled-up credit.
+    #[serde(rename = "attributionPlugin")]
+    attribution_plugin: Option<String>,
     #[serde(rename = "isSidechain", default)]
     is_sidechain: bool,
     #[serde(rename = "isMeta", default)]
@@ -217,6 +221,9 @@ enum ReconContent {
 struct ContentBlock {
     #[serde(rename = "type")]
     kind: Option<String>,
+    /// A `tool_use` block's own id (`toolu_...`), the join key a sub-agent's
+    /// `agent-<id>.meta.json` records as its `toolUseId` (issue #19).
+    id: Option<String>,
     name: Option<String>,
     input: Option<BlockInput>,
 }
@@ -306,7 +313,9 @@ pub fn reconstruct_usage_rows(content: &str) -> Vec<UsageRow> {
                             rows.push(UsageRow {
                                 message_id: id.clone(),
                                 attribution_skill: skill.clone(),
-                                attribution_plugin: skill.split_once(':').map(|(p, _)| p.to_string()),
+                                // No native field to read on a below-gate record,
+                                // so this is the prefix-only derivation.
+                                attribution_plugin: plugin_for(skill, None),
                                 is_subagent: record.is_sidechain,
                                 work: usage.input_tokens.saturating_add(usage.output_tokens),
                                 cache_write: usage.cache_creation_input_tokens,
@@ -335,6 +344,214 @@ pub fn reconstruct_usage_rows(content: &str) -> Vec<UsageRow> {
         }
     }
     rows
+}
+
+/// The names Claude Code's sub-agent spawn tool has shipped under: `Agent` on
+/// current builds, `Task` on older ones. Only a `tool_use` under one of these
+/// can spawn the `agent-<id>.jsonl` file the roll-up credits, so a matching id
+/// on any other tool is ignored rather than trusted (issue #19).
+const SPAWN_TOOLS: [&str; 2] = ["Agent", "Task"];
+
+/// A skill's `attributionPlugin`: the record's own field when it has one, else
+/// the `plugin:name` prefix. A reconstructed credit has no record field to
+/// read, so it derives the plugin from the prefix alone; a native one prefers
+/// what the record actually says.
+fn plugin_for(skill: &str, native_plugin: Option<&str>) -> Option<String> {
+    native_plugin.map(str::to_string).or_else(|| skill.split_once(':').map(|(p, _)| p.to_string()))
+}
+
+/// One sub-agent spawn's resolved attribution: the skill that was holding the
+/// wheel when the spawn was issued, and that skill's plugin. A named pair
+/// rather than a bare tuple, so the spawn map below reads as the
+/// `tool_use_attribution(toolUseId -> skill, plugin)` view issue #19 names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnAttribution {
+    skill: String,
+    plugin: Option<String>,
+}
+
+/// A parent transcript's spawns, keyed by the `tool_use` block id a sub-agent's
+/// `meta.json` records as its `toolUseId`.
+type SpawnMap = HashMap<String, SpawnAttribution>;
+
+/// Maps each sub-agent spawn in a PARENT transcript from its `tool_use` block
+/// id to the skill that was holding the wheel when the spawn was issued --
+/// the `tool_use_attribution(toolUseId -> skill, plugin)` view issue #19 needs,
+/// derived per scan rather than persisted (no new schema for a walk that fires
+/// on no current build).
+///
+/// Resolves each spawn native-first, exactly as ADR 0005 resolves everything
+/// else: the record's own `attributionSkill` when present, else the active
+/// skill issue #12's walk reconstructs. The fallback is what makes the roll-up
+/// reachable at all -- its version gate admits only pre-attribution builds, and
+/// on those the parent turn has no native `attributionSkill` by the gate's own
+/// definition, so a native-only read would resolve nothing, always.
+///
+/// The walk rules are #12's, and deliberately so -- same append order, same
+/// human-turn clear, same CREDIT-BEFORE-PUSH: a spawn is credited to the skill
+/// already active, never to one the same record starts. A spawn with no skill
+/// either way is omitted, so the caller drops it rather than guessing.
+fn parent_spawn_attributions(content: &str) -> SpawnMap {
+    let mut spawns = SpawnMap::new();
+    let mut current_skill: Option<String> = None;
+
+    for line in content.lines() {
+        let Ok(record) = serde_json::from_str::<ReconRecord>(line) else { continue };
+        match record.kind.as_deref() {
+            Some("user") => {
+                if is_fresh_human_turn(&record) {
+                    current_skill = None;
+                }
+            }
+            Some("assistant") => {
+                // Snapshot the wheel-holder BEFORE walking this record's blocks,
+                // so a `Skill` push here cannot back-date itself onto a spawn in
+                // the same record (credit-before-push).
+                let attribution = record.attribution_skill.clone().or_else(|| current_skill.clone());
+                let Some(ReconContent::Blocks(blocks)) = record.message.as_ref().and_then(|m| m.content.as_ref())
+                else {
+                    continue;
+                };
+                for block in blocks {
+                    if block.kind.as_deref() != Some("tool_use") {
+                        continue;
+                    }
+                    match block.name.as_deref() {
+                        Some(name) if SPAWN_TOOLS.contains(&name) => {
+                            if let (Some(id), Some(skill)) = (&block.id, &attribution) {
+                                let plugin = plugin_for(skill, record.attribution_plugin.as_deref());
+                                spawns.insert(id.clone(), SpawnAttribution { skill: skill.clone(), plugin });
+                            }
+                        }
+                        Some("Skill") => {
+                            if let Some(skill) = block.input.as_ref().and_then(|i| i.skill.as_ref()) {
+                                current_skill = Some(skill.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    spawns
+}
+
+/// Rolls a PRE-ATTRIBUTION sub-agent file's own work up to `skill`, the skill
+/// that spawned it (issue #19). The version gate is the whole safety argument:
+/// above it a sub-agent record self-attributes, so an absent `attributionSkill`
+/// means "no skill was active in that turn" (measured across all 1,455 real
+/// sub-agent files: absence spans the same builds as presence) and rolling up
+/// there would fabricate attribution the harness deliberately withheld.
+///
+/// Only records LACKING their own attribution are credited -- native
+/// own-attribution stays authoritative, so the roll-up can neither displace a
+/// native credit nor double-count a message the native pass already counted.
+///
+/// Work is summed from THIS file's own `message.usage`, never a parent's
+/// `toolUseResult.totalTokens` (ADR 0005), and dedups by `message.id` at the
+/// store. Every row is `is_subagent` (so the include toggle gates it) and
+/// `reconstructed` (so the credit is honestly labeled).
+///
+/// Unlike #12's walk this is STATELESS per record -- every unattributed record
+/// credits the same spawning skill -- so it is safe on a tail read, which a
+/// whole-file-stateful walk would not be.
+fn rollup_subagent_rows(content: &str, skill: &str, plugin: Option<&str>) -> Vec<UsageRow> {
+    if !file_is_below_gate(content) {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    for line in content.lines() {
+        let Ok(record) = serde_json::from_str::<ReconRecord>(line) else { continue };
+        if record.kind.as_deref() != Some("assistant") || record.attribution_skill.is_some() {
+            continue;
+        }
+        let Some(message) = record.message else { continue };
+        let (Some(id), Some(usage)) = (message.id, message.usage) else { continue };
+        rows.push(UsageRow {
+            message_id: id,
+            attribution_skill: skill.to_string(),
+            attribution_plugin: plugin.map(str::to_string),
+            // Sub-agent by provenance, exactly as the native sub-agent pass
+            // stamps it (grill D3): never trust the record's own isSidechain.
+            is_subagent: true,
+            work: usage.input_tokens.saturating_add(usage.output_tokens),
+            cache_write: usage.cache_creation_input_tokens,
+            cache_read: usage.cache_read_input_tokens,
+            reconstructed: true,
+            timestamp_millis: record.timestamp.as_deref().and_then(parse_iso8601_millis).unwrap_or(0),
+        });
+    }
+    rows
+}
+
+/// The `toolUseId` recorded in a sub-agent file's sibling
+/// `agent-<id>.meta.json` -- the id of the parent `tool_use` block that spawned
+/// it. `None` when the sidecar is absent, unreadable, or carries no
+/// `toolUseId`: a workflow sub-agent has no such linkage (1,227 of 1,455 real
+/// files), and with no linkage there is nothing to roll up.
+fn spawn_tool_use_id(subagent_path: &Path) -> Option<String> {
+    // `agent-<id>.jsonl` -> `agent-<id>.meta.json` (the stem is the whole
+    // `agent-<id>`, so swapping the extension lands on the sidecar).
+    let content = fs::read_to_string(subagent_path.with_extension("meta.json")).ok()?;
+    serde_json::from_str::<AgentMeta>(&content).ok()?.tool_use_id
+}
+
+#[derive(Deserialize)]
+struct AgentMeta {
+    #[serde(rename = "toolUseId")]
+    tool_use_id: Option<String>,
+}
+
+/// The transcript of the session that spawned `subagent_path`. Claude Code
+/// writes a session's sub-agents under `<project_dir>/<session>/subagents/`
+/// (workflow ones one level deeper), and the session's own transcript is the
+/// sibling `<project_dir>/<session>.jsonl` -- so the session dir is the parent
+/// of the `subagents` ancestor, at either depth. `None` when there is no
+/// `subagents` ancestor, which means this is not a sub-agent path at all.
+fn parent_transcript_path(subagent_path: &Path) -> Option<PathBuf> {
+    let session_dir = subagent_path
+        .ancestors()
+        .find(|a| a.file_name().and_then(|n| n.to_str()) == Some("subagents"))?
+        .parent()?;
+    // Append, never `with_extension`: the session dir is the file stem in full,
+    // so a `.` anywhere in it would otherwise be eaten as an extension.
+    let mut path = session_dir.as_os_str().to_os_string();
+    path.push(".jsonl");
+    Some(PathBuf::from(path))
+}
+
+/// The rolled-up rows for one sub-agent file (issue #19), or `None` when the
+/// roll-up does not apply -- an above-gate build, a missing linkage, an
+/// unreadable parent, or a spawn whose own turn was unattributed.
+///
+/// `memo` caches each parent transcript's spawn map for the scan, so N
+/// sub-agent files sharing one session read and walk that parent exactly once,
+/// and re-reads it even when the checkpoint says the parent is fresh (the
+/// roll-up needs the parent's CONTENT, not its usage rows).
+///
+/// An UNREADABLE parent is deliberately not cached: it is "unknown", never "no
+/// spawns". Caching the failure would conflate the two and silently strip the
+/// credit from every sibling sub-agent of that session for the whole scan --
+/// the same error-is-not-absence distinction `enumerated_dirs` draws for the
+/// prune (ADR 0024). Not caching it costs at most one retry per sibling and
+/// lets a transient failure recover within the pass.
+fn rollup_rows_for(path: &Path, text: &str, memo: &mut HashMap<PathBuf, SpawnMap>) -> Option<Vec<UsageRow>> {
+    // Gate FIRST. Every file on a real machine is above it, so the common case
+    // bails after one cheap version probe -- never touching the meta sidecar or
+    // re-reading a parent transcript.
+    if !file_is_below_gate(text) {
+        return None;
+    }
+    let tool_use_id = spawn_tool_use_id(path)?;
+    let parent_path = parent_transcript_path(path)?;
+    if !memo.contains_key(&parent_path) {
+        let content = fs::read_to_string(&parent_path).ok()?;
+        memo.insert(parent_path.clone(), parent_spawn_attributions(&content));
+    }
+    let spawn = memo.get(&parent_path)?.get(&tool_use_id)?;
+    Some(rollup_subagent_rows(text, &spawn.skill, spawn.plugin.as_deref()))
 }
 
 /// The join key between an `attributionSkill` string and a discovered skill.
@@ -461,6 +678,12 @@ fn ingest_transcripts(
     cache: &SqliteUsageCache,
     stats: &mut UsageStats,
 ) {
+    // Parent spawn maps for the roll-up (issue #19), memoized for this pass so
+    // the many sub-agent files of one session walk their shared parent once.
+    // Stays empty on the main pass and on every current-build sub-agent pass,
+    // since the gate bails before a parent is ever read.
+    let mut parent_spawns: HashMap<PathBuf, SpawnMap> = HashMap::new();
+
     for transcript in transcripts {
         stats.files_total += 1;
         let path_key = transcript.path.to_string_lossy();
@@ -533,6 +756,19 @@ fn ingest_transcripts(
         // alone.
         if !force_subagent && !is_tail {
             cache.ingest(&reconstruct_usage_rows(text));
+        }
+        // The sub-agent pass's counterpart (issue #19): roll a pre-attribution
+        // sub-agent file's unattributed work up to the skill that spawned it.
+        // Unlike the walk above this needs no `!is_tail` guard -- it is
+        // stateless per record (every unattributed record credits the same
+        // spawning skill), so a tail that starts mid-file still credits
+        // correctly. Native rows land first and are never displaced: the
+        // roll-up skips any record carrying its own attribution, and its rows
+        // are INSERT OR IGNORE regardless.
+        if force_subagent {
+            if let Some(rows) = rollup_rows_for(&transcript.path, text, &mut parent_spawns) {
+                cache.ingest(&rows);
+            }
         }
         let new_off = base + consumed as u64;
         if let Some(m) = mnanos {
@@ -1448,5 +1684,513 @@ mod tests {
             45,
             "the tail landed only the native m2 (5); reconstruction did NOT re-run on the tail",
         );
+    }
+
+    // ---- issue #19: version-gated parent-spawn roll-up for sub-agent usage ----
+
+    /// The expected resolution of one spawn, spelled without the struct noise.
+    fn attr(skill: &str, plugin: Option<&str>) -> SpawnAttribution {
+        SpawnAttribution { skill: skill.to_string(), plugin: plugin.map(str::to_string) }
+    }
+
+    /// A pre-attribution build (< the gate): the only window the roll-up runs
+    /// in, and the only one where a sub-agent record's missing attribution
+    /// means "too old to attribute" rather than "no skill was active".
+    const OLD: &str = "2.1.145";
+    /// A current build (>= the gate), where the child self-attributes.
+    const NEW: &str = "2.1.197";
+
+    /// An assistant record spawning a sub-agent. `tool` is the spawn tool's
+    /// name (`Agent` on current builds, `Task` on older ones); `skill` is the
+    /// record's NATIVE `attributionSkill`, which a below-gate build never
+    /// writes.
+    fn spawn_line(version: &str, tool: &str, tool_use_id: &str, skill: Option<&str>) -> String {
+        let mut rec = json!({
+            "type": "assistant", "version": version, "uuid": "u_spawn",
+            "message": {"id": "m_spawn", "role": "assistant",
+                "content": [{"type": "tool_use", "id": tool_use_id, "name": tool, "input": {}}],
+                "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+        });
+        if let Some(s) = skill {
+            rec["attributionSkill"] = json!(s);
+        }
+        rec.to_string()
+    }
+
+    /// An assistant record whose `Skill` tool_use hands the wheel to `skill`.
+    fn skill_invoke_line(version: &str, skill: &str) -> String {
+        json!({
+            "type": "assistant", "version": version, "uuid": "u_inv",
+            "message": {"id": "m_inv", "role": "assistant",
+                "content": [{"type": "tool_use", "id": "tu_inv", "name": "Skill", "input": {"skill": skill}}],
+                "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+        })
+        .to_string()
+    }
+
+    /// A typed human prompt, which hands the wheel back (clears the skill).
+    fn human_line(version: &str) -> String {
+        json!({"type": "user", "version": version, "message": {"role": "user", "content": "help me"}}).to_string()
+    }
+
+    /// A sub-agent assistant record with NO own attribution -- the roll-up's
+    /// target. `isSidechain` is set, as every real sub-agent record carries it.
+    fn unattributed_subagent_line(version: &str, message_id: &str, work: u32) -> String {
+        json!({
+            "type": "assistant", "version": version, "isSidechain": true, "uuid": message_id,
+            "timestamp": "2026-06-27T02:13:52.480Z",
+            "message": {"id": message_id, "role": "assistant",
+                "content": [{"type": "text", "text": "working"}],
+                "usage": {"input_tokens": work, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+        })
+        .to_string()
+    }
+
+    /// Lays out the real on-disk shape Claude Code writes for a session that
+    /// spawned one sub-agent:
+    ///   `<project_dir>/<session>.jsonl`                       -- the parent
+    ///   `<project_dir>/<session>/subagents/agent-<id>.jsonl`  -- the child
+    ///   `<project_dir>/<session>/subagents/agent-<id>.meta.json`
+    /// `meta_tool_use_id` is `None` to model a workflow sub-agent, whose meta
+    /// sidecar carries no `toolUseId` at all. Returns the project dir.
+    fn write_session(
+        tmp: &Path,
+        parent_lines: &[String],
+        child_lines: &[String],
+        meta_tool_use_id: Option<&str>,
+    ) -> PathBuf {
+        let project_dir = tmp.join("repo-a");
+        let session = "12d57136-d085-4c6a-8d3d-1c3f156c9ea2";
+        write_transcript(&project_dir, &format!("{session}.jsonl"), parent_lines);
+        let subagents = project_dir.join(session).join("subagents");
+        write_transcript(&subagents, "agent-abc123.jsonl", child_lines);
+        let meta = match meta_tool_use_id {
+            Some(id) => json!({"agentType": "Explore", "toolUseId": id, "spawnDepth": 1}),
+            None => json!({"agentType": "Explore", "spawnDepth": 1}),
+        };
+        fs::write(subagents.join("agent-abc123.meta.json"), meta.to_string()).unwrap();
+        project_dir
+    }
+
+    /// Run one sub-agent-only usage pass over `project_dir`. Main-thread refs
+    /// are deliberately empty, so any credit observed came from the roll-up
+    /// reading the parent directly -- never from the parent being ingested as a
+    /// main transcript in its own right.
+    fn subagent_scan(project_dir: &Path, cache: &SqliteUsageCache) -> UsageStats {
+        let dirs = [project_dir.to_path_buf()];
+        refresh_usage(&[], &subagent_transcript_refs(&dirs), &enumerated(project_dir), cache)
+    }
+
+    #[test]
+    fn parent_transcript_path_resolves_the_sibling_session_transcript() {
+        // Depth 1: <project>/<session>/subagents/agent-x.jsonl
+        let direct = Path::new("/p/repo-a/sess-1/subagents/agent-x.jsonl");
+        assert_eq!(parent_transcript_path(direct), Some(PathBuf::from("/p/repo-a/sess-1.jsonl")));
+        // Depth 2: a workflow sub-agent still belongs to the same session.
+        let workflow = Path::new("/p/repo-a/sess-1/subagents/workflows/wf_abc/agent-y.jsonl");
+        assert_eq!(parent_transcript_path(workflow), Some(PathBuf::from("/p/repo-a/sess-1.jsonl")));
+        // A path with no `subagents` ancestor has no derivable parent.
+        assert_eq!(parent_transcript_path(Path::new("/p/repo-a/sess-1.jsonl")), None);
+    }
+
+    #[test]
+    fn spawn_tool_use_id_reads_the_meta_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_session(tmp.path(), &[], &[], Some("toolu_01FFX17C8n4PWFhydJu7S9AP"));
+        let child = dir.join("12d57136-d085-4c6a-8d3d-1c3f156c9ea2/subagents/agent-abc123.jsonl");
+        assert_eq!(spawn_tool_use_id(&child), Some("toolu_01FFX17C8n4PWFhydJu7S9AP".to_string()));
+
+        // A workflow sub-agent's sidecar carries no toolUseId: no linkage, so
+        // no roll-up (the 1,227-file case measured in issue #19).
+        let dir2 = write_session(&tmp.path().join("b"), &[], &[], None);
+        let child2 = dir2.join("12d57136-d085-4c6a-8d3d-1c3f156c9ea2/subagents/agent-abc123.jsonl");
+        assert_eq!(spawn_tool_use_id(&child2), None);
+    }
+
+    #[test]
+    fn parent_spawn_attributions_maps_a_native_agent_spawn_to_its_skill() {
+        // The `Agent` spawn tool on a build that natively attributes the turn.
+        let parent = spawn_line(NEW, "Agent", "toolu_1", Some("claude-md-generator"));
+        let spawns = parent_spawn_attributions(&parent);
+        assert_eq!(spawns.get("toolu_1"), Some(&attr("claude-md-generator", None)));
+    }
+
+    #[test]
+    fn parent_spawn_attributions_reads_a_plugin_spawns_plugin() {
+        let mut rec: serde_json::Value =
+            serde_json::from_str(&spawn_line(NEW, "Agent", "toolu_1", Some("superpowers:executing-plans"))).unwrap();
+        rec["attributionPlugin"] = json!("superpowers");
+        let spawns = parent_spawn_attributions(&rec.to_string());
+        assert_eq!(spawns.get("toolu_1"), Some(&attr("superpowers:executing-plans", Some("superpowers"))));
+    }
+
+    #[test]
+    fn parent_spawn_attributions_falls_back_to_the_reconstructed_active_skill() {
+        // A pre-attribution parent: no native attributionSkill anywhere, so the
+        // spawn's skill comes from issue #12's walk (the `Skill` invoke above
+        // it). `Task` is the older builds' spawn tool name.
+        let parent = [
+            human_line(OLD),
+            skill_invoke_line(OLD, "grilling"),
+            spawn_line(OLD, "Task", "toolu_1", None),
+        ]
+        .join("\n");
+        let spawns = parent_spawn_attributions(&parent);
+        assert_eq!(spawns.get("toolu_1"), Some(&attr("grilling", None)));
+    }
+
+    #[test]
+    fn parent_spawn_attributions_clears_the_skill_on_a_fresh_human_turn() {
+        // The user took the wheel back before the spawn: nothing was active, so
+        // the spawn is unattributed and must not inherit the stale skill.
+        let parent = [
+            skill_invoke_line(OLD, "grilling"),
+            human_line(OLD),
+            spawn_line(OLD, "Task", "toolu_1", None),
+        ]
+        .join("\n");
+        assert_eq!(parent_spawn_attributions(&parent).get("toolu_1"), None);
+    }
+
+    #[test]
+    fn parent_spawn_attributions_credits_a_spawn_before_a_same_record_skill_push() {
+        // One record both spawns an agent AND invokes a new skill. Credit-
+        // before-push (issue #12's rule): the spawn belongs to the skill that
+        // was ALREADY active, never the one this same record starts.
+        let record = json!({
+            "type": "assistant", "version": OLD, "uuid": "u1",
+            "message": {"id": "m1", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Task", "input": {}},
+                {"type": "tool_use", "id": "tu_inv", "name": "Skill", "input": {"skill": "ship"}}
+            ], "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+        });
+        let parent = [skill_invoke_line(OLD, "grilling"), record.to_string()].join("\n");
+        assert_eq!(
+            parent_spawn_attributions(&parent).get("toolu_1"),
+            Some(&attr("grilling", None)),
+            "the spawn belongs to the already-active grilling, not the ship it pushes",
+        );
+    }
+
+    #[test]
+    fn parent_spawn_attributions_ignores_a_non_spawn_tool_use() {
+        // A `Read` tool_use is not a sub-agent spawn and must never enter the map.
+        let parent = [skill_invoke_line(OLD, "grilling"), spawn_line(OLD, "Read", "toolu_1", None)].join("\n");
+        assert!(!parent_spawn_attributions(&parent).contains_key("toolu_1"));
+    }
+
+    #[test]
+    fn a_below_gate_subagent_rolls_up_to_its_spawning_skill() {
+        // AC1: a pre-attribution sub-agent file with no own attribution, whose
+        // spawning parent turn IS attributed (here via issue #12's walk), gets
+        // its OWN work credited to that skill, tagged reconstructed.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_session(
+            tmp.path(),
+            &[human_line(OLD), skill_invoke_line(OLD, "grilling"), spawn_line(OLD, "Task", "toolu_1", None)],
+            &[unattributed_subagent_line(OLD, "m_sub", 999)],
+            Some("toolu_1"),
+        );
+
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        subagent_scan(&dir, &cache);
+
+        let rolled = UsageIndex::build(&cache, true).for_skill(&grilling()).unwrap();
+        assert_eq!(rolled.work, 999, "the sub-agent file's own work rolls up to the spawning skill");
+        assert_eq!(
+            rolled.attribution_source,
+            AttributionSource::Reconstructed,
+            "a rolled-up credit is honestly labeled reconstructed, never native",
+        );
+    }
+
+    #[test]
+    fn a_natively_attributed_parent_wins_over_the_reconstruction_fallback() {
+        // AC1 read literally: "whose spawning parent turn IS attributed". The
+        // combination is synthetic -- a below-gate build writes no native
+        // attribution, so a native parent and a below-gate child cannot co-occur
+        // on a real machine -- but it is the only way to drive the native branch
+        // end to end, and it pins the priority order: where a parent carries its
+        // own attributionSkill, THAT wins and the walk is never consulted. Here
+        // the walk would say `ship`; native says `grilling`.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_session(
+            tmp.path(),
+            &[skill_invoke_line(OLD, "ship"), spawn_line(OLD, "Task", "toolu_1", Some("grilling"))],
+            &[unattributed_subagent_line(OLD, "m_sub", 999)],
+            Some("toolu_1"),
+        );
+
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        subagent_scan(&dir, &cache);
+
+        assert_eq!(
+            UsageIndex::build(&cache, true).for_skill(&grilling()).unwrap().work,
+            999,
+            "the parent's own attributionSkill wins; the reconstructed `ship` never gets a look in",
+        );
+        let shipped = skill(SkillId::Personal { name: "ship".to_string() });
+        assert!(UsageIndex::build(&cache, true).for_skill(&shipped).is_none());
+    }
+
+    #[test]
+    fn an_unreadable_parent_is_not_cached_as_having_no_spawns() {
+        // Error is not absence (the distinction ADR 0024 draws for the prune).
+        // Two sub-agent files share one session; the parent is missing when the
+        // first is processed and present for the second. Caching the failed read
+        // as an empty spawn map would strip the second's credit too.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_session(
+            tmp.path(),
+            &[skill_invoke_line(OLD, "grilling"), spawn_line(OLD, "Task", "toolu_1", None)],
+            &[unattributed_subagent_line(OLD, "m_a", 10)],
+            Some("toolu_1"),
+        );
+        let session = "12d57136-d085-4c6a-8d3d-1c3f156c9ea2";
+        let subagents = dir.join(session).join("subagents");
+        write_transcript(&subagents, "agent-zzz.jsonl", &[unattributed_subagent_line(OLD, "m_b", 7)]);
+        fs::write(subagents.join("agent-zzz.meta.json"), json!({"toolUseId": "toolu_1"}).to_string()).unwrap();
+
+        // Drive the memo directly: an unreadable parent must leave no entry
+        // behind, so a later sibling still resolves once the parent is readable.
+        let mut memo: HashMap<PathBuf, SpawnMap> = HashMap::new();
+        let child_a = subagents.join("agent-abc123.jsonl");
+        let text = fs::read_to_string(&child_a).unwrap();
+        let parent = dir.join(format!("{session}.jsonl"));
+        let saved = fs::read_to_string(&parent).unwrap();
+        fs::remove_file(&parent).unwrap();
+
+        assert!(rollup_rows_for(&child_a, &text, &mut memo).is_none(), "an unreadable parent rolls up nothing");
+        assert!(memo.is_empty(), "the failed read must NOT be cached as an empty spawn map");
+
+        fs::write(&parent, saved).unwrap();
+        let rows = rollup_rows_for(&child_a, &text, &mut memo).expect("the retry resolves once the parent is back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].attribution_skill, "grilling");
+    }
+
+    #[test]
+    fn rollup_subagent_rows_gates_itself_on_the_build_version() {
+        // The gate is the roll-up's whole safety argument, so it lives in the
+        // pure function -- not only in the caller's fast path (which skips the
+        // sidecar and parent I/O). Pins it directly: `rollup_rows_for`'s early
+        // bail must never be the ONLY thing standing between a current build
+        // and a fabricated credit.
+        let current = unattributed_subagent_line(NEW, "m_sub", 999);
+        assert!(
+            rollup_subagent_rows(&current, "grilling", None).is_empty(),
+            "an above-gate file must roll up nothing even when handed a skill directly",
+        );
+        let old = unattributed_subagent_line(OLD, "m_sub", 999);
+        assert_eq!(rollup_subagent_rows(&old, "grilling", None).len(), 1, "a below-gate file still rolls up");
+    }
+
+    #[test]
+    fn a_current_build_subagent_with_no_attribution_credits_nothing() {
+        // AC2: the version gate. Same linkage, same attributed parent, but a
+        // current build -- where an absent child attribution means "no skill was
+        // active". Rolling up here would fabricate what the harness withheld.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_session(
+            tmp.path(),
+            &[spawn_line(NEW, "Agent", "toolu_1", Some("grilling"))],
+            &[unattributed_subagent_line(NEW, "m_sub", 999)],
+            Some("toolu_1"),
+        );
+
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        subagent_scan(&dir, &cache);
+
+        assert!(
+            UsageIndex::build(&cache, true).for_skill(&grilling()).is_none(),
+            "on a current build the roll-up must never fire, even with a linked, attributed parent",
+        );
+    }
+
+    #[test]
+    fn an_unattributed_spawning_parent_credits_nothing() {
+        // The parent turn itself has no skill (native or reconstructed): the
+        // linkage exists but resolves to nothing, so the credit is dropped.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_session(
+            tmp.path(),
+            &[human_line(OLD), spawn_line(OLD, "Task", "toolu_1", None)],
+            &[unattributed_subagent_line(OLD, "m_sub", 999)],
+            Some("toolu_1"),
+        );
+
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        subagent_scan(&dir, &cache);
+        assert_eq!(cache.totals(true).len(), 0, "an unattributed parent credits nothing, never a guess");
+    }
+
+    #[test]
+    fn a_subagent_with_no_meta_sidecar_credits_nothing() {
+        // A workflow sub-agent (no toolUseId): no linkage to walk, so no credit.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_session(
+            tmp.path(),
+            &[skill_invoke_line(OLD, "grilling"), spawn_line(OLD, "Task", "toolu_1", None)],
+            &[unattributed_subagent_line(OLD, "m_sub", 999)],
+            None,
+        );
+
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        subagent_scan(&dir, &cache);
+        assert_eq!(cache.totals(true).len(), 0, "no toolUseId linkage means no roll-up");
+    }
+
+    #[test]
+    fn a_subagent_record_with_its_own_attribution_is_not_rolled_up() {
+        // Native own-attribution stays authoritative: only records LACKING it
+        // are roll-up candidates, so the roll-up can never displace a native
+        // credit or double-count the same message.
+        let rows = rollup_subagent_rows(
+            &[
+                unattributed_subagent_line(OLD, "m_none", 10),
+                json!({
+                    "type": "assistant", "version": OLD, "isSidechain": true, "uuid": "m_own",
+                    "attributionSkill": "ship",
+                    "message": {"id": "m_own", "role": "assistant",
+                        "usage": {"input_tokens": 500, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+            "grilling",
+            None,
+        );
+        assert_eq!(rows.len(), 1, "only the unattributed record rolls up");
+        assert_eq!(rows[0].message_id, "m_none");
+        assert_eq!(rows[0].work, 10);
+    }
+
+    #[test]
+    fn rolled_up_rows_dedup_by_message_id_and_never_read_tool_use_result() {
+        // AC3. The same message.id repeated (a content-block split) counts once,
+        // and a toolUseResult total in the file is never the source of a sum.
+        let tmp = tempfile::tempdir().unwrap();
+        let tool_use_result =
+            json!({"type":"user","version":OLD,"toolUseResult":{"totalTokens":999_999,"usage":{"input_tokens":999_999,"output_tokens":0}}}).to_string();
+        let dir = write_session(
+            tmp.path(),
+            &[skill_invoke_line(OLD, "grilling"), spawn_line(OLD, "Task", "toolu_1", None)],
+            &[
+                unattributed_subagent_line(OLD, "m_sub", 50),
+                unattributed_subagent_line(OLD, "m_sub", 50), // same message.id
+                tool_use_result,
+            ],
+            Some("toolu_1"),
+        );
+
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        subagent_scan(&dir, &cache);
+        assert_eq!(
+            UsageIndex::build(&cache, true).for_skill(&grilling()).unwrap().work,
+            50,
+            "one message counts once (50), and the toolUseResult total (999,999) is never read",
+        );
+    }
+
+    #[test]
+    fn rolled_up_rows_are_subagent_tagged_so_the_include_toggle_gates_them() {
+        // AC4: a rolled-up credit is sub-agent work by provenance, so it stays
+        // out of the default headline and surfaces only with the toggle on.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_session(
+            tmp.path(),
+            &[skill_invoke_line(OLD, "grilling"), spawn_line(OLD, "Task", "toolu_1", None)],
+            &[unattributed_subagent_line(OLD, "m_sub", 999)],
+            Some("toolu_1"),
+        );
+
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        subagent_scan(&dir, &cache);
+
+        assert!(
+            UsageIndex::build(&cache, false).for_skill(&grilling()).is_none(),
+            "the default headline excludes rolled-up sub-agent work",
+        );
+        assert_eq!(UsageIndex::build(&cache, true).for_skill(&grilling()).unwrap().work, 999);
+    }
+
+    /// Exercises the roll-up against this machine's real `~/.claude` -- the
+    /// CLAUDE.md verification bar, which tempdir unit tests cannot meet. The
+    /// headline assertion is a NEGATIVE one, and it is the point of issue #19:
+    /// every real transcript is far above the gate, so the roll-up must fire on
+    /// zero files and leave every total byte-identical. A regression that
+    /// widened the gate would light this up immediately. Run by hand:
+    /// `cargo test --manifest-path src-tauri/Cargo.toml
+    /// adapters::claude_code::usage::tests::real_claude_home_subagent_rollup -- --ignored --exact --nocapture`
+    #[test]
+    #[ignore]
+    fn real_claude_home_subagent_rollup() {
+        use crate::adapters::claude_code::paths;
+
+        let projects = paths::projects_dir(&paths::default_claude_home());
+        let project_dirs: Vec<PathBuf> = fs::read_dir(&projects)
+            .expect("a real ~/.claude/projects")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        let (main_refs, dirs) = transcript_refs_by_recency(&project_dirs);
+        let sub_refs = subagent_transcript_refs(&project_dirs);
+
+        // How many real sub-agent files the gate actually admits, and how many
+        // carry the meta linkage at all -- the two populations issue #19 rests on.
+        let below_gate = sub_refs
+            .iter()
+            .filter(|r| fs::read_to_string(&r.path).map(|c| file_is_below_gate(&c)).unwrap_or(false))
+            .count();
+        let linked = sub_refs.iter().filter(|r| spawn_tool_use_id(&r.path).is_some()).count();
+        eprintln!("\n=== issue #19 against the real ~/.claude ===");
+        eprintln!("  project dirs      {}", project_dirs.len());
+        eprintln!("  main transcripts  {}", main_refs.len());
+        eprintln!("  sub-agent files   {}", sub_refs.len());
+        eprintln!("  ... with a meta toolUseId linkage  {linked}");
+        eprintln!("  ... below the attribution gate     {below_gate}");
+
+        // Totals with sub-agents included, computed through the full pass. The
+        // roll-up runs here; on a current-build corpus it must contribute
+        // nothing, so these are exactly the native-first totals of issue #13.
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        refresh_usage(&main_refs, &sub_refs, &dirs, &cache);
+        let rolled: Vec<UsageTotal> =
+            cache.totals(true).into_iter().filter(|t| t.reconstructed).collect();
+
+        assert_eq!(
+            below_gate, 0,
+            "no real transcript is pre-attribution, so the roll-up must be inert on this corpus",
+        );
+        assert!(
+            rolled.is_empty(),
+            "the roll-up fabricated {} reconstructed credit(s) on a current-build corpus: {:?}",
+            rolled.len(),
+            rolled.iter().map(|t| &t.attribution_skill).collect::<Vec<_>>(),
+        );
+        eprintln!("  reconstructed credits (must be 0)  {}", rolled.len());
+    }
+
+    #[test]
+    fn the_roll_up_never_runs_on_main_thread_transcripts() {
+        // The roll-up is the sub-agent pass's job alone. A main-thread file that
+        // happens to sit next to a meta sidecar must never be rolled up.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_session(
+            tmp.path(),
+            &[skill_invoke_line(OLD, "grilling"), spawn_line(OLD, "Task", "toolu_1", None)],
+            &[unattributed_subagent_line(OLD, "m_sub", 999)],
+            Some("toolu_1"),
+        );
+
+        let cache = SqliteUsageCache::open_in_memory().unwrap();
+        // Main-thread pass only: the parent's own turns reconstruct via #12,
+        // but the sub-agent file is never enumerated, so its 999 never lands.
+        let (main_refs, dirs) = transcript_refs_by_recency(std::slice::from_ref(&dir));
+        refresh_usage(&main_refs, &[], &dirs, &cache);
+
+        let work = UsageIndex::build(&cache, true).for_skill(&grilling()).map(|u| u.work).unwrap_or(0);
+        assert_eq!(work, 0, "the parent's spawn turn carries 0 work, and no sub-agent file was scanned");
     }
 }
