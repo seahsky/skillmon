@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposed.
+Proposed, and amended by ADR 0027 before any of it was implemented.
+ADR 0027 collapses this ADR's two mechanisms (quarantine, trash) into one reversible move-the-entry-out operation carrying a retention intent, scopes removal to the *entry* rather than the content it resolves to, and records a hazard this ADR does not: a managing tool silently reverting a quarantine.
+Read 0027 first; the parts of this ADR it does not touch (plugins via the `claude plugin` CLI, cross-device `rename(2)` fallback, `.in_use/<pid>`) still stand.
 
 ## Context
 
