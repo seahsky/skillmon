@@ -661,6 +661,17 @@ mod tests {
         .unwrap();
     }
 
+    /// A short kind label for the diagnostic tables the `#[ignore]`d real-home
+    /// tests print. Debug-printing the whole ref would wrap those lines.
+    fn skill_kind_label(id: &crate::domain::report::SkillRef) -> &'static str {
+        use crate::domain::report::SkillRef;
+        match id {
+            SkillRef::Personal { .. } => "personal",
+            SkillRef::Project { .. } => "project",
+            SkillRef::Plugin { .. } => "plugin",
+        }
+    }
+
     /// A directly-ingestable attributed-usage row for the scan-level e2e tests,
     /// so a test can seed the persisted store with a chosen timestamp without
     /// hand-writing a transcript. `message_id` folds in every field so distinct
@@ -926,7 +937,7 @@ mod tests {
 
     #[test]
     fn scan_all_bundles_every_discovered_skill_with_its_footprint() {
-        use crate::domain::report::SkillKind;
+        use crate::domain::report::SkillRef;
 
         let tmp = tempfile::tempdir().unwrap();
         let claude_home = tmp.path().join(".claude");
@@ -937,12 +948,62 @@ mod tests {
         let report = adapter.scan_all(false);
 
         assert_eq!(report.skills.len(), 2);
-        assert!(report.skills.iter().all(|s| s.kind == SkillKind::Personal));
-        let names: Vec<&str> = report.skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(report.skills.iter().all(|s| matches!(s.id, SkillRef::Personal { .. })));
+        let names: Vec<&str> = report.skills.iter().map(|s| s.id.name()).collect();
         assert!(names.contains(&"alpha"));
         assert!(names.contains(&"beta"));
         // No key configured, so every layer is the estimate tier.
         assert!(report.skills.iter().all(|s| !s.always_on.exact && !s.on_invoke.exact));
+    }
+
+    /// The end-to-end gate for issue #27: a manager root computed by discovery
+    /// has to reach the panel, over real symlinks in both shapes a managed skill
+    /// takes on disk (ADR 0026, issue #25). Reproduced here rather than left to
+    /// the `#[ignore]`d real-home run, which only covers whichever shapes that
+    /// machine happens to have.
+    #[test]
+    #[cfg(unix)]
+    fn scan_all_carries_the_manager_root_of_both_managed_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        let skills = claude_home.join("skills");
+        fs::create_dir_all(&skills).unwrap();
+
+        // Unmanaged: a real directory holding a real SKILL.md.
+        write_skill(&skills.join("vercel-react"), "vercel-react");
+
+        // gstack's shape: a real directory whose SKILL.md links into a checkout.
+        let checkout = tmp.path().join("gstack-checkout").join("skills").join("ship");
+        write_skill(&checkout, "ship");
+        fs::create_dir_all(skills.join("ship")).unwrap();
+        std::os::unix::fs::symlink(checkout.join("SKILL.md"), skills.join("ship").join("SKILL.md")).unwrap();
+
+        // `.agents`' shape: the entry directory is itself the symlink.
+        let agents = tmp.path().join("agents-home").join("skills").join("tdd");
+        write_skill(&agents, "tdd");
+        std::os::unix::fs::symlink(&agents, skills.join("tdd")).unwrap();
+
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        let report = adapter.scan_all(false);
+
+        let root_of = |name: &str| {
+            report
+                .skills
+                .iter()
+                .find(|s| s.id.name() == name)
+                .unwrap_or_else(|| panic!("{name} was not discovered"))
+                .manager_root
+                .clone()
+        };
+
+        // canonicalize: the tempdir path itself may run through a symlink (on
+        // macOS /tmp is one), and the manager root is resolved, so the expected
+        // value has to be resolved too.
+        let expected = |p: &std::path::Path| Some(fs::canonicalize(p).unwrap().display().to_string());
+
+        assert_eq!(root_of("ship"), expected(&checkout.parent().unwrap().to_path_buf()));
+        assert_eq!(root_of("tdd"), expected(&agents.parent().unwrap().to_path_buf()));
+        assert_eq!(root_of("vercel-react"), None, "a skill owning its own content has no manager root");
     }
 
     #[test]
@@ -978,7 +1039,7 @@ mod tests {
         let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
         let report = adapter.scan_all(false);
 
-        let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        let grilling = report.skills.iter().find(|s| s.id.name() == "grilling").unwrap();
         assert_eq!(
             grilling.always_on_text,
             AlwaysOnTextKind::Native,
@@ -1048,7 +1109,7 @@ mod tests {
         let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
 
         let report = adapter.scan_all(false);
-        let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        let grilling = report.skills.iter().find(|s| s.id.name() == "grilling").unwrap();
         assert_eq!(grilling.usage.unwrap().work, 10, "the default scan never reads the sub-agent file");
     }
 
@@ -1059,7 +1120,7 @@ mod tests {
         let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
 
         let report = adapter.scan_all(true);
-        let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        let grilling = report.skills.iter().find(|s| s.id.name() == "grilling").unwrap();
         assert_eq!(grilling.usage.unwrap().work, 1009, "the toggle folds the sub-agent's own 999 into the main 10");
     }
 
@@ -1095,7 +1156,7 @@ mod tests {
         let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
         let report = adapter.scan_all(true);
 
-        let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        let grilling = report.skills.iter().find(|s| s.id.name() == "grilling").unwrap();
         assert_eq!(
             grilling.always_on_text,
             AlwaysOnTextKind::Reconstructed,
@@ -1137,7 +1198,7 @@ mod tests {
         let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
         let report = adapter.scan_all(false);
 
-        let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        let grilling = report.skills.iter().find(|s| s.id.name() == "grilling").unwrap();
         let usage = grilling.usage.expect("grilling should have reconstructed usage");
         assert_eq!(usage.work, 40, "the post-invoke turn (30 + 10) is credited to grilling");
         assert_eq!(usage.attribution_source, AttributionSource::Reconstructed);
@@ -1218,12 +1279,12 @@ mod tests {
         ]);
 
         let all = adapter.scan(&ScanParams { now_millis: FIXED_NOW, usage_window: UsageWindow::AllTime, include_subagents: false });
-        let g_all = all.report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        let g_all = all.report.skills.iter().find(|s| s.id.name() == "grilling").unwrap();
         assert_eq!(g_all.usage.unwrap().work, 140, "all-time sums both records");
         assert_eq!(all.report.usage_window_hours, None);
 
         let win = adapter.scan(&ScanParams { now_millis: FIXED_NOW, usage_window: UsageWindow::Rolling { hours: 24 }, include_subagents: false });
-        let g_win = win.report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        let g_win = win.report.skills.iter().find(|s| s.id.name() == "grilling").unwrap();
         assert_eq!(g_win.usage.unwrap().work, 40, "the 24h window shows only the recent work");
         assert_eq!(win.report.usage_window_hours, Some(24));
     }
@@ -1405,6 +1466,42 @@ mod tests {
                 "it is still slash-invokable, so on-invoke is untouched"
             );
         }
+
+        // Issue #27: the same facts have to survive the trip to the panel. The
+        // gap this closes is that they did not -- discovery computed a manager
+        // root and then dropped it at the DTO, leaving the source column (#30)
+        // and removal (#31) with nothing to read.
+        let mut managed = 0usize;
+        let mut mismatched: Vec<(String, String)> = Vec::new();
+        for skill in &discovery.skills {
+            let report = SkillReport::from_parts(skill, &adapter.compute_footprint(skill), None);
+
+            assert_eq!(
+                SkillId::from(report.id.clone()),
+                skill.id,
+                "{}: the ref the panel holds must resolve back to the skill it names",
+                skill.directory_name()
+            );
+            assert_eq!(
+                report.manager_root,
+                skill.manager_root.as_ref().map(|p| p.display().to_string()),
+                "{}: the manager root must reach the panel intact",
+                skill.directory_name()
+            );
+
+            if report.manager_root.is_some() {
+                managed += 1;
+            }
+            if report.name_mismatch {
+                mismatched.push((report.id.name().to_string(), report.declared_name.clone()));
+            }
+        }
+        eprintln!("\n=== what crosses to the panel (issue #27) ===");
+        eprintln!("  {managed} of {} rows carry a manager root", discovery.skills.len());
+        eprintln!("  {} rows declare a name other than their directory:", mismatched.len());
+        for (dir, declared) in &mismatched {
+            eprintln!("       {dir:<28} declares {declared}");
+        }
         eprintln!();
     }
 
@@ -1484,9 +1581,9 @@ mod tests {
 
         for skill in resolved.skills.iter().take(10) {
             eprintln!(
-                "  [{:?}] {:<28} always_on={:>4} (exact={}, text={:?})  on_invoke={:>5}  on_demand={:?}  usage={:?}",
-                skill.kind,
-                skill.name,
+                "  [{:<8}] {:<28} always_on={:>4} (exact={}, text={:?})  on_invoke={:>5}  on_demand={:?}  usage={:?}",
+                skill_kind_label(&skill.id),
+                skill.id.name(),
                 skill.always_on.tokens,
                 skill.always_on.exact,
                 skill.always_on_text,
@@ -1614,7 +1711,7 @@ mod tests {
         );
 
         let report = adapter.scan_all(false);
-        let grilling = report.skills.iter().find(|s| s.name == "grilling").unwrap();
+        let grilling = report.skills.iter().find(|s| s.id.name() == "grilling").unwrap();
 
         assert!(seen_contains(&seen, BODY_SENTINEL), "the body (on-invoke) must be tokenized");
         assert!(
@@ -1637,7 +1734,7 @@ mod tests {
 
         let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
         let report = adapter.scan_all(false);
-        let skill = report.skills.iter().find(|s| s.name == "no-refs").unwrap();
+        let skill = report.skills.iter().find(|s| s.id.name() == "no-refs").unwrap();
 
         let on_demand = skill.on_demand.expect("an empty bundle resolves immediately, never pending");
         assert_eq!(on_demand.tokens, 0);
@@ -1654,7 +1751,7 @@ mod tests {
 
         let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
         let report = adapter.scan_all(false);
-        let skill = report.skills.iter().find(|s| s.name == "has-refs").unwrap();
+        let skill = report.skills.iter().find(|s| s.id.name() == "has-refs").unwrap();
 
         assert!(skill.on_demand.is_none(), "an uncomputed non-empty bundle is pending, never Some(0)");
     }
@@ -1756,7 +1853,7 @@ mod tests {
         );
 
         let warm = adapter2.scan_all(false);
-        let grilling = warm.skills.iter().find(|s| s.name == "grilling").unwrap();
+        let grilling = warm.skills.iter().find(|s| s.id.name() == "grilling").unwrap();
         let on_demand = grilling.on_demand.expect("warm rescan resolves on-demand from the memo");
 
         assert_eq!(on_demand.tokens, eager.tokens, "served ceiling equals the eager compute");

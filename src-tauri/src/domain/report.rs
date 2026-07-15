@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use super::footprint::{AlwaysOnTextKind, Footprint, TokenSource};
@@ -20,14 +22,88 @@ impl From<crate::domain::footprint::LayerCount> for LayerReport {
     }
 }
 
-/// The kind of skill, driving the UI's grouping and the identity fields that
-/// are populated below.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SkillKind {
-    Personal,
-    Project,
-    Plugin,
+/// One skill's identity at the IPC boundary: the domain's `SkillId` (CONTEXT.md
+/// "Skill identity"), mirrored here rather than derived on `SkillId` itself so
+/// the domain type stays free of the wire format, like `LayerReport` above.
+///
+/// It replaces the flat `(kind, name, repo_path, marketplace, plugin)` tuple the
+/// panel used to reassemble -- all five were projections of this one value -- so
+/// a row carries its identity as one thing it can hand back. Tagging it keeps a
+/// plugin row's `marketplace` a `string` rather than a nullable the other two
+/// kinds leave empty.
+///
+/// **A ref names a row; it is never a path to act on.** That is a narrower claim
+/// than issue #27's framing, and deliberately so: a ref does not close the
+/// window between the scan the panel rendered and the mutation that follows, and
+/// no id can -- the filesystem moves underneath either one. What it buys is that
+/// a stale ref *fails* instead of misfiring. A mutation resolves it against a
+/// fresh scan and acts on the `DiscoveredSkill` it finds (ADR 0027), so
+/// `repo_path` is part of the key and never an operand: a ref that no longer
+/// matches aims no delete at all, rather than aiming one at the wrong directory.
+///
+/// The round trip is lossless. Every component reaches the domain as UTF-8
+/// already -- discovery skips a skill whose directory name is not valid UTF-8
+/// (`discovery/scan.rs`), `marketplace`/`plugin` are JSON object keys, and
+/// `repo_path` is built from a transcript's JSON `cwd` string (ADR 0014) -- so
+/// `display()` here has nothing to replace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum SkillRef {
+    Personal { name: String },
+    Project { repo_path: String, name: String },
+    Plugin { marketplace: String, plugin: String, name: String },
+}
+
+impl SkillRef {
+    /// The directory name -- the identity Claude Code renders and the user
+    /// recognizes, not the frontmatter `name:` (ADR 0016). Every variant carries
+    /// one, so callers need no match on the kind.
+    ///
+    /// Rust-side this is exercised only by the test suite, since the panel reads
+    /// the field straight off the JSON; `allow(dead_code)` keeps it without
+    /// masking a real regression, as on `HarnessAdapter`.
+    #[allow(dead_code)]
+    pub fn name(&self) -> &str {
+        match self {
+            SkillRef::Personal { name } => name,
+            SkillRef::Project { name, .. } => name,
+            SkillRef::Plugin { name, .. } => name,
+        }
+    }
+}
+
+impl From<&SkillId> for SkillRef {
+    fn from(id: &SkillId) -> Self {
+        match id {
+            SkillId::Personal { name } => SkillRef::Personal { name: name.clone() },
+            SkillId::Project { repo_path, name } => {
+                SkillRef::Project { repo_path: repo_path.display().to_string(), name: name.clone() }
+            }
+            SkillId::Plugin { marketplace, plugin, name } => SkillRef::Plugin {
+                marketplace: marketplace.clone(),
+                plugin: plugin.clone(),
+                name: name.clone(),
+            },
+        }
+    }
+}
+
+/// The way back in, for the mutation commands that take a ref as a parameter
+/// (issue #31). Infallible: a ref carries no state the domain has to validate,
+/// and whether it names a skill that still exists is a lookup against a fresh
+/// scan, not a parse.
+impl From<SkillRef> for SkillId {
+    fn from(reference: SkillRef) -> Self {
+        match reference {
+            SkillRef::Personal { name } => SkillId::Personal { name },
+            SkillRef::Project { repo_path, name } => {
+                SkillId::Project { repo_path: PathBuf::from(repo_path), name }
+            }
+            SkillRef::Plugin { marketplace, plugin, name } => {
+                SkillId::Plugin { marketplace, plugin, name }
+            }
+        }
+    }
 }
 
 /// How a usage figure was attributed (ADR 0005). `Native` trusts Claude Code's
@@ -68,10 +144,10 @@ pub struct UsageReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillReport {
-    pub kind: SkillKind,
-    /// The directory name -- the identity Claude Code actually renders and
-    /// the user recognizes, not the frontmatter `name:` (ADR 0016).
-    pub name: String,
+    /// The row's identity, and the handle the panel hands back to name it in a
+    /// mutation (issue #31). Carries the directory name, and the repo or
+    /// marketplace/plugin that qualifies it.
+    pub id: SkillRef,
     pub live: bool,
     pub always_on: LayerReport,
     /// Where the always-on text came from (ADR 0016). Only the always-on layer
@@ -90,37 +166,39 @@ pub struct SkillReport {
     /// "attributed zero," so a zero figure is never fabricated for a skill no
     /// session used.
     pub usage: Option<UsageReport>,
-    /// Populated for `Project` skills: the repo the skill belongs to.
-    pub repo_path: Option<String>,
-    /// Populated for `Plugin` skills: the owning marketplace and plugin.
-    pub marketplace: Option<String>,
-    pub plugin: Option<String>,
+    /// The frontmatter `name:` -- the label the model is shown. When it diverges
+    /// from the directory name in `id`, the panel surfaces both rather than
+    /// silently picking one (CONTEXT.md "Declared name"), so both cross.
+    pub declared_name: String,
+    /// Whether `declared_name` diverges from the directory name. Computed here
+    /// rather than left to the panel because what counts as divergence is the
+    /// domain's rule, not a rendering one.
+    pub name_mismatch: bool,
+    /// The directory owning this skill's real content, or `None` when the skill
+    /// owns it itself (ADR 0026). A path, deliberately: no basename rule turns
+    /// one into a product name (`gstack` reads well, `skills` -- from
+    /// `~/.agents/skills` -- says nothing), and skillmon reads no managing
+    /// tool's manifest to do better.
+    ///
+    /// `None` means unmanaged, which is **not** the same as safe to remove: the
+    /// row other skills resolve into is itself unmanaged. That question needs
+    /// the dependent count, which lands with the column it feeds (issue #30).
+    pub manager_root: Option<String>,
 }
 
 impl SkillReport {
     pub fn from_parts(skill: &DiscoveredSkill, footprint: &Footprint, usage: Option<UsageReport>) -> Self {
-        let (kind, repo_path, marketplace, plugin) = match &skill.id {
-            SkillId::Personal { .. } => (SkillKind::Personal, None, None, None),
-            SkillId::Project { repo_path, .. } => {
-                (SkillKind::Project, Some(repo_path.display().to_string()), None, None)
-            }
-            SkillId::Plugin { marketplace, plugin, .. } => {
-                (SkillKind::Plugin, None, Some(marketplace.clone()), Some(plugin.clone()))
-            }
-        };
-
         SkillReport {
-            kind,
-            name: skill.directory_name().to_string(),
+            id: SkillRef::from(&skill.id),
             live: skill.live,
             always_on: footprint.always_on.count.into(),
             always_on_text: footprint.always_on.text_kind,
             on_invoke: footprint.on_invoke.into(),
             on_demand: footprint.on_demand.map(Into::into),
             usage,
-            repo_path,
-            marketplace,
-            plugin,
+            declared_name: skill.frontmatter.declared_name.clone(),
+            name_mismatch: skill.name_mismatch(),
+            manager_root: skill.manager_root.as_ref().map(|p| p.display().to_string()),
         }
     }
 }
@@ -169,12 +247,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn skill_with_id(id: SkillId) -> DiscoveredSkill {
+        let declared_name = id.name().to_string();
         DiscoveredSkill {
             id,
             dir_path: PathBuf::from("/tmp/x"),
             skill_md_path: PathBuf::from("/tmp/x/SKILL.md"),
             frontmatter: Frontmatter {
-                declared_name: "x".to_string(),
+                // Matches the directory name, so the default fixture is an
+                // ordinary skill and only the mismatch tests opt into divergence.
+                declared_name,
                 description: "d".to_string(),
                 raw_block: "name: x\ndescription: d".to_string(),
                 model_invocable: true,
@@ -198,18 +279,15 @@ mod tests {
     }
 
     #[test]
-    fn personal_skill_report_leaves_repo_and_plugin_identity_empty() {
+    fn personal_skill_report_carries_only_a_name_as_its_identity() {
         let skill = skill_with_id(SkillId::Personal { name: "grilling".to_string() });
         let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
 
-        assert_eq!(report.kind, SkillKind::Personal);
-        assert_eq!(report.name, "grilling");
+        assert_eq!(report.id, SkillRef::Personal { name: "grilling".to_string() });
+        assert_eq!(report.id.name(), "grilling");
         assert!(report.always_on.exact);
         assert_eq!(report.always_on_text, AlwaysOnTextKind::Native);
         assert!(!report.on_invoke.exact);
-        assert_eq!(report.repo_path, None);
-        assert_eq!(report.marketplace, None);
-        assert_eq!(report.plugin, None);
     }
 
     #[test]
@@ -221,10 +299,14 @@ mod tests {
         });
         let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
 
-        assert_eq!(report.kind, SkillKind::Plugin);
-        assert_eq!(report.marketplace.as_deref(), Some("official"));
-        assert_eq!(report.plugin.as_deref(), Some("superpowers"));
-        assert_eq!(report.repo_path, None);
+        assert_eq!(
+            report.id,
+            SkillRef::Plugin {
+                marketplace: "official".to_string(),
+                plugin: "superpowers".to_string(),
+                name: "brainstorming".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -235,8 +317,130 @@ mod tests {
         });
         let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
 
-        assert_eq!(report.kind, SkillKind::Project);
-        assert_eq!(report.repo_path.as_deref(), Some("/home/me/repo"));
+        assert_eq!(
+            report.id,
+            SkillRef::Project { repo_path: "/home/me/repo".to_string(), name: "deploy".to_string() }
+        );
+    }
+
+    /// The identity contract issue #27 turns on: a ref the panel holds and hands
+    /// back must name the same skill it was minted from. A mutation resolves the
+    /// ref against a fresh scan by comparing `SkillId`s (ADR 0027), so anything
+    /// lost here would silently fail to match -- or, worse, match a sibling.
+    #[test]
+    fn a_skill_ref_round_trips_through_json_back_to_the_same_skill_id() {
+        let ids = [
+            SkillId::Personal { name: "grilling".to_string() },
+            SkillId::Project { repo_path: PathBuf::from("/home/me/repo"), name: "deploy".to_string() },
+            SkillId::Plugin {
+                marketplace: "official".to_string(),
+                plugin: "superpowers".to_string(),
+                name: "brainstorming".to_string(),
+            },
+        ];
+
+        for id in ids {
+            let json = serde_json::to_string(&SkillRef::from(&id)).unwrap();
+            let parsed: SkillRef = serde_json::from_str(&json).unwrap();
+            assert_eq!(SkillId::from(parsed), id, "ref did not round-trip: {json}");
+        }
+    }
+
+    /// Two skills sharing a directory name are distinct rows, so the qualifying
+    /// fields have to be part of the wire identity, not just the Rust one.
+    #[test]
+    fn same_named_skills_from_different_marketplaces_are_distinct_refs() {
+        let a = SkillRef::from(&SkillId::Plugin {
+            marketplace: "official".to_string(),
+            plugin: "superpowers".to_string(),
+            name: "brainstorming".to_string(),
+        });
+        let b = SkillRef::from(&SkillId::Plugin {
+            marketplace: "community".to_string(),
+            plugin: "superpowers".to_string(),
+            name: "brainstorming".to_string(),
+        });
+
+        assert_ne!(a, b);
+        assert_ne!(serde_json::to_value(&a).unwrap(), serde_json::to_value(&b).unwrap());
+    }
+
+    #[test]
+    fn skill_ref_serializes_tagged_and_camel_cased() {
+        let personal = SkillRef::from(&SkillId::Personal { name: "grilling".to_string() });
+        let json = serde_json::to_value(&personal).unwrap();
+        assert_eq!(json["kind"], "personal");
+        assert_eq!(json["name"], "grilling");
+        // A personal row carries no marketplace key at all, rather than a null
+        // the panel would have to narrow away.
+        assert!(json.get("marketplace").is_none());
+
+        let project = SkillRef::from(&SkillId::Project {
+            repo_path: PathBuf::from("/home/me/repo"),
+            name: "deploy".to_string(),
+        });
+        let json = serde_json::to_value(&project).unwrap();
+        assert_eq!(json["kind"], "project");
+        assert_eq!(json["repoPath"], "/home/me/repo");
+
+        let plugin = SkillRef::from(&SkillId::Plugin {
+            marketplace: "official".to_string(),
+            plugin: "superpowers".to_string(),
+            name: "brainstorming".to_string(),
+        });
+        let json = serde_json::to_value(&plugin).unwrap();
+        assert_eq!(json["kind"], "plugin");
+        assert_eq!(json["marketplace"], "official");
+        assert_eq!(json["plugin"], "superpowers");
+    }
+
+    #[test]
+    fn manager_root_crosses_as_a_path_and_is_null_when_unmanaged() {
+        let unmanaged = skill_with_id(SkillId::Personal { name: "vercel-react".to_string() });
+        let report = SkillReport::from_parts(&unmanaged, &sample_footprint(), None);
+        assert_eq!(report.manager_root, None);
+        assert_eq!(serde_json::to_value(&report).unwrap()["managerRoot"], serde_json::Value::Null);
+
+        // gstack's dominant shape: a real dir whose SKILL.md links into the
+        // checkout (issue #25). The panel shows the path, never an invented
+        // product name (ADR 0026).
+        let managed = DiscoveredSkill {
+            manager_root: Some(PathBuf::from("/home/me/.claude/skills/gstack")),
+            ..skill_with_id(SkillId::Personal { name: "ship".to_string() })
+        };
+        let report = SkillReport::from_parts(&managed, &sample_footprint(), None);
+        assert_eq!(report.manager_root.as_deref(), Some("/home/me/.claude/skills/gstack"));
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["managerRoot"],
+            "/home/me/.claude/skills/gstack"
+        );
+    }
+
+    /// The real divergence on the reference machine: a directory named
+    /// `connect-chrome` whose frontmatter declares `open-gstack-browser`. Both
+    /// names cross so the panel can show both (CONTEXT.md "Declared name").
+    #[test]
+    fn a_declared_name_that_diverges_from_the_directory_crosses_flagged() {
+        let mut skill = skill_with_id(SkillId::Personal { name: "connect-chrome".to_string() });
+        skill.frontmatter.declared_name = "open-gstack-browser".to_string();
+        let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
+
+        assert_eq!(report.id.name(), "connect-chrome");
+        assert_eq!(report.declared_name, "open-gstack-browser");
+        assert!(report.name_mismatch);
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["declaredName"], "open-gstack-browser");
+        assert_eq!(json["nameMismatch"], true);
+    }
+
+    #[test]
+    fn an_agreeing_declared_name_is_not_flagged_as_a_mismatch() {
+        let skill = skill_with_id(SkillId::Personal { name: "grilling".to_string() });
+        let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
+
+        assert_eq!(report.declared_name, "grilling");
+        assert!(!report.name_mismatch);
     }
 
     #[test]

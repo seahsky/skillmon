@@ -9,7 +9,18 @@ export interface LayerReport {
   exact: boolean;
 }
 
-export type SkillKind = "personal" | "project" | "plugin";
+/**
+ * A skill's identity, mirroring the Rust `SkillRef` (serde-tagged on `kind`).
+ * The panel's handle on a row: it holds this verbatim and hands it back to name
+ * a row in a mutation, rather than reassembling a tuple the backend re-parses.
+ *
+ * A discriminated union, not a bag of nullables, so asking a personal skill for
+ * its `marketplace` is a type error rather than a `null` to narrow away.
+ */
+export type SkillRef =
+  | { kind: "personal"; name: string }
+  | { kind: "project"; repoPath: string; name: string }
+  | { kind: "plugin"; marketplace: string; plugin: string; name: string };
 
 /** Mirrors the Rust `AlwaysOnTextKind`: where a skill's always-on text came
  * from (ADR 0016). `native` is the literal transcript-rendered line;
@@ -38,8 +49,10 @@ export interface UsageReport {
 
 /** One row the panel renders. Mirrors `SkillReport` (serde camelCase). */
 export interface SkillReport {
-  kind: SkillKind;
-  name: string;
+  /** The row's identity, and the handle a mutation names it by (issue #31).
+   * Carries the directory name plus whatever qualifies it: a repo, or a
+   * marketplace and plugin. */
+  id: SkillRef;
   live: boolean;
   alwaysOn: LayerReport;
   /** Where the always-on text came from (ADR 0016). `notListed` means the skill
@@ -53,9 +66,19 @@ export interface SkillReport {
   /** Attributed session usage, or `null` when no session touched this skill
    * (never a fabricated zero). Issue #5. */
   usage: UsageReport | null;
-  repoPath: string | null;
-  marketplace: string | null;
-  plugin: string | null;
+  /** The frontmatter `name:`. Shown alongside the directory name in `id` when
+   * the two diverge, rather than the panel silently picking one. */
+  declaredName: string;
+  /** Whether `declaredName` diverges from the directory name. Decided by the
+   * Rust domain, which owns what counts as divergence. */
+  nameMismatch: boolean;
+  /** The directory owning this skill's real content, or `null` when the skill
+   * owns it itself (ADR 0026). A path, shown as one: no basename rule turns it
+   * into a product name.
+   *
+   * `null` means unmanaged, NOT "safe to remove" — the row other skills resolve
+   * into is itself unmanaged. That needs the dependent count (issue #30). */
+  managerRoot: string | null;
 }
 
 /** Mirrors `ScanReport`. */
@@ -122,42 +145,66 @@ export function sortSkills(skills: readonly SkillReport[], sort: SortState = DEF
   const dir = direction === "asc" ? 1 : -1;
 
   if (column === "name") {
-    return [...skills].sort((a, b) => dir * a.name.localeCompare(b.name));
+    return [...skills].sort((a, b) => dir * a.id.name.localeCompare(b.id.name));
   }
 
   const value = NUMERIC_VALUE[column];
   return [...skills].sort((a, b) => {
     const av = value(a);
     const bv = value(b);
-    if (av === null && bv === null) return a.name.localeCompare(b.name);
+    if (av === null && bv === null) return a.id.name.localeCompare(b.id.name);
     if (av === null) return 1; // a is unknown → after b
     if (bv === null) return -1; // b is unknown → after a
     const byValue = dir * (av - bv);
-    return byValue !== 0 ? byValue : a.name.localeCompare(b.name);
+    return byValue !== 0 ? byValue : a.id.name.localeCompare(b.id.name);
   });
 }
 
 /**
- * A stable identity for a skill, used as the `{#each}` key. Follows the
- * domain identity in CONTEXT.md: a plugin skill is `Plugin(marketplace, plugin,
- * name)`, so `marketplace` must be part of the key — two same-named plugins from
- * different marketplaces are distinct rows.
+ * A skill's identity flattened to a string, for the `{#each}` key — Svelte keys
+ * must be primitives, so `skill.id` cannot be handed over as the object it is.
+ * Anything that is not a keyed-each should take `skill.id` itself.
+ *
+ * One case per `SkillRef` variant, mirroring the domain identity in CONTEXT.md:
+ * a plugin skill is `Plugin(marketplace, plugin, name)`, so `marketplace` is
+ * part of the key — two same-named plugins from different marketplaces are
+ * distinct rows.
+ *
+ * Joined on a NUL — written as an escape, never pasted in raw — which cannot
+ * occur in a directory name or a path, so no two identities collide by
+ * concatenation.
  */
 export function skillKey(skill: SkillReport): string {
-  return [
-    skill.kind,
-    skill.marketplace ?? "",
-    skill.plugin ?? "",
-    skill.repoPath ?? "",
-    skill.name,
-  ].join("\u0000");
+  const id = skill.id;
+  switch (id.kind) {
+    case "personal":
+      return ["personal", id.name].join("\u0000");
+    case "project":
+      return ["project", id.repoPath, id.name].join("\u0000");
+    case "plugin":
+      return ["plugin", id.marketplace, id.plugin, id.name].join("\u0000");
+  }
+}
+
+/**
+ * The hover text for a row's name. A skill whose frontmatter `name:` diverges
+ * from its directory name is known to the user by either, so both are shown
+ * rather than the panel silently picking one (CONTEXT.md "Declared name"). The
+ * reference machine has a `connect-chrome` directory declaring
+ * `open-gstack-browser`.
+ *
+ * The row still reads by directory name: that is the filesystem-stable identity
+ * Claude Code renders, and what a mutation operates on (ADR 0016).
+ */
+export function skillNameTitle(skill: SkillReport): string {
+  return skill.nameMismatch ? `${skill.id.name} · declared as "${skill.declaredName}"` : skill.id.name;
 }
 
 /** The always-co-resident skills — personal + plugin — that make up the main
  * list. Project skills are split out into per-repo sections (DESIGN.md UX #5),
  * so they are excluded here. Order is not guaranteed; callers sort. */
 export function mainSkills(skills: readonly SkillReport[]): SkillReport[] {
-  return skills.filter((s) => s.kind !== "project");
+  return skills.filter((s) => s.id.kind !== "project");
 }
 
 /** One header-and-rows cluster for the opt-in group-by-plugin view (DESIGN.md
@@ -179,13 +226,14 @@ export interface SkillGroup {
 export function groupByPlugin(skills: readonly SkillReport[], sort: SortState = DEFAULT_SORT): SkillGroup[] {
   const groups = new Map<string, SkillGroup>();
   for (const skill of sortSkills(mainSkills(skills), sort)) {
-    const key = skill.kind === "plugin" ? `plugin:${skill.marketplace ?? ""}:${skill.plugin ?? ""}` : "personal";
+    const id = skill.id;
+    const key = id.kind === "plugin" ? `plugin:${id.marketplace}:${id.plugin}` : "personal";
     let group = groups.get(key);
     if (!group) {
       group = {
         key,
-        label: skill.kind === "plugin" ? (skill.plugin ?? "plugin") : "Personal",
-        kind: skill.kind === "plugin" ? "plugin" : "personal",
+        label: id.kind === "plugin" ? id.plugin : "Personal",
+        kind: id.kind === "plugin" ? "plugin" : "personal",
         skills: [],
       };
       groups.set(key, group);
@@ -217,10 +265,10 @@ export function groupProjectsByRepo(
 ): RepoSection[] {
   const byRepo = new Map<string, SkillReport[]>();
   for (const skill of skills) {
-    if (skill.kind !== "project" || !skill.repoPath) continue;
-    const list = byRepo.get(skill.repoPath) ?? [];
+    if (skill.id.kind !== "project") continue;
+    const list = byRepo.get(skill.id.repoPath) ?? [];
     list.push(skill);
-    byRepo.set(skill.repoPath, list);
+    byRepo.set(skill.id.repoPath, list);
   }
   return [...byRepo.entries()]
     .map(([repoPath, list]) => ({
@@ -234,13 +282,13 @@ export function groupProjectsByRepo(
 
 /** Whether a skill is co-resident in context right now (DESIGN.md UX #5). */
 function isCoResident(skill: SkillReport, activeRepoPath: string | null): boolean {
-  switch (skill.kind) {
+  switch (skill.id.kind) {
     case "personal":
       return true; // personal skills have no enable/disable; always co-resident
     case "plugin":
       return skill.live; // only plugins enabled in an applicable scope
     case "project":
-      return skill.repoPath === activeRepoPath; // only the active repo's
+      return skill.id.repoPath === activeRepoPath; // only the active repo's
   }
 }
 
