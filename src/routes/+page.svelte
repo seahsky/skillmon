@@ -233,8 +233,13 @@
   }
 
   function alwaysOnTitle(skill: SkillReport): string {
+    // A never-listed skill is not an imprecise count but the absence of one, so
+    // it never inherits the exact/estimate framing (issue #24).
+    if (skill.alwaysOnText === "notListed") {
+      return "Not in the skill listing (disable-model-invocation), so it costs no always-on tokens. Still invokable as a slash command";
+    }
     const base = layerTitle(skill.alwaysOn);
-    return skill.alwaysOnNative
+    return skill.alwaysOnText === "native"
       ? base
       : `${base}. Always-on text reconstructed from frontmatter; no session has listed this skill yet`;
   }
@@ -311,7 +316,13 @@
       {/if}
     </div>
 
-    {@render layerCell(skill.alwaysOn, alwaysOnTitle(skill), !skill.alwaysOnNative)}
+    {#if skill.alwaysOnText === "notListed"}
+      <!-- A real 0, not the "…" a pending ceiling gets nor an em dash: this
+           cost is known to be nothing, not unknown (issue #24). -->
+      <div class="col num not-listed" role="cell" title={alwaysOnTitle(skill)}>0</div>
+    {:else}
+      {@render layerCell(skill.alwaysOn, alwaysOnTitle(skill), skill.alwaysOnText === "reconstructed")}
+    {/if}
     {@render layerCell(skill.onInvoke, layerTitle(skill.onInvoke))}
     {#if skill.onDemand === null}
       <div class="col num pending" role="cell" title={onDemandTitle(null)}>…</div>
@@ -921,6 +932,12 @@
   .col.num.reconstructed {
     text-decoration: underline dotted;
     text-underline-offset: 3px;
+  }
+  /* Never listed to the model, so there is no always-on line to count (issue
+     #24). Muted to set it apart from a counted figure, but it carries neither
+     the estimate nor the reconstructed mark: the zero is certain. */
+  .col.num.not-listed {
+    color: var(--faint);
   }
 
   /* Per-repo collapsed project sections (DESIGN.md UX #5). */

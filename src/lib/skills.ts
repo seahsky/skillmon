@@ -11,6 +11,14 @@ export interface LayerReport {
 
 export type SkillKind = "personal" | "project" | "plugin";
 
+/** Mirrors the Rust `AlwaysOnTextKind`: where a skill's always-on text came
+ * from (ADR 0016). `native` is the literal transcript-rendered line;
+ * `reconstructed` is built from frontmatter because no session has listed the
+ * skill yet; `notListed` means `disable-model-invocation` keeps it out of the
+ * listing entirely, so its always-on cost is a certain zero, not a guess
+ * (issue #24). Three states, so it deliberately isn't a boolean. */
+export type AlwaysOnTextKind = "native" | "reconstructed" | "notListed";
+
 /** Mirrors the Rust `AttributionSource`: `native` trusts Claude Code's own
  * attribution (issue #5); `reconstructed` is the version-gated walk over a
  * pre-attribution transcript (issue #12), a lower-confidence figure. */
@@ -34,8 +42,9 @@ export interface SkillReport {
   name: string;
   live: boolean;
   alwaysOn: LayerReport;
-  /** `false` when always-on text was reconstructed from frontmatter, not a transcript (ADR 0016). */
-  alwaysOnNative: boolean;
+  /** Where the always-on text came from (ADR 0016). `notListed` means the skill
+   * never enters the listing, so `alwaysOn.tokens` is a certain zero. */
+  alwaysOnText: AlwaysOnTextKind;
   onInvoke: LayerReport;
   /** `null` while the on-demand ceiling is still being computed off the
    * interactive scan (issue #11); the panel renders a pending affordance, not a
@@ -242,12 +251,18 @@ function isCoResident(skill: SkillReport, activeRepoPath: string | null): boolea
  * are shown in their sections but never summed here. `exact` is true only when
  * every contributing layer is exact, so a mixed total is honestly `~`-marked as
  * an estimate (ADR 0003) when rendered through `layerDisplay`.
+ *
+ * A never-listed skill is skipped outright rather than left to add its zero
+ * (issue #24). Adding it would reach the same total only for as long as the
+ * backend keeps that zero `exact`; the day it didn't, a skill contributing
+ * nothing would silently mark the whole total an estimate.
  */
 export function coResidentAlwaysOn(skills: readonly SkillReport[], activeRepoPath: string | null): LayerReport {
   let tokens = 0;
   let exact = true;
   for (const skill of skills) {
     if (!isCoResident(skill, activeRepoPath)) continue;
+    if (skill.alwaysOnText === "notListed") continue;
     tokens += skill.alwaysOn.tokens;
     if (!skill.alwaysOn.exact) exact = false;
   }
@@ -364,7 +379,10 @@ export function estimatedLayerCount(report: ScanReport): number {
   if (!report.apiKeyPresent) return 0;
   let count = 0;
   for (const skill of report.skills) {
-    for (const layer of [skill.alwaysOn, skill.onInvoke]) {
+    // A never-listed skill's always-on was never fetched, so it can't be a
+    // count that failed to fetch exactly (issue #24).
+    const layers = skill.alwaysOnText === "notListed" ? [skill.onInvoke] : [skill.alwaysOn, skill.onInvoke];
+    for (const layer of layers) {
       if (!layer.exact) count += 1;
     }
     // A pending on-demand (`null`) is not a failed-exact count: skip it so it
