@@ -16,6 +16,14 @@ pub fn discover_skills_in_dir(
         Err(_) => return (skills, warnings),
     };
 
+    // Canonicalized once, so an entry's resolved content can be compared
+    // against where it would sit if it were unmanaged. Comparing two
+    // canonical paths would be wrong (a symlinked entry canonicalizes to its
+    // target, so it would always look equal to itself); comparing against the
+    // raw `dir` would be wrong too, since a user whose `~/.claude` is itself a
+    // symlink would see every skill resolve "elsewhere" and read as managed.
+    let canonical_root = fs::canonicalize(dir).ok();
+
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -50,14 +58,15 @@ pub fn discover_skills_in_dir(
             }
             continue;
         }
-        let symlink_target = if is_symlink { fs::read_link(&dir_path).ok() } else { None };
-
         let name = match dir_path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
             None => continue,
         };
 
         let skill_md_path = dir_path.join("SKILL.md");
+        let manager_root = canonical_root
+            .as_deref()
+            .and_then(|root| resolve_manager_root(root, &name, &skill_md_path));
         let content = match fs::read_to_string(&skill_md_path) {
             Ok(c) => c,
             Err(_) => {
@@ -88,14 +97,34 @@ pub fn discover_skills_in_dir(
             skill_md_path,
             frontmatter,
             body,
-            is_symlink,
-            symlink_target,
+            manager_root,
             on_demand_files,
             live: true,
         });
     }
 
     (skills, warnings)
+}
+
+/// The directory owning a skill's real content, or `None` when the skill owns
+/// it itself (ADR 0026).
+///
+/// Resolving `SKILL.md` rather than the entry directory is what makes one rule
+/// cover both shapes a managed skill takes, with no branch on where the link
+/// sits: a symlinked directory (`tdd -> ~/.agents/skills/tdd`) and a real
+/// directory holding a symlinked `SKILL.md` (gstack's shims) both resolve out
+/// of the scan root. The previous check lstat'd only the directory and so
+/// missed the second shape entirely -- 46 of 66 managed skills on a real
+/// machine (issue #25).
+///
+/// `canonicalize` also resolves relative link bodies (`../../.agents/skills/tdd`)
+/// against the link's own location, which `read_link` does not.
+fn resolve_manager_root(canonical_root: &Path, name: &str, skill_md_path: &Path) -> Option<PathBuf> {
+    let resolved_dir = fs::canonicalize(skill_md_path).ok()?.parent()?.to_path_buf();
+    if resolved_dir == canonical_root.join(name) {
+        return None;
+    }
+    Some(resolved_dir.parent()?.to_path_buf())
 }
 
 /// Directory names whose contents are never bundled references. A skill
@@ -159,9 +188,10 @@ fn collect_files_recursive(dir: &Path, skip: &Path, visited: &mut HashSet<PathBu
 /// skill. A nested `SKILL.md` marks the subtree as another skill's: that
 /// content reaches context (if at all) as that skill's own layers, loaded by
 /// the skill mechanism, never because this skill's body said to read it
-/// (ADR 0028). When the nested skill is also discovered in its own right --
-/// gstack symlinks each of its 46 into `~/.claude/skills` -- counting it here
-/// double-counts it outright.
+/// (ADR 0028). Testing `SKILL.md` through `is_file()` sees a shim -- a real
+/// directory whose `SKILL.md` is a symlink -- as readily as a plain skill dir,
+/// which is what matters in practice: the shim is the dominant managed shape on
+/// disk (issue #25).
 fn is_reference_dir(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     !NON_REFERENCE_DIR_NAMES.contains(&name) && !path.join("SKILL.md").is_file()
@@ -237,21 +267,82 @@ mod tests {
         assert!(warnings[0].reason.contains("no readable SKILL.md"));
     }
 
+    /// The `.agents` shape: the whole entry is a symlink into another tree.
     #[test]
-    fn symlinked_skill_directory_records_target() {
+    fn symlinked_skill_directory_reports_its_manager_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let real_dir = tmp.path().join("real-location");
-        write_skill(tmp.path(), "real-location", "linked", "a linked skill", "Body.");
+        let store = tmp.path().join("store");
+        write_skill(&store, "linked", "linked", "a linked skill", "Body.");
         let scan_root = tmp.path().join("scan-root");
         fs::create_dir_all(&scan_root).unwrap();
-        symlink(&real_dir, scan_root.join("linked")).unwrap();
+        symlink(store.join("linked"), scan_root.join("linked")).unwrap();
 
         let (skills, warnings) = discover_skills_in_dir(&scan_root, |name| SkillId::Personal { name });
 
         assert_eq!(skills.len(), 1);
         assert!(warnings.is_empty());
-        assert!(skills[0].is_symlink);
-        assert_eq!(skills[0].symlink_target.as_deref(), Some(real_dir.as_path()));
+        assert_eq!(
+            skills[0].manager_root.as_deref(),
+            Some(fs::canonicalize(&store).unwrap().as_path())
+        );
+    }
+
+    /// The gstack shim shape, and the whole point of issue #25: a *real* entry
+    /// directory whose `SKILL.md` links into the managing tool's tree. The old
+    /// dir-only lstat reported `is_symlink: false` here, missing 46 of 66
+    /// managed skills on a real machine.
+    #[test]
+    fn real_directory_with_symlinked_skill_md_reports_its_manager_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("gstack");
+        write_skill(&tool, "ship", "ship", "ships it", "Body.");
+        let scan_root = tmp.path().join("scan-root");
+        let shim = scan_root.join("ship");
+        fs::create_dir_all(&shim).unwrap();
+        symlink(tool.join("ship").join("SKILL.md"), shim.join("SKILL.md")).unwrap();
+
+        let (skills, warnings) = discover_skills_in_dir(&scan_root, |name| SkillId::Personal { name });
+
+        assert_eq!(skills.len(), 1);
+        assert!(warnings.is_empty());
+        assert_eq!(skills[0].directory_name(), "ship");
+        assert_eq!(
+            skills[0].manager_root.as_deref(),
+            Some(fs::canonicalize(&tool).unwrap().as_path())
+        );
+    }
+
+    /// The real `~/.agents` entries link relatively (`../../.agents/skills/tdd`),
+    /// which `read_link` would hand back uninterpretable on its own.
+    #[test]
+    fn relative_symlink_resolves_against_the_entry_not_the_process_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        write_skill(&store, "tdd", "tdd", "test driven", "Body.");
+        let scan_root = tmp.path().join("scan-root");
+        fs::create_dir_all(&scan_root).unwrap();
+        symlink(Path::new("../store/tdd"), scan_root.join("tdd")).unwrap();
+
+        let (skills, warnings) = discover_skills_in_dir(&scan_root, |name| SkillId::Personal { name });
+
+        assert_eq!(skills.len(), 1);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            skills[0].manager_root.as_deref(),
+            Some(fs::canonicalize(&store).unwrap().as_path())
+        );
+    }
+
+    #[test]
+    fn skill_owning_its_own_content_is_unmanaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "mine", "mine", "hand installed", "Body.");
+
+        let (skills, warnings) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+
+        assert_eq!(skills.len(), 1);
+        assert!(warnings.is_empty());
+        assert_eq!(skills[0].manager_root, None);
     }
 
     #[cfg(unix)]
@@ -366,6 +457,29 @@ mod tests {
         let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
 
         assert_eq!(skills[0].on_demand_files, vec![skill_dir.join("REFERENCE.md")]);
+    }
+
+    #[test]
+    fn nested_skill_whose_skill_md_is_a_symlink_is_still_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "gstack", "gstack", "ships nested skills", "Body.");
+        let skill_dir = tmp.path().join("gstack");
+        fs::write(skill_dir.join("REFERENCE.md"), "a real reference").unwrap();
+
+        // The dominant managed shape on a real machine is a shim: a real
+        // directory whose SKILL.md is a symlink, not a symlinked directory
+        // (46 of 66 managed skills, issue #25). The prune must see through it.
+        let real = tmp.path().join("elsewhere").join("browse");
+        write_skill(&tmp.path().join("elsewhere"), "browse", "browse", "drives a browser", "Body.");
+        let shim = skill_dir.join("skills").join("browse");
+        fs::create_dir_all(&shim).unwrap();
+        symlink(real.join("SKILL.md"), shim.join("SKILL.md")).unwrap();
+        fs::write(shim.join("PLAYBOOK.md"), "the shim's own bundled ref").unwrap();
+
+        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let gstack = skills.iter().find(|s| s.directory_name() == "gstack").unwrap();
+
+        assert_eq!(gstack.on_demand_files, vec![skill_dir.join("REFERENCE.md")]);
     }
 
     #[test]

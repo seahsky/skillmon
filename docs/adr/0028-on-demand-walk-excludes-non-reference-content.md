@@ -15,8 +15,10 @@ This is a correctness bug, not a cost problem.
 The domain defines the on-demand layer as bundled reference files that load only if the body tells the agent to read them, reported as a ceiling.
 No `SKILL.md` body instructs Claude to read `node_modules/.pnpm/`, a git object store, or a compiled binary, so the ceiling was measuring content that can never enter context and reporting it as a bound on content that might.
 A nested skill's files were counted as the outer skill's references too, which they are not: that content reaches context (if at all) as the nested skill's own layers, loaded by the skill mechanism, never because the outer body told the agent to read it.
-On the reference machine it is also a literal double-count, because gstack symlinks each of its 46 nested skills into `~/.claude/skills`, where discovery picks them up as their own rows (issue #30 counts them among the 71 personal skills).
-That second fact is what makes it a double-count rather than merely a miscount, and it does not hold for every nesting shape: a plugin whose skills nest below depth 1 (mattpocock-skills nests `skills/<category>/<skill>/`) is not discovered at all today, so its bytes simply leave every row.
+For gstack's 46 nested skills it is also a literal double-count, though only of the nested `SKILL.md` itself.
+Each gets its own row through a shim — a real directory under `~/.claude/skills` whose `SKILL.md` is a symlink into the checkout, the dominant managed shape on a real machine (issue #25) — so that one file's content was counted twice: once as gstack's on-demand reference file, once as the shim row's own always-on and on-invoke layers.
+The nested skill's *other* bundled files were never double-counted, because the shim directory holds only the link; they were counted once, under the wrong row. Pruning them therefore removes them from every row rather than moving them, which is correct — they are the nested skill's references, and the shim row failing to see them is its own gap, not something an unrelated skill's ceiling should paper over.
+Neither claim generalizes to every nesting shape: a plugin whose skills nest below depth 1 (mattpocock-skills nests `skills/<category>/<skill>/`) is not discovered at all today, so its bytes simply leave every row.
 
 It is distinct from issue #11, which deferred this walk off the interactive path — deferring wrong work still yields a wrong number.
 
@@ -32,7 +34,7 @@ After this decision it yields 63 files totalling 0.20 MB, and every real skill d
 The walk prunes any directory whose contents cannot enter context through *this* skill:
 
 - A deny-list of directory names, `.git` and `node_modules` — a VCS object store and a dependency tree are never reference material.
-- Any directory containing its own `SKILL.md`. That subtree is another skill's, and its content reaches context as that skill's own three layers, not as a reference this skill's body reads. Where the nested skill is separately discovered — gstack's symlinked-in skills — it is a double-count as well.
+- Any directory containing its own `SKILL.md`. That subtree is another skill's, and its content reaches context as that skill's own three layers, not as a reference this skill's body reads. The test reads `SKILL.md` through `is_file()`, so it sees a shim (a real directory whose `SKILL.md` is a symlink) as readily as a plain one — which matters, since the shim is the dominant managed shape on disk (issue #25).
 
 Pruning happens before descent, so the excluded subtrees are never even enumerated — that is where the byte saving lives, not just the token correction.
 

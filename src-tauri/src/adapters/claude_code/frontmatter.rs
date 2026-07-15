@@ -13,6 +13,11 @@ pub enum FrontmatterError {
 struct FrontmatterYaml {
     name: String,
     description: String,
+    /// Claude Code drops a skill declaring this from the model-facing skill
+    /// listing entirely, so it costs zero always-on tokens while staying
+    /// slash-invokable (issue #24). Absent means listed, hence the default.
+    #[serde(rename = "disable-model-invocation", default)]
+    disable_model_invocation: bool,
 }
 
 pub fn parse_skill_md(content: &str) -> Result<(Frontmatter, String), FrontmatterError> {
@@ -37,6 +42,7 @@ pub fn parse_skill_md(content: &str) -> Result<(Frontmatter, String), Frontmatte
             declared_name: parsed.name,
             description: parsed.description,
             raw_block: raw_block.to_string(),
+            model_invocable: !parsed.disable_model_invocation,
         },
         body,
     ))
@@ -57,9 +63,30 @@ mod tests {
 
     #[test]
     fn tolerates_unknown_extra_frontmatter_fields() {
+        let content = "---\nname: gstack-ship\ndescription: ships it\npreamble-tier: 4\nallowed-tools: Bash\n---\n\nBody.\n";
+        let (frontmatter, _) = parse_skill_md(content).unwrap();
+        assert_eq!(frontmatter.declared_name, "gstack-ship");
+    }
+
+    #[test]
+    fn skills_are_model_invocable_by_default() {
+        let content = "---\nname: grilling\ndescription: grills\n---\n\nBody.\n";
+        let (frontmatter, _) = parse_skill_md(content).unwrap();
+        assert!(frontmatter.model_invocable);
+    }
+
+    #[test]
+    fn disable_model_invocation_true_makes_a_skill_not_model_invocable() {
         let content = "---\nname: grill-with-docs\ndescription: sharpens a plan\ndisable-model-invocation: true\n---\n\nBody.\n";
         let (frontmatter, _) = parse_skill_md(content).unwrap();
-        assert_eq!(frontmatter.declared_name, "grill-with-docs");
+        assert!(!frontmatter.model_invocable);
+    }
+
+    #[test]
+    fn disable_model_invocation_false_keeps_a_skill_model_invocable() {
+        let content = "---\nname: grilling\ndescription: grills\ndisable-model-invocation: false\n---\n\nBody.\n";
+        let (frontmatter, _) = parse_skill_md(content).unwrap();
+        assert!(frontmatter.model_invocable);
     }
 
     #[test]

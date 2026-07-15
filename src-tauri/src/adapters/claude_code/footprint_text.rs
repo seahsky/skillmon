@@ -1,5 +1,5 @@
 use super::listing_cache::SqliteListingCache;
-use crate::domain::footprint::TextConfidence;
+use crate::domain::footprint::AlwaysOnTextKind;
 use crate::domain::skill::DiscoveredSkill;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct AlwaysOnText {
     pub text: String,
-    pub confidence: TextConfidence,
+    pub kind: AlwaysOnTextKind,
 }
 
 /// The literal substring a `skill_listing` attachment line always contains
@@ -186,10 +186,24 @@ pub fn always_on_text_from_index(
     index: &ListingIndex,
     search_project_dirs: &[PathBuf],
 ) -> AlwaysOnText {
-    match index.resolve(skill.directory_name(), search_project_dirs) {
-        Some(bullet) => AlwaysOnText { text: bullet.to_string(), confidence: TextConfidence::Native },
-        None => AlwaysOnText { text: reconstruct_bullet(skill), confidence: TextConfidence::Reconstructed },
+    if let Some(absent) = not_listed(skill) {
+        return absent;
     }
+    match index.resolve(skill.directory_name(), search_project_dirs) {
+        Some(bullet) => AlwaysOnText { text: bullet.to_string(), kind: AlwaysOnTextKind::Native },
+        None => AlwaysOnText { text: reconstruct_bullet(skill), kind: AlwaysOnTextKind::Reconstructed },
+    }
+}
+
+/// Short-circuits a skill Claude Code never lists (issue #24), before any
+/// transcript lookup. The lookup would miss by construction -- a skill that is
+/// never listed can never appear in a listing -- and the miss would fall
+/// through to `reconstruct_bullet`, inventing the very line whose absence is
+/// the point. That is the bug: it billed 12 of 71 skills on a real machine for
+/// a line Claude Code never injects.
+fn not_listed(skill: &DiscoveredSkill) -> Option<AlwaysOnText> {
+    (!skill.frontmatter.model_invocable)
+        .then(|| AlwaysOnText { text: String::new(), kind: AlwaysOnTextKind::NotListed })
 }
 
 /// Gathers every `.jsonl` under `project_dirs`, paired with its project dir
@@ -296,9 +310,12 @@ struct SkillListingAttachment {
 /// repo's project dir for personal/user-scoped-plugin skills, just the
 /// owning repo's for project/scoped-plugin skills.
 pub fn always_on_text(skill: &DiscoveredSkill, search_project_dirs: &[PathBuf]) -> AlwaysOnText {
+    if let Some(absent) = not_listed(skill) {
+        return absent;
+    }
     match find_rendered_bullet(skill.directory_name(), search_project_dirs) {
-        Some(text) => AlwaysOnText { text, confidence: TextConfidence::Native },
-        None => AlwaysOnText { text: reconstruct_bullet(skill), confidence: TextConfidence::Reconstructed },
+        Some(text) => AlwaysOnText { text, kind: AlwaysOnTextKind::Native },
+        None => AlwaysOnText { text: reconstruct_bullet(skill), kind: AlwaysOnTextKind::Reconstructed },
     }
 }
 
@@ -440,10 +457,10 @@ mod tests {
                 declared_name: dir_name.to_string(),
                 description: description.to_string(),
                 raw_block: format!("name: {dir_name}\ndescription: {description}"),
+                model_invocable: true,
             },
             body: "Body.".to_string(),
-            is_symlink: false,
-            symlink_target: None,
+            manager_root: None,
             on_demand_files: vec![],
             live: true,
         }
@@ -512,7 +529,7 @@ mod tests {
         let result = always_on_text(&skill, &[project_dir]);
 
         assert_eq!(result.text, "- grilling: Interview relentlessly.");
-        assert_eq!(result.confidence, TextConfidence::Native);
+        assert_eq!(result.kind, AlwaysOnTextKind::Native);
     }
 
     #[test]
@@ -525,7 +542,7 @@ mod tests {
         let result = always_on_text(&skill, &[project_dir]);
 
         assert_eq!(result.text, "- grilling: Interview relentlessly.");
-        assert_eq!(result.confidence, TextConfidence::Reconstructed);
+        assert_eq!(result.kind, AlwaysOnTextKind::Reconstructed);
     }
 
     #[test]
@@ -533,7 +550,7 @@ mod tests {
         let skill = sample_skill("grilling", "Interview relentlessly.");
         let result = always_on_text(&skill, &[]);
 
-        assert_eq!(result.confidence, TextConfidence::Reconstructed);
+        assert_eq!(result.kind, AlwaysOnTextKind::Reconstructed);
     }
 
     #[test]
@@ -621,6 +638,63 @@ mod tests {
         assert_eq!(index.resolve("grilling", &[project_dir]), Some("- grilling: Interview relentlessly."));
     }
 
+    fn never_listed_skill(dir_name: &str, description: &str) -> DiscoveredSkill {
+        let mut skill = sample_skill(dir_name, description);
+        skill.frontmatter.model_invocable = false;
+        skill
+    }
+
+    #[test]
+    fn never_listed_skill_has_no_always_on_text_at_all() {
+        let skill = never_listed_skill("grill-with-docs", "sharpens a plan");
+
+        let result = always_on_text(&skill, &[]);
+
+        assert_eq!(result.kind, AlwaysOnTextKind::NotListed);
+        assert!(result.text.is_empty(), "there is no listing line to count");
+    }
+
+    /// The regression #24 is really about. Without the short-circuit, the index
+    /// lookup misses (a never-listed skill can't be in a listing), and the miss
+    /// falls through to `reconstruct_bullet` -- inventing the line whose absence
+    /// is the whole point, and billing the skill for it.
+    #[test]
+    fn never_listed_skill_is_not_reconstructed_from_frontmatter() {
+        let skill = never_listed_skill("grill-with-docs", "sharpens a plan");
+        let index = ListingIndex::default();
+
+        let result = always_on_text_from_index(&skill, &index, &[]);
+
+        assert_eq!(result.kind, AlwaysOnTextKind::NotListed);
+        assert!(result.text.is_empty());
+    }
+
+    /// Adding `disable-model-invocation: true` to an already-used skill leaves
+    /// its old bullet sitting in past transcripts forever. The flag describes
+    /// what Claude Code does *now*, so it must beat that stale evidence --
+    /// otherwise the cost only drops to zero once the transcripts age out.
+    #[test]
+    fn never_listed_skill_beats_a_stale_bullet_from_an_older_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("repo-a");
+        write_skill_listing_transcript(
+            &project_dir,
+            "s.jsonl",
+            &["grill-with-docs"],
+            "- grill-with-docs: sharpens a plan",
+        );
+        let (refs, _) = transcript_refs_by_recency(std::slice::from_ref(&project_dir));
+        let index = ListingIndex::build(&refs, &wanted(&["grill-with-docs"]));
+        // The bullet really is there: without the flag this resolves Native.
+        assert!(index.resolve("grill-with-docs", std::slice::from_ref(&project_dir)).is_some());
+
+        let skill = never_listed_skill("grill-with-docs", "sharpens a plan");
+        let result = always_on_text_from_index(&skill, &index, &[project_dir]);
+
+        assert_eq!(result.kind, AlwaysOnTextKind::NotListed);
+        assert!(result.text.is_empty());
+    }
+
     #[test]
     fn index_keeps_the_most_recent_bullet_when_a_skill_appears_in_two_transcripts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -706,8 +780,8 @@ mod tests {
         let via_scan = always_on_text(&skill, &[project_dir]);
 
         assert_eq!(via_index.text, via_scan.text);
-        assert_eq!(via_index.confidence, TextConfidence::Native);
-        assert_eq!(via_scan.confidence, TextConfidence::Native);
+        assert_eq!(via_index.kind, AlwaysOnTextKind::Native);
+        assert_eq!(via_scan.kind, AlwaysOnTextKind::Native);
     }
 
     #[test]
