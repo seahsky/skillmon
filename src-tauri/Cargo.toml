@@ -22,7 +22,11 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` because skillmon rewrites a file it does not own: the
+# `.agents` skill lock (ADR 0027, issue #31). Without it, serde_json's Map is a
+# BTreeMap and a one-key prune would silently re-alphabetize a third-party
+# tool's state file -- a spurious whole-file diff for anyone tracking dotfiles.
+serde_json = { version = "1", features = ["preserve_order"] }
 tauri-plugin-notification = "2"
 serde_yaml_ng = "0.10"
 thiserror = "2"

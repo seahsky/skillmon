@@ -5,6 +5,7 @@
 mod adapters;
 mod domain;
 mod footprint;
+mod managing_tool;
 mod removal;
 mod self_write;
 
@@ -29,6 +30,7 @@ use footprint::api_key_store::{ApiKeyStore, KeychainApiKeyStore};
 use footprint::cache::TokenCache;
 use footprint::count_tokens_client::{AnthropicCountTokensClient, CountTokensClient};
 use footprint::tokenizer::BpeTokenizer;
+use managing_tool::ManagingTools;
 use removal::store::TrashStore;
 use self_write::SelfWriteWindow;
 
@@ -62,6 +64,15 @@ type SharedApiKeySettings = Arc<Mutex<ApiKeySettings>>;
 /// `Empty trash`. Its `rusqlite` connection is `Send` but not `Sync`, so the
 /// `Mutex` is mandatory rather than merely convenient.
 type SharedTrashStore = Arc<Mutex<TrashStore>>;
+
+/// The managing tools skillmon knows how to ask (ADR 0027), resolved once at the
+/// composition root because `.agents` reads `XDG_STATE_HOME` to find its own lock.
+///
+/// No `Mutex`, unlike every other piece of state here: the tools hold paths and
+/// nothing else, and each call reads and writes the tool's file within it. So
+/// there is no shared mutable state to guard, and wrapping it would only queue a
+/// removal behind an unrelated one.
+type SharedManagingTools = Arc<ManagingTools>;
 
 // TODO(skillmon): the mutations that CREATE trash units (disable/enable,
 // uninstall, remove_plugin) land with issue #31. This file wires only the
@@ -207,14 +218,16 @@ async fn restore_trash_unit(
     unit_id: i64,
     app: tauri::AppHandle,
     trash: tauri::State<'_, SharedTrashStore>,
+    tools: tauri::State<'_, SharedManagingTools>,
     self_writes: tauri::State<'_, SelfWriteWindow>,
 ) -> Result<(), String> {
     let trash = trash.inner().clone();
+    let tools = tools.inner().clone();
     let self_writes = self_writes.inner().clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         let mut store = trash.lock().expect("trash mutex poisoned");
         let _writing = self_writes.open();
-        removal::restore(&mut store, TrashUnitId(unit_id)).map_err(|e| e.to_string())
+        removal::restore(&mut store, &tools, TrashUnitId(unit_id)).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -583,6 +596,7 @@ pub fn run() {
             app.manage(api_key_settings);
             app.manage(self_writes);
             app.manage::<SharedTrashStore>(Arc::new(Mutex::new(trash_store)));
+            app.manage::<SharedManagingTools>(Arc::new(ManagingTools::from_env()));
 
             // Global hotkey: Cmd/Ctrl+Shift+K toggles the panel from anywhere.
             // A conflict (another app already owns the combo) is non-fatal --
