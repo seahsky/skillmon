@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::domain::removal::{Retention, Tombstone, TrashUnit, TrashUnitId, TrashedEntry};
+use crate::domain::removal::{Retention, Tombstone, TrashUnit, TrashUnitId, TrashedEntry, TrashedSource};
 use crate::domain::skill::SkillId;
 
 /// The on-disk encoding of a skill identity.
@@ -97,6 +97,119 @@ fn parse_skill_key(raw: &str, column: usize) -> SqliteResult<SkillId> {
         .map_err(|e| SqliteError::FromSqlConversionFailure(column, Type::Text, Box::new(e)))
 }
 
+/// The columns issue #31 added to `trash_entry`, and the whole of the migration
+/// from the shape issue #28 created.
+///
+/// Every one is nullable, which is what makes adding them additive: a row
+/// written by the older build reads back as an entry-only removal, which is
+/// exactly what it was. All four move together -- a source is a path, a staged
+/// path, a size, and the tool's bookkeeping, and any one of them without the
+/// others describes nothing.
+/// Carries each column's declared type, so a ledger that reaches this shape by
+/// migration is identical to one created at it. SQLite would tolerate the
+/// mismatch -- typing is per-value, not per-column -- which is exactly why it is
+/// worth being deliberate: a `source_bytes` that is INTEGER on a fresh install
+/// and TEXT on an upgraded one is a difference nothing would report until
+/// something read it back.
+const SOURCE_COLUMNS: &[(&str, &str)] = &[
+    ("source_origin_path", "TEXT"),
+    ("source_stored_path", "TEXT"),
+    ("source_bytes", "INTEGER"),
+    ("source_state", "TEXT"),
+];
+
+/// Adds any of `columns` the table does not already have.
+///
+/// `CREATE TABLE IF NOT EXISTS` is a no-op against an existing table, so the
+/// widened definition above reaches a *new* ledger only. Anyone who ran the
+/// issue #28 build has the old four-column table already, and it must be carried
+/// across rather than recreated: this store is authoritative state, and dropping
+/// it would strand real files with no undo (see the module docs).
+///
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`, so the existing columns are read
+/// first. Every added column is nullable and has no default, which SQLite can
+/// always do in O(1) -- there is no table rewrite here, however large the ledger.
+fn add_missing_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> SqliteResult<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: HashSet<String> = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<SqliteResult<_>>()?;
+    for (column, ty) in columns.iter().filter(|(c, _)| !existing.contains(*c)) {
+        // Interpolated, not bound: SQLite takes no parameter in DDL. The values
+        // are this module's own `const`s, never anything a user or a file
+        // supplies, so there is nothing here to inject.
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))?;
+    }
+    Ok(())
+}
+
+/// One `trash_entry` row as SQLite hands it over, before it is a domain value.
+///
+/// A named struct rather than a nine-wide tuple: every field but two is a
+/// `String`, so a transposition in the destructuring would compile and quietly
+/// swap a skill's origin with where its bytes are staged -- on the read path
+/// that a purge and a restore both go through.
+struct StoredEntryRow {
+    skill_id: String,
+    declared_name: String,
+    origin_path: String,
+    stored_path: String,
+    bytes: i64,
+    source_origin_path: Option<String>,
+    source_stored_path: Option<String>,
+    source_bytes: Option<i64>,
+    source_state: Option<String>,
+}
+
+impl StoredEntryRow {
+    fn into_entry(self) -> SqliteResult<TrashedEntry> {
+        let source = self.source()?;
+        Ok(TrashedEntry {
+            skill_id: parse_skill_key(&self.skill_id, 0)?,
+            declared_name: self.declared_name,
+            origin_path: PathBuf::from(self.origin_path),
+            stored_path: PathBuf::from(self.stored_path),
+            bytes: parse_bytes(self.bytes, 4)?,
+            source,
+        })
+    }
+
+    /// The three source columns are written together or not at all, so reading
+    /// them back demands the same. A row carrying only some of them is not an
+    /// entry-only removal that can be shrugged off -- it is a row describing a
+    /// source whose location or size this build cannot name, and treating it as
+    /// `None` would leave the staged bytes on disk while the purge deleted the
+    /// only row pointing at them. `source_state` is excluded: a tool with
+    /// nothing recorded to drop legitimately returns `None` for it.
+    fn source(&self) -> SqliteResult<Option<TrashedSource>> {
+        match (&self.source_origin_path, &self.source_stored_path, self.source_bytes) {
+            (None, None, None) => Ok(None),
+            (Some(origin), Some(stored), Some(bytes)) => Ok(Some(TrashedSource {
+                origin_path: PathBuf::from(origin),
+                stored_path: PathBuf::from(stored),
+                bytes: parse_bytes(bytes, 7)?,
+                state: self.source_state.clone(),
+            })),
+            _ => Err(SqliteError::FromSqlConversionFailure(
+                5,
+                Type::Text,
+                format!(
+                    "trash entry for {} has a partial source record (origin: {}, stored: {}, bytes: {})",
+                    self.declared_name,
+                    self.source_origin_path.is_some(),
+                    self.source_stored_path.is_some(),
+                    self.source_bytes.is_some(),
+                )
+                .into(),
+            )),
+        }
+    }
+}
+
+/// A negative size is corruption, not a big number: `as u64` would turn -1 into
+/// 18 exabytes and offer to reclaim it.
+fn parse_bytes(raw: i64, column: usize) -> SqliteResult<u64> {
+    u64::try_from(raw).map_err(|e| SqliteError::FromSqlConversionFailure(column, Type::Integer, Box::new(e)))
+}
+
 pub struct TrashStore {
     conn: Connection,
 }
@@ -129,6 +242,16 @@ impl TrashStore {
                 origin_path   TEXT NOT NULL,
                 stored_path   TEXT NOT NULL,
                 bytes         INTEGER NOT NULL,
+                -- The managing tool's own copy, when the user opted into
+                -- removing it too (issue #31, ADR 0027). All four are NULL for
+                -- entry-only removal, which is the rule and the default.
+                -- `source_state` is the tool's bookkeeping, stored verbatim and
+                -- never parsed here: this ledger is harness- AND tool-neutral,
+                -- and hands the blob back to whoever wrote it.
+                source_origin_path TEXT,
+                source_stored_path TEXT,
+                source_bytes       INTEGER,
+                source_state       TEXT,
                 PRIMARY KEY (unit_id, ordinal)
             );
             CREATE TABLE IF NOT EXISTS tombstone (
@@ -141,6 +264,7 @@ impl TrashStore {
         // foreign keys per-connection by default, so forgetting a unit would
         // silently strand its entries.
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        add_missing_columns(&conn, "trash_entry", SOURCE_COLUMNS)?;
         Ok(Self { conn })
     }
 
@@ -172,9 +296,11 @@ impl TrashStore {
     /// the primary, the rest are its cascaded dependents (ADR 0027).
     pub fn insert_entries(tx: &Transaction<'_>, id: TrashUnitId, entries: &[TrashedEntry]) -> SqliteResult<()> {
         for (ordinal, e) in entries.iter().enumerate() {
+            let source = e.source.as_ref();
             tx.execute(
-                "INSERT INTO trash_entry (unit_id, ordinal, skill_id, declared_name, origin_path, stored_path, bytes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO trash_entry (unit_id, ordinal, skill_id, declared_name, origin_path, stored_path, bytes,
+                                          source_origin_path, source_stored_path, source_bytes, source_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     id.0,
                     ordinal as i64,
@@ -183,6 +309,10 @@ impl TrashStore {
                     e.origin_path.to_string_lossy(),
                     e.stored_path.to_string_lossy(),
                     e.bytes as i64,
+                    source.map(|s| s.origin_path.to_string_lossy().into_owned()),
+                    source.map(|s| s.stored_path.to_string_lossy().into_owned()),
+                    source.map(|s| s.bytes as i64),
+                    source.and_then(|s| s.state.clone()),
                 ],
             )?;
         }
@@ -248,30 +378,26 @@ impl TrashStore {
 
     fn entries_of(&self, id: TrashUnitId) -> SqliteResult<Vec<TrashedEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT skill_id, declared_name, origin_path, stored_path, bytes
+            "SELECT skill_id, declared_name, origin_path, stored_path, bytes,
+                    source_origin_path, source_stored_path, source_bytes, source_state
              FROM trash_entry WHERE unit_id = ?1 ORDER BY ordinal",
         )?;
         let rows = stmt.query_map(params![id.0], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-            ))
+            Ok(StoredEntryRow {
+                skill_id: r.get(0)?,
+                declared_name: r.get(1)?,
+                origin_path: r.get(2)?,
+                stored_path: r.get(3)?,
+                bytes: r.get(4)?,
+                source_origin_path: r.get(5)?,
+                source_stored_path: r.get(6)?,
+                source_bytes: r.get(7)?,
+                source_state: r.get(8)?,
+            })
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (skill_id, declared_name, origin_path, stored_path, bytes) = row?;
-            let bytes = u64::try_from(bytes)
-                .map_err(|e| SqliteError::FromSqlConversionFailure(4, Type::Integer, Box::new(e)))?;
-            out.push(TrashedEntry {
-                skill_id: parse_skill_key(&skill_id, 0)?,
-                declared_name,
-                origin_path: PathBuf::from(origin_path),
-                stored_path: PathBuf::from(stored_path),
-                bytes,
-            });
+            out.push(row?.into_entry()?);
         }
         Ok(out)
     }
@@ -357,6 +483,99 @@ impl TrashStore {
 mod tests {
     use super::*;
 
+    /// `trash_entry` exactly as the issue #28 build created it, with no source
+    /// columns. Spelled out rather than derived from the current DDL, because
+    /// the point is to reproduce a shape that no longer exists in this file --
+    /// generating it from today's schema would test nothing.
+    const ISSUE_28_SCHEMA: &str = "CREATE TABLE trash_unit (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            retention  TEXT NOT NULL,
+            removed_at INTEGER NOT NULL
+        );
+        CREATE TABLE trash_entry (
+            unit_id       INTEGER NOT NULL REFERENCES trash_unit(id) ON DELETE CASCADE,
+            ordinal       INTEGER NOT NULL,
+            skill_id      TEXT NOT NULL,
+            declared_name TEXT NOT NULL,
+            origin_path   TEXT NOT NULL,
+            stored_path   TEXT NOT NULL,
+            bytes         INTEGER NOT NULL,
+            PRIMARY KEY (unit_id, ordinal)
+        );
+        CREATE TABLE tombstone (
+            skill_id      TEXT PRIMARY KEY,
+            declared_name TEXT NOT NULL,
+            removed_at    INTEGER NOT NULL
+        );";
+
+    /// The upgrade path, and the one this store's docs forbid getting wrong: a
+    /// ledger is authoritative state, so issue #31's columns have to be added to
+    /// the existing table rather than arrive by recreating it. `CREATE TABLE IF
+    /// NOT EXISTS` is a no-op against a table that is already there, so without
+    /// the migration the new columns would simply never appear -- and every
+    /// insert would fail on a machine that had ever run the older build.
+    #[test]
+    fn opening_a_ledger_from_the_issue_28_build_adds_the_source_columns_and_keeps_its_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("removal.sqlite");
+
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(ISSUE_28_SCHEMA).unwrap();
+        old.execute("INSERT INTO trash_unit (id, retention, removed_at) VALUES (1, 'trashed', 1000)", []).unwrap();
+        old.execute(
+            "INSERT INTO trash_entry (unit_id, ordinal, skill_id, declared_name, origin_path, stored_path, bytes)
+             VALUES (1, 0, ?1, 'vercel-react', '/home/me/.claude/skills/vercel-react', '/staged/0-vercel-react', 12)",
+            params![skill_key(&SkillId::Personal { name: "vercel-react".to_string() })],
+        )
+        .unwrap();
+        drop(old);
+
+        let store = TrashStore::open(&path).unwrap();
+        let unit = store.get(TrashUnitId(1)).unwrap().expect("the pre-existing unit must survive the upgrade");
+
+        assert_eq!(unit.primary.declared_name, "vercel-react");
+        assert_eq!(unit.primary.origin_path, PathBuf::from("/home/me/.claude/skills/vercel-react"));
+        assert_eq!(unit.bytes(), 12);
+        assert_eq!(unit.primary.source, None, "a row written before source removal existed had no source");
+    }
+
+    /// Opening is what runs the migration, and the panel opens the ledger on
+    /// every launch -- so it has to be safe to run against an already-migrated
+    /// file, forever.
+    #[test]
+    fn opening_an_already_migrated_ledger_again_is_a_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("removal.sqlite");
+
+        drop(TrashStore::open(&path).unwrap());
+        let mut store = TrashStore::open(&path).unwrap();
+
+        let tx = store.transaction().unwrap();
+        let id = TrashStore::insert_unit(&tx, Retention::Trashed, 1_000).unwrap();
+        TrashStore::insert_entries(&tx, id, &[entry("tdd", 5)]).unwrap();
+        tx.commit().unwrap();
+        assert!(store.get(id).unwrap().is_some(), "a twice-opened ledger still takes writes");
+    }
+
+    /// A source is a path, a staged path, and a size, written together. A row
+    /// carrying only some of them describes a directory this build cannot find
+    /// or size -- reading it as "no source" would leave those bytes on disk
+    /// while the purge deleted the only row naming them.
+    #[test]
+    fn a_partially_written_source_is_corruption_rather_than_no_source() {
+        let mut store = TrashStore::open_in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let id = TrashStore::insert_unit(&tx, Retention::Trashed, 1_000).unwrap();
+        TrashStore::insert_entries(&tx, id, &[entry("tdd", 5)]).unwrap();
+        tx.commit().unwrap();
+        store
+            .conn
+            .execute("UPDATE trash_entry SET source_origin_path = '/home/me/.agents/skills/tdd'", [])
+            .unwrap();
+
+        assert!(store.get(id).is_err(), "a half-written source must surface, not be shrugged off as absent");
+    }
+
     fn entry(name: &str, bytes: u64) -> TrashedEntry {
         TrashedEntry {
             skill_id: SkillId::Personal { name: name.to_string() },
@@ -364,6 +583,7 @@ mod tests {
             origin_path: PathBuf::from(format!("/home/me/.claude/skills/{name}")),
             stored_path: PathBuf::from(format!("/home/me/.claude/skillmon/removed/1/0-{name}")),
             bytes,
+            source: None,
         }
     }
 

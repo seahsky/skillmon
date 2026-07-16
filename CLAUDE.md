@@ -17,7 +17,12 @@ That wave is now closed; every follow-up ADR 0005 deferred is built.
 Its gate window (build < 2.1.146) is pre-native-attribution *by definition*, so the parent turn resolves native-first with #12's walk as the fallback; reading only the parent's native `attributionSkill`, as the issue literally specified, would resolve nothing on every build the gate admits.
 It fires on zero real files (oldest build on disk is 2.1.170), and that inertness is asserted, not assumed, by the `#[ignore]`d `real_claude_home_subagent_rollup`.
 
-**Next up**: the removal ops (issue #31, label `ready-for-agent`), designed in ADR 0026/0027 against a real 71-skill `~/.claude`:
+**The removal ops (issue #31) have landed**, designed in ADR 0026/0027 against a real 71-skill `~/.claude`.
+What shipped: the `ManagingTool` seam (`src-tauri/src/managing_tool/`, parallel to `HarnessAdapter`), `removal::plan` (cascade, tool-uninstall classification, source offers), the `plan_removal`/`remove_skill` commands, and the panel's confirm dialog + removed view.
+Two things bear repeating for whoever touches this next.
+**ADR 0027's `remove_source` signature did not survive contact** — a source in its own trash unit means two undos, and restoring the entry alone rebuilds a symlink pointing at nothing, which `discovery/scan.rs:51-59` turns into a warning and a vanished row: the exact outcome ADR 0027 rejected, as an undo path. So a source is staged *into* its skill's trash entry (`TrashedSource`), one unit and one undo, and the tool's job narrowed to `forget_source`/`relearn_source` bookkeeping (ADR 0027 Update).
+**Both tool impls were written from the tools' own sources, not from this machine** — neither is installed any more. gstack came from the public repo (`setup:540-575`; its skills are *flat* top-level dirs, so a shim's manager root is the checkout itself, and the `skills/<category>/<name>` in the domain unit-test fixtures is illustrative only). `.agents` came from the `skills` CLI in the npx cache: its lock keys are the **unsanitized** name while the folder is `sanitizeName()` of it, so a key cannot be read off a directory and must be searched for by inverting the tool's rule. Re-derive from the source, never from a sample.
+The context that produced it:
 
 - **Three bugs found while designing, all now fixed.** #24: 12 skills carry `disable-model-invocation: true`, so Claude Code drops them from the listing and charges zero always-on — skillmon didn't parse the field, so those rows fell to the `Reconstructed` path and were billed a cost that doesn't exist. #25: symlink detection lstat'd only the skill dir, so it caught 20 of 66 managed skills — the dominant form on disk (a real dir whose `SKILL.md` is a symlink) read as unmanaged, which `manager_root` fixes by resolving `SKILL.md` itself. #26: the on-demand walk had no exclusions, so gstack's ceiling swept 704 MB of `node_modules`, a 60 MB `.git`, and 46 nested skills (ADR 0028).
 - **Source = manager root, not origin** (#30, ADR 0026, landed). "Which is official / superpowers / mine" doesn't survive contact with a real `~/.claude`: superpowers is a plugin and already labeled, "official" means three incompatible things, and none of the 71 personal skills are self-authored. The axis that pays is *who will restore this if I remove it*, derived structurally, with no tool manifests parsed.
@@ -31,7 +36,9 @@ It fires on zero real files (oldest build on disk is 2.1.170), and that inertnes
 - ADR 0027 amends ADR 0007 before any of it was built: quarantine and trash collapse into one reversible op with a retention intent, and a row with dependents is a *tool uninstall*, not a skill removal.
 - Filed while verifying #26 against a real `~/.claude`: **#33**, plugin skills declared in `plugin.json` are invisible (skillmon finds 15 of ~55 — the manifest is read from the wrong path, `skills` is typed string-only when it is also an array of explicit paths, and the walk is depth-1).
 
-The post-mutation "restart Claude Code to apply" nudge is deferred until the disable/uninstall mutation ops are scoped.
+The "restart Claude Code to apply" nudge shipped with #31 (ADR 0007): sticky until dismissed, since a rescan does not restart anyone's session.
+
+**Next up**: **#33** (plugin skills declared in `plugin.json` are invisible) is the largest known correctness gap — skillmon sees 15 of ~55 plugin skills. Plugin *removal* is still unbuilt: it goes through the `claude plugin` CLI rather than an entry move (ADR 0007), so it shares no code with #31's path, and the panel's plugin rows carry a disabled affordance explaining the lock. Windows and signing remain out of MVP.
 
 ## Commands
 

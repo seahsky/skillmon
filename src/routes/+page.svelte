@@ -35,6 +35,26 @@
     type SortState,
     type UsageSettings,
   } from "$lib/skills";
+  import {
+    cascadeNote,
+    formatBytes,
+    isPurgeable,
+    purgeSummaryMessage,
+    rebuildWarning,
+    reclaimableBytes,
+    relativeAge,
+    removalTitle,
+    retentionDescription,
+    retentionLabel,
+    revertedNote,
+    sourceOptionLabel,
+    trashUnitSummary,
+    type PurgeSummary,
+    type RemovalPlanReport,
+    type Retention,
+    type TombstoneReport,
+    type TrashUnitReport,
+  } from "$lib/removal";
 
   let report = $state<ScanReport | null>(null);
   let error = $state<string | null>(null);
@@ -48,7 +68,40 @@
 
   // API-key settings (issue #4). The panel is a view-swap: the gear replaces
   // the skill table with a settings pane, never a modal on this small surface.
-  let view = $state<"table" | "settings">("table");
+  // The removed view (DESIGN.md UX #6) is a third swap for the same reason.
+  let view = $state<"table" | "settings" | "removed">("table");
+
+  // The removal confirm dialog (issue #31). A modal here, unlike settings,
+  // because it is the one surface that must not be dismissible by wandering off:
+  // it asks a question about deleting the user's files, and the answer differs
+  // per row. `plan` being non-null is what opens it.
+  let plan = $state<RemovalPlanReport | null>(null);
+  let planLoading = $state(false);
+  let planError = $state<string | null>(null);
+  // Trashed by default: it is the reclaimable intent, and the one a user reaching
+  // for "remove" means. Disable is the deliberate choice, so it is the one you
+  // pick rather than the one you fall into.
+  let retention = $state<Retention>("trashed");
+  let removeSourceOn = $state(false);
+  let removing = $state(false);
+
+  // The removed view's two lists, which outlive each other: a purged skill has
+  // no unit left, and its tombstone is then the only handle on it (ADR 0029).
+  let trashUnits = $state<TrashUnitReport[]>([]);
+  let tombstones = $state<TombstoneReport[]>([]);
+  let removedLoading = $state(false);
+  let removedMessage = $state<string | null>(null);
+  let removedError = $state<string | null>(null);
+  // Stamped when the view loads rather than read per row, so every age on screen
+  // is measured from one instant and the list cannot render two "now"s. The core
+  // holds no wall clock (issue #14), so this is the panel's job.
+  let removedNow = $state(0);
+
+  // Every mutation applies to NEW sessions only, because enablement is read at
+  // session start (DESIGN.md, ADR 0007). Set after any successful change, and
+  // deliberately sticky: a rescan must not clear it, since the rescan does not
+  // restart anyone's Claude Code.
+  let restartNudge = $state(false);
   let keyInput = $state("");
   let saving = $state(false);
   let setOutcome = $state<SetKeyOutcome | null>(null);
@@ -97,6 +150,18 @@
   const hasSkills = $derived(allSkills.length > 0);
   const hasMain = $derived(mainRows.length > 0);
 
+  // The source option is offered only where the tool said it could make the
+  // removal stick; a blocked offer renders its reason instead (ADR 0027).
+  const sourceOffer = $derived(plan?.source ?? null);
+  const canRemoveSource = $derived(!!sourceOffer && sourceOffer.blocked === null);
+  // `removeSourceOn` is guarded rather than trusted: the checkbox cannot exist
+  // while the offer is blocked, but the flag outlives one dialog and the backend
+  // would refuse anyway. Better to never ask.
+  const takingSource = $derived(canRemoveSource && removeSourceOn);
+  const warning = $derived(plan ? rebuildWarning(plan, retention, takingSource) : null);
+  const cascade = $derived(plan ? cascadeNote(plan) : null);
+  const staged = $derived(reclaimableBytes(trashUnits));
+
   async function load() {
     loading = true;
     error = null;
@@ -106,6 +171,117 @@
       error = String(e);
     } finally {
       loading = false;
+    }
+  }
+
+  // Ask the backend what removing this row would actually do, and show it before
+  // touching anything. The plan is worked out against a fresh discovery, so a
+  // row whose skill has since been uninstalled reports that rather than
+  // describing a removal of something that is not there.
+  async function openRemoval(skill: SkillReport) {
+    plan = null;
+    planError = null;
+    planLoading = true;
+    removeSourceOn = false;
+    retention = "trashed";
+    try {
+      plan = await invoke<RemovalPlanReport>("plan_removal", { id: skill.id });
+    } catch (e) {
+      planError = String(e);
+    } finally {
+      planLoading = false;
+    }
+  }
+
+  function closeRemoval() {
+    plan = null;
+    planError = null;
+    planLoading = false;
+  }
+
+  async function confirmRemoval() {
+    if (!plan || removing) return;
+    removing = true;
+    planError = null;
+    try {
+      await invoke<number>("remove_skill", { id: plan.id, retention, removeSource: takingSource });
+      closeRemoval();
+      restartNudge = true;
+      await load();
+    } catch (e) {
+      // The dialog stays open on failure: the message is about the row it names,
+      // and closing would leave the user with an error and no idea what it was
+      // about.
+      planError = String(e);
+    } finally {
+      removing = false;
+    }
+  }
+
+  // The removed view's two lists. Loaded together because they are one view, and
+  // separately from each other because a purged skill has only a tombstone.
+  async function loadRemoved() {
+    removedLoading = true;
+    removedError = null;
+    try {
+      [trashUnits, tombstones] = await Promise.all([
+        invoke<TrashUnitReport[]>("list_trash"),
+        invoke<TombstoneReport[]>("list_tombstones"),
+      ]);
+      removedNow = Date.now();
+    } catch (e) {
+      removedError = String(e);
+    } finally {
+      removedLoading = false;
+    }
+  }
+
+  function openRemoved() {
+    removedMessage = null;
+    view = "removed";
+    loadRemoved();
+  }
+
+  async function restoreUnit(unit: TrashUnitReport) {
+    removedError = null;
+    removedMessage = null;
+    try {
+      await invoke("restore_trash_unit", { unitId: unit.id });
+      removedMessage = `Restored ${unit.declaredName}.`;
+      restartNudge = true;
+      await Promise.all([loadRemoved(), load()]);
+    } catch (e) {
+      removedError = String(e);
+      // The refusal is about the disk, not the ledger — a manager rebuilt the
+      // path — so re-read: the row's `reverted` note is the explanation.
+      await loadRemoved();
+    }
+  }
+
+  async function purgeUnit(unit: TrashUnitReport) {
+    removedError = null;
+    removedMessage = null;
+    try {
+      const freed = await invoke<number>("purge_trash_unit", { unitId: unit.id });
+      removedMessage = `Reclaimed ${formatBytes(freed)} from ${unit.declaredName}.`;
+      await loadRemoved();
+    } catch (e) {
+      removedError = String(e);
+    }
+  }
+
+  // Reports what was actually reclaimed, never the figure the button offered: a
+  // sweep that freed a gigabyte and failed on one tree must not claim a clean
+  // one (ADR 0029).
+  async function emptyTrash() {
+    removedError = null;
+    removedMessage = null;
+    try {
+      const summary = await invoke<PurgeSummary>("empty_trash");
+      removedMessage = purgeSummaryMessage(summary);
+      await loadRemoved();
+    } catch (e) {
+      removedError = String(e);
     }
   }
 
@@ -295,6 +471,10 @@
     {@render numHeader("alwaysOn", "Always-on")}
     {@render numHeader("onInvoke", "On-invoke")}
     {@render numHeader("onDemand", "On-demand")}
+    <!-- Unlabeled and unsortable: it holds each row's remove affordance, and a
+         header over it would read as a fifth sortable figure. Present rather
+         than omitted so the grid's columns line up with the rows'. -->
+    <div class="col actions colhead" role="columnheader"></div>
   </div>
 {/snippet}
 
@@ -346,6 +526,27 @@
       {:else}
         {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand))}
       {/if}
+      <div class="col actions" role="cell">
+        {#if skill.id.kind === "plugin"}
+          <!-- Plugin-locked: you cannot remove one skill, only the whole plugin
+               (DESIGN.md), and that goes through the `claude plugin` CLI rather
+               than an entry move. Disabled rather than absent, so the reason is
+               reachable instead of the row just looking different. -->
+          <button
+            class="row-btn"
+            disabled
+            aria-label={`Remove ${skill.id.name}`}
+            title="Plugin-locked: remove the whole plugin, not one of its skills"
+          >⋯</button>
+        {:else}
+          <button
+            class="row-btn"
+            onclick={() => openRemoval(skill)}
+            aria-label={`Remove ${skill.id.name}`}
+            title="Disable or remove this skill"
+          >⋯</button>
+        {/if}
+      </div>
     </div>
 
     {#if skill.managerRoot}
@@ -471,10 +672,99 @@
         Toggle the panel from anywhere with <kbd>⌘⇧K</kbd>.
       </p>
     </section>
+  {:else if view === "removed"}
+    <header class="topbar">
+      <button class="icon-btn back" onclick={() => (view = "table")} aria-label="Back to skills" title="Back">‹</button>
+      <h1>Removed</h1>
+      <span class="spacer"></span>
+    </header>
+
+    <section class="settings removed-pane">
+      {#if removedError}
+        <p class="notice rejected">{removedError}</p>
+      {/if}
+      {#if removedMessage}
+        <p class="notice ok">{removedMessage}</p>
+      {/if}
+
+      {#if removedLoading && trashUnits.length === 0}
+        <p class="hint">Loading…</p>
+      {:else if trashUnits.length === 0 && tombstones.length === 0}
+        <p class="hint">
+          Nothing removed. Skills you disable or delete land here, where you can undo them or reclaim their disk space.
+        </p>
+      {/if}
+
+      {#if trashUnits.length > 0}
+        <div class="pane-head">
+          <h2>Staged</h2>
+          {#if staged > 0}
+            <!-- The figure is what makes explicit purge work instead of a timer:
+                 a gigabyte announces itself rather than expiring quietly
+                 (ADR 0029). -->
+            <button class="danger" onclick={emptyTrash} title="Permanently delete every trashed removal. Disabled skills are kept.">
+              Empty trash ({formatBytes(staged)})
+            </button>
+          {/if}
+        </div>
+        <ul class="unit-list">
+          {#each trashUnits as unit (unit.id)}
+            {@const note = revertedNote(unit)}
+            <li class="unit" class:reverted={unit.reverted}>
+              <div class="unit-head">
+                <span class="unit-name">{unit.declaredName}</span>
+                <span class="badge {unit.retention}">{retentionLabel(unit.retention).toLowerCase()}</span>
+                <span class="spacer"></span>
+                <span class="unit-age">{relativeAge(unit.removedAtMillis, removedNow)}</span>
+              </div>
+              <div class="unit-sub">{trashUnitSummary(unit)}</div>
+              {#if note}
+                <p class="unit-note">{note}</p>
+              {/if}
+              <div class="unit-actions">
+                <button onclick={() => restoreUnit(unit)}>
+                  {unit.retention === "disabled" ? "Re-enable" : "Restore"}
+                </button>
+                {#if isPurgeable(unit)}
+                  <button class="danger" onclick={() => purgeUnit(unit)} title="Permanently delete these files. The removed row and its usage history are kept.">
+                    Delete permanently
+                  </button>
+                {/if}
+              </div>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+
+      {#if tombstones.length > 0}
+        <div class="pane-head">
+          <h2>Removed</h2>
+        </div>
+        <!-- Tombstones outlive the bytes: a purged skill has no unit left, and
+             this row is the only handle on it. Its usage history was never
+             deleted, so reinstalling picks up where it left off (DESIGN.md UX
+             #6, ADR 0029). -->
+        <ul class="tomb-list">
+          {#each tombstones as tomb (tomb.declaredName + tomb.removedAtMillis)}
+            <li class="tomb">
+              <span class="tomb-name">{tomb.declaredName}</span>
+              <span class="spacer"></span>
+              <span class="unit-age">{relativeAge(tomb.removedAtMillis, removedNow)}</span>
+            </li>
+          {/each}
+        </ul>
+        <p class="hint why">
+          Reinstall any of these and skillmon picks its history back up — usage totals were never deleted.
+        </p>
+      {/if}
+    </section>
   {:else}
     <header class="topbar">
       <h1>Skills</h1>
       <div class="topbar-right">
+        <button class="rescan" onclick={openRemoved} title="Skills you have disabled or removed">
+          Removed
+        </button>
         <button class="rescan" onclick={load} disabled={loading} title="Rescan now">
           {loading ? "Scanning…" : "Rescan"}
         </button>
@@ -528,6 +818,17 @@
         <span class="active-repo" title={activeRepoPath}>active: {repoBasename(activeRepoPath)}</span>
       {/if}
     </div>
+
+    {#if restartNudge}
+      <!-- Every mutation applies to new sessions only: Claude Code reads
+           enablement at session start (DESIGN.md, ADR 0007). Dismissible but
+           never self-clearing — a rescan does not restart anyone's session, so
+           only the user can say they have dealt with it. -->
+      <div class="nudge">
+        <span>Restart Claude Code to apply. Running sessions keep the skills they started with.</span>
+        <button class="linklike" onclick={() => (restartNudge = false)}>Dismiss</button>
+      </div>
+    {/if}
 
     {#if report?.warnings?.length}
       <ul class="warnings">
@@ -623,6 +924,84 @@
     {/if}
   {/if}
 </main>
+
+{#if planLoading || plan || planError}
+  <!-- The removal dialog. A modal, unlike the settings view-swap, because it asks
+       one question about one row's files and must not be wandered away from. -->
+  <div
+    class="scrim"
+    role="button"
+    tabindex="-1"
+    aria-label="Cancel"
+    onclick={closeRemoval}
+    onkeydown={(e) => e.key === "Escape" && closeRemoval()}
+  ></div>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="removal-title">
+    {#if planLoading}
+      <p class="hint">Working out what this removes…</p>
+    {:else if plan}
+      <h2 id="removal-title">{removalTitle(plan)}</h2>
+
+      <!-- The entry, shown rather than asserted: "delete this skill" means three
+           different things depending on what this path turns out to be. -->
+      <p class="dialog-path" title={plan.entryPath}>{plan.entryPath}</p>
+
+      {#if cascade}
+        <p class="dialog-cascade">{cascade}</p>
+      {/if}
+
+      {#if sourceOffer}
+        {#if canRemoveSource}
+          <label class="inline-toggle source-opt" title={sourceOffer.path}>
+            <input type="checkbox" bind:checked={removeSourceOn} disabled={removing} />
+            {sourceOptionLabel(sourceOffer)}
+          </label>
+        {:else}
+          <!-- The reason, in place of the option. An affordance that is missing
+               without explaining itself reads as a bug, which is exactly why the
+               tool returns a reason rather than a bare "no" (ADR 0027). -->
+          <p class="dialog-blocked">{sourceOffer.blocked}</p>
+        {/if}
+      {/if}
+
+      <div class="retention" role="group" aria-label="What to do with it">
+        <button
+          class="seg"
+          class:active={retention === "disabled"}
+          onclick={() => (retention = "disabled")}
+          disabled={removing}
+        >Disable</button>
+        <button
+          class="seg"
+          class:active={retention === "trashed"}
+          onclick={() => (retention = "trashed")}
+          disabled={removing}
+        >Delete</button>
+      </div>
+      <p class="hint why">{retentionDescription(retention)}</p>
+
+      {#if warning}
+        <p class="dialog-warning">{warning}</p>
+      {/if}
+
+      {#if planError}
+        <p class="notice rejected">{planError}</p>
+      {/if}
+
+      <div class="dialog-actions">
+        <button onclick={closeRemoval} disabled={removing}>Cancel</button>
+        <button class="danger" onclick={confirmRemoval} disabled={removing}>
+          {removing ? "Working…" : retentionLabel(retention)}
+        </button>
+      </div>
+    {:else if planError}
+      <p class="notice rejected">{planError}</p>
+      <div class="dialog-actions">
+        <button onclick={closeRemoval}>Close</button>
+      </div>
+    {/if}
+  </div>
+{/if}
 
 <style>
   :root {
@@ -810,7 +1189,11 @@
 
   .row {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 84px 84px 84px;
+    /* The trailing 22px is the remove affordance's column. Fixed, and narrow
+       enough that it costs the name column almost nothing: the three figures are
+       what the panel is for, and an action column that pushed them around would
+       be paying for a button with the data. */
+    grid-template-columns: minmax(0, 1fr) 84px 84px 84px 22px;
     align-items: center;
     gap: 4px;
     padding: 5px 12px;
@@ -1192,6 +1575,270 @@
   }
   .hint.why {
     color: var(--faint);
+  }
+
+  /* The per-row remove affordance. Faint until the row is hovered: 71 of these
+     down a list would otherwise read as the busiest thing on screen, and the
+     figures are what the panel is for. Focus reveals it too, so it is reachable
+     by keyboard without a mouse ever being involved. */
+  .row-btn {
+    border: none;
+    background: none;
+    padding: 0;
+    width: 100%;
+    color: var(--faint);
+    opacity: 0;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .skill-group:hover .row-btn,
+  .row-btn:focus-visible {
+    opacity: 1;
+  }
+  .row-btn:hover:not(:disabled) {
+    color: var(--fg);
+  }
+  .row-btn:disabled {
+    cursor: default;
+  }
+  /* A plugin row's affordance stays hidden even on hover: it can never do
+     anything, and revealing a dead control on every hover teaches the user to
+     distrust the one beside it. Its tooltip still explains why on hover. */
+  .skill-group:hover .row-btn:disabled {
+    opacity: 0.3;
+  }
+
+  /* The "restart Claude Code to apply" nudge (ADR 0007). Informational, not a
+     warning: nothing is wrong, the change simply lands for new sessions. */
+  .nudge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 12px 6px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: #eef3fd;
+    color: #2f5bb7;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .nudge .linklike {
+    flex: none;
+    color: #2f5bb7;
+    text-decoration: underline;
+  }
+
+  /* The removed view (DESIGN.md UX #6). Wider than the settings pane it borrows
+     its layout from: a unit's note is a sentence about the user's files, not a
+     field label. */
+  .removed-pane {
+    max-width: none;
+    overflow-y: auto;
+  }
+  .pane-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 4px;
+  }
+  .pane-head h2 {
+    margin: 0;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .pane-head .danger {
+    margin-left: auto;
+  }
+  .unit-list,
+  .tomb-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .unit {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 8px 10px;
+    background: #fff;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  /* A unit whose origin came back: its label is no longer true, or its undo
+     cannot land (ADR 0027's hazard). Marked, because the note explaining it is
+     the point of the row. */
+  .unit.reverted {
+    border-color: #e6c98f;
+    background: #fffdf6;
+  }
+  .unit-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .unit-name {
+    font-weight: 500;
+  }
+  .unit-age,
+  .unit-sub {
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .unit-note {
+    margin: 0;
+    font-size: 11px;
+    line-height: 1.45;
+    color: #6b5900;
+  }
+  .unit-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 2px;
+  }
+  .unit-actions button,
+  .pane-head button {
+    font-size: 11px;
+    padding: 3px 8px;
+  }
+  .unit-actions .danger,
+  .pane-head .danger {
+    color: #b3261e;
+    border-color: #e6b4b0;
+  }
+  .unit-actions .danger:hover:not(:disabled),
+  .pane-head .danger:hover:not(:disabled) {
+    border-color: #b3261e;
+  }
+  .badge.disabled {
+    background: var(--badge-bg);
+  }
+  .badge.trashed {
+    background: #fdeceb;
+    color: #b3261e;
+  }
+  .tomb {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 2px;
+    border-bottom: 1px solid var(--line);
+    color: var(--muted);
+  }
+  .tomb-name {
+    color: var(--fg);
+  }
+
+  /* The removal dialog. */
+  .scrim {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.28);
+    border: none;
+    padding: 0;
+  }
+  .dialog {
+    position: fixed;
+    inset: 12px;
+    top: auto;
+    bottom: 12px;
+    max-height: calc(100vh - 24px);
+    overflow-y: auto;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .dialog h2 {
+    margin: 0;
+    font-size: 14px;
+  }
+  /* The path is shown, not asserted: the same-looking entry can be a link a tool
+     rebuilds, a link whose target is the only copy, or a real directory, and the
+     user is entitled to see which. Breaks anywhere rather than ellipsizing — a
+     truncated path is exactly the part that matters. */
+  .dialog-path {
+    margin: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10px;
+    color: var(--muted);
+    word-break: break-all;
+  }
+  .dialog-cascade {
+    margin: 0;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: #fbeee8;
+    font-size: 11px;
+    line-height: 1.45;
+  }
+  .dialog-warning {
+    margin: 0;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: #fff8e6;
+    color: #6b5900;
+    font-size: 11px;
+    line-height: 1.45;
+  }
+  /* Rendered where the option would have been, so the space explains itself
+     rather than just being empty (ADR 0027). */
+  .dialog-blocked {
+    margin: 0;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--muted);
+    border-left: 2px solid var(--line);
+    padding-left: 8px;
+  }
+  .source-opt {
+    align-items: flex-start;
+    line-height: 1.4;
+  }
+  .retention {
+    display: inline-flex;
+    align-self: flex-start;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .retention .seg {
+    border: none;
+    border-radius: 0;
+    padding: 4px 12px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .retention .seg + .seg {
+    border-left: 1px solid var(--line);
+  }
+  .retention .seg.active {
+    background: var(--accent);
+    color: #fff;
+  }
+  .dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 2px;
+  }
+  .dialog-actions .danger {
+    color: #fff;
+    background: #b3261e;
+    border-color: #b3261e;
+  }
+  .dialog-actions .danger:disabled {
+    opacity: 0.6;
+    color: #fff;
   }
 
   /* Inline outcome messages in the settings pane. */

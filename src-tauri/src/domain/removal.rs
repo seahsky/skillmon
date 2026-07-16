@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::skill::SkillId;
 
@@ -10,7 +10,11 @@ use super::skill::SkillId;
 /// thing that distinguishes them. Keeping the intent in state rather than in the
 /// destination path is what let ADR 0027 collapse ADR 0007's two mechanisms into
 /// one code path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// `Deserialize`, unlike the read-only report DTOs, because it is the one thing
+/// about a removal the *user* chooses: it crosses inbound on `remove_skill`
+/// (issue #31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Retention {
     /// Kept indefinitely, and never purged -- not by `empty_trash`, not by a
@@ -66,6 +70,49 @@ pub struct EntryToRemove {
     /// The path *under the scan root* -- the entry itself, never what it
     /// resolves to. skillmon removes the entry, never through it (ADR 0027).
     pub entry_path: PathBuf,
+    /// The managing tool's own copy, to be staged alongside, when the user took
+    /// ADR 0027's second, explicit opt-in *and* the tool said it could make the
+    /// removal stick.
+    ///
+    /// `None` is the default and the core rule. That this is an `Option` the
+    /// caller has to fill in, rather than something this layer could work out
+    /// from a path, is the seam: `removal` resolves no symlink and knows what
+    /// gstack is (`removal::mod` docs).
+    pub source: Option<SourceToRemove>,
+}
+
+/// The managing tool's copy of a skill, and how to make its removal stick.
+#[derive(Debug, Clone)]
+pub struct SourceToRemove {
+    /// Where the content really lives -- what `SKILL.md` resolves to.
+    pub path: PathBuf,
+    /// The tool's bookkeeping, already dropped by the planner, kept here so the
+    /// ledger can store it and a restore can hand it back
+    /// (`ManagingTool::relearn_source`).
+    pub state: Option<String>,
+}
+
+/// A managing tool's own copy of a skill, staged alongside the entry that
+/// pointed at it (ADR 0027's opt-in source removal).
+///
+/// Nested inside `TrashedEntry` rather than sitting beside it as another entry
+/// in the unit, because entry and source are two halves of *one* skill: a unit's
+/// entry count stays a count of skills, and -- decisively -- one undo puts back
+/// both. Restoring an entry whose source stayed in the trash would rebuild a
+/// symlink pointing at nothing, and `discovery/scan.rs` turns a dangling entry
+/// into a warning and a silently vanished row. That is the outcome ADR 0027
+/// rejected on evidence; it must not reappear as a restore path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashedSource {
+    /// The managing tool's directory -- where `SKILL.md` actually resolved.
+    pub origin_path: PathBuf,
+    pub stored_path: PathBuf,
+    pub bytes: u64,
+    /// What the tool dropped from its own bookkeeping to make the removal
+    /// stick, opaque to skillmon and stored verbatim so `relearn_source` can put
+    /// it back (`managing_tool::ManagingTool::forget_source`). `None` means the
+    /// tool had nothing recorded, so a restore has nothing to teach it.
+    pub state: Option<String>,
 }
 
 /// One entry that has been moved out of the scan root and recorded.
@@ -83,6 +130,24 @@ pub struct TrashedEntry {
     /// trash, so the figure cannot go stale, and re-walking 1.1 GB to render a
     /// number on every panel open is not a trade worth making.
     pub bytes: u64,
+    /// The managing tool's copy, when the user opted into removing it too.
+    /// `None` -- the default and the overwhelming majority -- is entry-only
+    /// removal, ADR 0027's core rule: skillmon removes the entry, never through
+    /// it.
+    pub source: Option<TrashedSource>,
+}
+
+impl TrashedEntry {
+    /// What removing this one skill took off the disk: its entry, plus the
+    /// managing tool's copy when that was removed too.
+    ///
+    /// Named apart from the `bytes` field on purpose. `entry.bytes` compiles and
+    /// means something narrower, and it under-reports worst on exactly the rows
+    /// where it matters -- a `.agents` entry is a symlink of a few bytes, and
+    /// everything reclaimable is in the source beside it.
+    pub fn total_bytes(&self) -> u64 {
+        self.bytes + self.source.as_ref().map_or(0, |s| s.bytes)
+    }
 }
 
 /// One removal, and one undo (ADR 0027). The primary is a field rather than the
@@ -131,7 +196,7 @@ impl TrashUnit {
     /// agents are neither cascaded nor counted here. This is not the tool's disk
     /// footprint and must not be presented as one.
     pub fn bytes(&self) -> u64 {
-        self.entries().map(|e| e.bytes).sum()
+        self.entries().map(TrashedEntry::total_bytes).sum()
     }
 
     /// The directory holding this unit's staged entries, derived from where the
@@ -140,6 +205,81 @@ impl TrashUnit {
     pub fn storage_dir(&self) -> Option<&std::path::Path> {
         self.primary.stored_path.parent()
     }
+
+    /// Whether anything now sits at an origin this unit would restore to
+    /// (ADR 0027's recorded hazard).
+    ///
+    /// On a `Disabled` unit that means a managing tool rebuilt the entry and
+    /// skillmon's "disabled" is no longer true -- the skill is live in context
+    /// again. The panel reconciles by rendering this rather than its own claim.
+    ///
+    /// `symlink_metadata`, never `exists()`, for the reason `restore`'s precheck
+    /// gives: `exists()` follows links, so a shim rebuilt ahead of its target
+    /// reads as absent -- and that is precisely the shape a mid-rebuild tool
+    /// leaves behind.
+    pub fn is_reverted(&self) -> bool {
+        self.entries().any(|e| std::fs::symlink_metadata(&e.origin_path).is_ok())
+    }
+}
+
+/// What removing one row would actually do, worked out before anything moves
+/// (ADR 0027).
+///
+/// Exists because "delete this skill" has no single meaning: the same path can
+/// be a link whose removal a tool silently reverts, a link whose target is the
+/// only copy, or a real directory. The dialog has to say which of those the user
+/// is looking at, and the plan is that answer -- computed once, rendered, and
+/// then executed on the user's say-so.
+#[derive(Debug, Clone)]
+pub struct RemovalPlan {
+    pub primary: EntryToRemove,
+    /// The skills that resolve into the primary and move with it, as one unit
+    /// with one undo. Non-empty exactly when this is a tool uninstall.
+    ///
+    /// A **floor**: skillmon scans Claude Code's paths alone, so a tool's
+    /// entries for other agents are neither here nor moved (ADR 0027). The
+    /// dialog must not present it as exhaustive.
+    pub dependents: Vec<EntryToRemove>,
+    /// The managing tool's own copy of the primary, and whether removing it can
+    /// be made to stick. `None` = unmanaged, so the entry *is* the content and
+    /// there is no second thing to offer.
+    pub source: Option<SourceOffer>,
+    /// The manager root that will put this entry back, when one will
+    /// (ADR 0027's recorded hazard: a quarantined shim is silently rebuilt, and
+    /// skillmon's state would go on claiming the skill is disabled while it is
+    /// live in context).
+    ///
+    /// `None` for an unmanaged row, whose removal nothing reverts.
+    pub rebuilt_by: Option<PathBuf>,
+}
+
+impl RemovalPlan {
+    /// Whether this is a tool uninstall rather than a skill removal (ADR 0027).
+    /// Derived from the cascade rather than stored, exactly as on `TrashUnit`,
+    /// so the label and the entries can never disagree.
+    pub fn is_tool_uninstall(&self) -> bool {
+        !self.dependents.is_empty()
+    }
+}
+
+/// The managing tool's copy of a skill, offered for removal or refused with a
+/// reason (ADR 0027's second, explicit opt-in).
+#[derive(Debug, Clone)]
+pub struct SourceOffer {
+    /// Where the content really lives -- what `SKILL.md` resolves to. Named in
+    /// the dialog alongside the entry path, because an option that reaches
+    /// outside `~/.claude` must say so.
+    pub path: PathBuf,
+    /// The tool that owns it, or `None` when no known tool claims the manager
+    /// root. An unknown manager is entry-only, honestly labeled.
+    pub tool_name: Option<String>,
+    /// `None` = removable. `Some(reason)` = it is not, and this is why -- a
+    /// missing option must explain itself or it reads as a bug.
+    ///
+    /// The reason *is* the flag, deliberately: a separate bool could disagree
+    /// with it, and the disagreement that matters is "unavailable, with nothing
+    /// to tell the user why".
+    pub blocked: Option<String>,
 }
 
 /// The retained "(removed)" marker for an uninstalled skill (DESIGN.md UX #6).
@@ -169,6 +309,21 @@ mod tests {
             origin_path: PathBuf::from(format!("/home/me/.claude/skills/{name}")),
             stored_path: PathBuf::from(format!("/home/me/.claude/skillmon/removed/1/0-{name}")),
             bytes,
+            source: None,
+        }
+    }
+
+    /// The same entry, with the managing tool's copy staged beside it -- ADR
+    /// 0027's opt-in source removal.
+    fn entry_with_source(name: &str, entry_bytes: u64, source_bytes: u64) -> TrashedEntry {
+        TrashedEntry {
+            source: Some(TrashedSource {
+                origin_path: PathBuf::from(format!("/home/me/.agents/skills/{name}")),
+                stored_path: PathBuf::from(format!("/home/me/.claude/skillmon/removed/1/0-source")),
+                bytes: source_bytes,
+                state: Some(r#"{"key":"tdd"}"#.to_string()),
+            }),
+            ..entry(name, entry_bytes)
         }
     }
 
@@ -217,6 +372,84 @@ mod tests {
         let u = unit(entry("gstack", 1), vec![entry("ship", 2), entry("review", 3)]);
         let names: Vec<&str> = u.entries().map(|e| e.skill_id.name()).collect();
         assert_eq!(names, vec!["gstack", "ship", "review"]);
+    }
+
+    /// A `.agents` skill's real weight: the entry is a symlink of a few bytes,
+    /// and everything reclaimable is the source. Counting the entry alone would
+    /// offer to free ~0 for a removal that frees megabytes.
+    #[test]
+    fn an_entry_with_a_removed_source_counts_both_halves() {
+        let e = entry_with_source("tdd", 20, 40_000);
+        assert_eq!(e.total_bytes(), 40_020);
+
+        let u = unit(e, vec![]);
+        assert_eq!(u.bytes(), 40_020);
+        assert_eq!(u.entry_count(), 1, "entry + source is still one skill, and one row");
+        assert!(!u.is_tool_uninstall(), "removing a skill's own content is not a tool uninstall");
+    }
+
+    /// The default and the rule: entry-only removal leaves the manager's content
+    /// alone, so there is nothing extra to reclaim.
+    #[test]
+    fn an_entry_without_a_removed_source_counts_only_the_entry() {
+        assert_eq!(entry("ship", 20).total_bytes(), 20);
+    }
+
+    /// ADR 0027's hazard, on the shape it actually bites: a gstack shim
+    /// quarantined as `Disabled`, which the next `/gstack-upgrade` rebuilds. The
+    /// state file still says "disabled" while the skill is live in context, so
+    /// the panel has to reconcile against the disk rather than keep its claim.
+    #[test]
+    fn a_unit_whose_origin_has_been_rebuilt_reads_as_reverted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("skills/ship");
+        let u = TrashUnit {
+            primary: TrashedEntry { origin_path: origin.clone(), ..entry("ship", 10) },
+            ..unit(entry("ship", 10), vec![])
+        };
+
+        assert!(!u.is_reverted(), "nothing is there yet, so the disable still holds");
+
+        std::fs::create_dir_all(&origin).unwrap();
+        assert!(u.is_reverted(), "the manager put it back, and the ledger's claim is now false");
+    }
+
+    /// The exact reason this cannot use `Path::exists()`: a shim rebuilt ahead
+    /// of its target is a *dangling* link, which `exists()` reports as absent --
+    /// so the reverted entry would read as still-removed, and the restore that
+    /// followed would fail with `OriginOccupied` for reasons the panel never
+    /// mentioned.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_at_the_origin_still_counts_as_reverted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("skills/ship");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("not-cloned-yet"), &origin).unwrap();
+
+        let u = TrashUnit {
+            primary: TrashedEntry { origin_path: origin.clone(), ..entry("ship", 10) },
+            ..unit(entry("ship", 10), vec![])
+        };
+
+        assert!(!origin.exists(), "the fixture really is the case exists() gets wrong");
+        assert!(u.is_reverted());
+    }
+
+    /// A cascade is reverted if *any* of its entries came back: the unit
+    /// restores as one, so one occupied origin is enough to make the undo fail.
+    #[test]
+    fn a_unit_is_reverted_when_any_dependent_came_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rebuilt = tmp.path().join("skills/ship");
+        std::fs::create_dir_all(&rebuilt).unwrap();
+
+        let u = unit(
+            TrashedEntry { origin_path: tmp.path().join("skills/gstack"), ..entry("gstack", 10) },
+            vec![TrashedEntry { origin_path: rebuilt, ..entry("ship", 1) }],
+        );
+
+        assert!(u.is_reverted(), "the primary is still gone, but the unit can no longer restore cleanly");
     }
 
     #[test]

@@ -312,6 +312,7 @@ mod tests {
                 skill_id: SkillId::Personal { name: name.to_string() },
                 declared_name: name.to_string(),
                 entry_path: skills.join(name),
+                source: None,
             }
         };
         let primary = install("gstack");

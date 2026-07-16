@@ -1,30 +1,45 @@
 //! Reversible entry removal: move it out, put it back, or reclaim it (ADR 0029).
 //!
-//! The seam split with issue #31 is: **that** decides *what* to remove -- entry
-//! or source, which dependents cascade, whether a managing tool can make a
-//! source removal stick -- and this moves it out reversibly and records it. So
-//! nothing here reads a `SKILL.md`, resolves a symlink, or knows what gstack is.
+//! The seam splits in two, and this file is the second half. `plan` decides
+//! *what* to remove -- entry or source, which dependents cascade, whether a
+//! managing tool can make a source removal stick -- and this moves what it was
+//! handed, reversibly, and records it. So nothing in *this* file reads a
+//! `SKILL.md`, resolves a symlink, or knows what gstack is; that knowledge is
+//! confined to `plan`, which writes nothing.
 //!
 //! Harness-neutral, like `footprint/` and for the same reason (ADR 0002): the
 //! caller passes the storage root, and no Claude Code path is named here.
 
 pub mod fs_ops;
+pub mod plan;
 pub mod store;
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Result as SqliteResult, Transaction};
 
-use crate::domain::removal::{EntryToRemove, Retention, TrashUnit, TrashUnitId, TrashedEntry};
+use crate::domain::removal::{EntryToRemove, Retention, TrashUnit, TrashUnitId, TrashedEntry, TrashedSource};
 use crate::domain::report::PurgeSummary;
+use crate::managing_tool::ManagingTools;
 use store::TrashStore;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemovalError {
     #[error("trash unit {0} is not in the ledger")]
     UnknownUnit(i64),
+    /// A ref the panel held onto no longer names a row in a fresh scan. The
+    /// point of resolving refs at all: this fails rather than aiming a delete at
+    /// whatever now sits where the skill used to (`plan::resolve`).
+    #[error("{name} is no longer installed, so there is nothing to remove")]
+    UnknownSkill { name: String },
+    /// The user asked for ADR 0027's second opt-in where it is not on offer --
+    /// a tool that cannot make it stick, an unrecognized manager, or a skill
+    /// whose content is its own entry.
+    #[error("{name}'s content cannot be removed: {reason}")]
+    SourceUnavailable { name: String, reason: String },
     /// ADR 0027's recorded hazard, reached: a managing tool rebuilt the path
     /// while the entry sat in the trash. Failing loudly is the point -- the
     /// alternative is clobbering what the tool just wrote.
@@ -144,23 +159,92 @@ fn stage_one(entry: &EntryToRemove, ordinal: usize, storage_dir: &Path) -> Resul
     let stored_path = storage_dir.join(format!("{ordinal}-{}", name.to_string_lossy()));
     fs_ops::move_entry(&entry.entry_path, &stored_path)?;
 
+    // The source second, and only after the entry has moved. If it fails, the
+    // entry is put back before the error goes up -- a skill whose content was
+    // trashed while its entry stayed live is a dangling entry, the one shape
+    // ADR 0027 refuses to produce.
+    let source = match stage_source(entry, ordinal, storage_dir, name) {
+        Ok(source) => source,
+        Err(e) => {
+            move_back(std::iter::once((stored_path.as_path(), entry.entry_path.as_path())));
+            return Err(e);
+        }
+    };
+
     Ok(TrashedEntry {
         skill_id: entry.skill_id.clone(),
         declared_name: entry.declared_name.clone(),
         origin_path: entry.entry_path.clone(),
         stored_path,
         bytes,
+        source,
     })
 }
 
-/// Undoes a partial staging: puts entries back where they came from.
+/// Stages the managing tool's own copy beside its entry, under the same unit.
+///
+/// Under the same ordinal rather than one of its own: the two are one skill, so
+/// one undo has to put back both (`domain::removal::TrashedSource`). The tool's
+/// bookkeeping was already dropped by the planner and is only carried through to
+/// the ledger here -- this module knows no tools (see the module docs).
+///
+/// The name is built from the entry's own stored name, and that is what keeps
+/// the two from landing on each other. A bare `{ordinal}-source` would collide
+/// with a skill directory legitimately named `source`, and nothing rejects that
+/// name -- discovery takes any UTF-8 directory. Deriving it instead makes the
+/// collision unrepresentable: within one ordinal the entry is `{name}` and its
+/// source is `source-{name}`, and no string equals its own extension; across
+/// ordinals the prefix already differs.
+fn stage_source(entry: &EntryToRemove, ordinal: usize, storage_dir: &Path, entry_name: &OsStr) -> Result<Option<TrashedSource>, RemovalError> {
+    let Some(source) = entry.source.as_ref() else { return Ok(None) };
+
+    let bytes = fs_ops::entry_size(&source.path)?;
+    let stored_path = storage_dir.join(format!("{ordinal}-source-{}", entry_name.to_string_lossy()));
+    fs_ops::move_entry(&source.path, &stored_path)?;
+
+    Ok(Some(TrashedSource {
+        origin_path: source.path.clone(),
+        stored_path,
+        bytes,
+        state: source.state.clone(),
+    }))
+}
+
+/// Undoes a partial staging: puts entries back where they came from, sources
+/// included.
 fn unstage(staged: &[TrashedEntry]) {
-    move_back(staged.iter().rev().map(|e| (e.stored_path.as_path(), e.origin_path.as_path())));
+    move_back(staged.iter().rev().flat_map(|e| moves_of(e, Direction::OutOfTrash)));
 }
 
 /// Undoes a partial restore: puts entries back into the trash.
 fn restage(restored: &[&TrashedEntry]) {
-    move_back(restored.iter().rev().map(|e| (e.origin_path.as_path(), e.stored_path.as_path())));
+    move_back(restored.iter().rev().flat_map(|e| moves_of(e, Direction::IntoTrash)));
+}
+
+/// Which way a run of moves goes. Named rather than passed as a bool, because
+/// every move here is (path, path) of the same type and the two directions are
+/// distinguishable only by argument order -- a transposition would compile and
+/// move everything the wrong way.
+#[derive(Clone, Copy)]
+enum Direction {
+    IntoTrash,
+    OutOfTrash,
+}
+
+/// Every move one entry needs, source included, in the order they run.
+///
+/// The source moves after its entry going in and before it coming out -- the
+/// mirror image, so that a half-finished run in either direction never leaves a
+/// live entry pointing at content that has already gone.
+fn moves_of(entry: &TrashedEntry, direction: Direction) -> Vec<(&Path, &Path)> {
+    let mut paths: Vec<(&Path, &Path)> = vec![(entry.stored_path.as_path(), entry.origin_path.as_path())];
+    if let Some(source) = entry.source.as_ref() {
+        paths.push((source.stored_path.as_path(), source.origin_path.as_path()));
+    }
+    match direction {
+        Direction::OutOfTrash => paths,
+        Direction::IntoTrash => paths.into_iter().rev().map(|(a, b)| (b, a)).collect(),
+    }
 }
 
 /// Reverses a run of moves, in reverse order.
@@ -190,37 +274,52 @@ fn move_back<'a>(moves: impl Iterator<Item = (&'a Path, &'a Path)>) {
 /// transaction and is not claimed to be: the filesystem offers nothing across 47
 /// paths. The precheck does the real work by refusing before anything moves; the
 /// rollback covers the races it cannot close.
-pub fn restore(store: &mut TrashStore, id: TrashUnitId) -> Result<(), RemovalError> {
+pub fn restore(store: &mut TrashStore, tools: &ManagingTools, id: TrashUnitId) -> Result<(), RemovalError> {
     let unit = store.get(id)?.ok_or(RemovalError::UnknownUnit(id.0))?;
 
     for entry in unit.entries() {
-        if fs::symlink_metadata(&entry.stored_path).is_err() {
-            return Err(RemovalError::StoredEntryMissing {
-                name: entry.declared_name.clone(),
-                path: entry.stored_path.clone(),
-            });
-        }
-        // `symlink_metadata`, never `Path::exists()`: `exists()` follows links
-        // and so reports a *dangling* symlink as absent. That is precisely the
-        // shape a managing tool leaves behind when it rebuilds a shim whose
-        // target is not there yet, and `rename` would silently replace it.
-        if fs::symlink_metadata(&entry.origin_path).is_ok() {
-            return Err(RemovalError::OriginOccupied {
-                name: entry.declared_name.clone(),
-                path: entry.origin_path.clone(),
-            });
+        // Every path this restore will touch, entry and source alike. A source
+        // whose origin has been rebuilt has to fail the precheck too: it is the
+        // same hazard one level down, and restoring over it would clobber
+        // content the tool reinstalled.
+        for (stored, origin) in moves_of(entry, Direction::OutOfTrash) {
+            if fs::symlink_metadata(stored).is_err() {
+                return Err(RemovalError::StoredEntryMissing {
+                    name: entry.declared_name.clone(),
+                    path: stored.to_path_buf(),
+                });
+            }
+            // `symlink_metadata`, never `Path::exists()`: `exists()` follows links
+            // and so reports a *dangling* symlink as absent. That is precisely the
+            // shape a managing tool leaves behind when it rebuilds a shim whose
+            // target is not there yet, and `rename` would silently replace it.
+            if fs::symlink_metadata(origin).is_ok() {
+                return Err(RemovalError::OriginOccupied {
+                    name: entry.declared_name.clone(),
+                    path: origin.to_path_buf(),
+                });
+            }
         }
     }
 
     let mut moved: Vec<&TrashedEntry> = Vec::new();
     for entry in unit.entries() {
-        match fs_ops::move_entry(&entry.stored_path, &entry.origin_path) {
+        match restore_one(entry) {
             Ok(()) => moved.push(entry),
             Err(e) => {
                 restage(&moved);
-                return Err(e.into());
+                return Err(e);
             }
         }
+    }
+
+    // After the bytes are back, never before: teaching a tool about a skill
+    // whose content failed to land would point its lock at nothing. Best-effort
+    // for the same reason the rollback is -- the files are restored, the skill
+    // works, and a tool that does not know about it is worth a log line, not a
+    // failure that would tell the user their undo did not happen.
+    for entry in unit.entries() {
+        relearn(tools, entry);
     }
 
     if let Some(dir) = unit.storage_dir() {
@@ -228,6 +327,47 @@ pub fn restore(store: &mut TrashStore, id: TrashUnitId) -> Result<(), RemovalErr
     }
     store.forget_restored(&unit)?;
     Ok(())
+}
+
+/// Puts one skill back: its entry, then the managing tool's copy.
+fn restore_one(entry: &TrashedEntry) -> Result<(), RemovalError> {
+    let mut done: Vec<(&Path, &Path)> = Vec::new();
+    for (stored, origin) in moves_of(entry, Direction::OutOfTrash) {
+        if let Err(e) = fs_ops::move_entry(stored, origin) {
+            // This entry's own half-finished moves, before the caller unwinds
+            // the entries before it.
+            move_back(done.iter().rev().map(|(stored, origin)| (*origin, *stored)));
+            return Err(e.into());
+        }
+        done.push((stored, origin));
+    }
+    Ok(())
+}
+
+/// Hands a tool back the bookkeeping `forget_source` dropped, so a restored
+/// skill is one the tool knows about again (ADR 0027 rejected desyncing a lock;
+/// a restore that left it pruned would do the same thing one step later).
+///
+/// The tool is re-detected from where the source came from rather than recorded
+/// with it: `~/.agents/skills/tdd`'s parent is the manager root discovery
+/// derives, so the same rule that found the tool at removal finds it now. A tool
+/// that has since been uninstalled is simply not found, and the files still go
+/// back.
+fn relearn(tools: &ManagingTools, entry: &TrashedEntry) {
+    let Some(source) = entry.source.as_ref() else { return };
+    let Some(state) = source.state.as_deref() else { return };
+    let Some(root) = source.origin_path.parent() else { return };
+    let Some(tool) = tools.for_root(root) else {
+        eprintln!(
+            "[skillmon] restored {} but no managing tool now owns {}; its bookkeeping was left as it is",
+            entry.declared_name,
+            root.display()
+        );
+        return;
+    };
+    if let Err(e) = tool.relearn_source(state) {
+        eprintln!("[skillmon] restored {} but could not tell {} about it again: {e}", entry.declared_name, tool.name());
+    }
 }
 
 /// Reclaims a trashed unit's bytes, on the user's explicit say-so, and returns
@@ -248,6 +388,12 @@ fn purge_unit(store: &mut TrashStore, unit: &TrashUnit) -> Result<u64, RemovalEr
         // Forgiving of an already-missing entry: a user who deleted the staged
         // copy by hand should still be able to clear the row that points at it.
         fs_ops::delete_if_exists(&entry.stored_path)?;
+        // A staged source is this unit's bytes too, and on a `.agents` skill it
+        // is nearly all of them -- the entry is a symlink. Skipping it would
+        // leave the content on disk while deleting the only row naming it.
+        if let Some(source) = entry.source.as_ref() {
+            fs_ops::delete_if_exists(&source.stored_path)?;
+        }
     }
     if let Some(dir) = unit.storage_dir() {
         fs_ops::remove_dir_if_empty(dir);
@@ -289,10 +435,41 @@ pub fn empty_trash(store: &mut TrashStore) -> Result<PurgeSummary, RemovalError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::skill::SkillId;
+    use crate::domain::removal::SourceToRemove;
+    use crate::domain::skill::{DiscoveredSkill, SkillId};
+    use crate::managing_tool::{ManagingTool, SourceError};
     use std::fs::File;
     use std::io::Write;
+    use std::sync::{Arc, Mutex};
     use tempfile::{tempdir, TempDir};
+
+    /// Records what a restore hands back, so the bookkeeping round trip is
+    /// asserted rather than assumed. A real tool is not needed here and would be
+    /// the wrong thing: this module knows nothing about any of them, and the
+    /// contract under test is only that the state reaches whoever owns the root.
+    struct SpyTool {
+        root: PathBuf,
+        relearned: Arc<Mutex<Option<String>>>,
+    }
+
+    impl ManagingTool for SpyTool {
+        fn name(&self) -> &'static str {
+            "spy"
+        }
+        fn detects(&self, root: &Path) -> bool {
+            root == self.root
+        }
+        fn can_remove_source(&self) -> Option<&str> {
+            None
+        }
+        fn forget_source(&self, _skill: &DiscoveredSkill) -> Result<Option<String>, SourceError> {
+            Ok(None)
+        }
+        fn relearn_source(&self, state: &str) -> Result<(), SourceError> {
+            *self.relearned.lock().unwrap() = Some(state.to_string());
+            Ok(())
+        }
+    }
 
     struct Fixture {
         tmp: TempDir,
@@ -324,7 +501,35 @@ mod tests {
                 skill_id: SkillId::Personal { name: name.to_string() },
                 declared_name: name.to_string(),
                 entry_path: self.skills_dir().join(name),
+                source: None,
             }
+        }
+
+        /// Puts a unit back, through a registry with no tools in it -- which is
+        /// the honest default here: nothing in this module knows what a tool is,
+        /// and only the source tests need one to talk to.
+        fn restore(&mut self, id: TrashUnitId) -> Result<(), RemovalError> {
+            super::restore(&mut self.store, &ManagingTools::new(vec![]), id)
+        }
+
+        /// A skill in the `.agents` shape, with the user's opt-in already taken:
+        /// the entry under the scan root is a symlink, the content lives in the
+        /// tool's own tree, and the removal is set to take both.
+        ///
+        /// Returns the entry and the source's real path, because every assertion
+        /// worth making here is about what happened to the latter.
+        #[cfg(unix)]
+        fn install_managed(&self, name: &str, body: &str) -> (EntryToRemove, PathBuf) {
+            let source = self.tmp.path().join("agents/skills").join(name);
+            write_file(&source.join("SKILL.md"), body);
+            fs::create_dir_all(self.skills_dir()).unwrap();
+            std::os::unix::fs::symlink(&source, self.skills_dir().join(name)).unwrap();
+
+            let entry = EntryToRemove {
+                source: Some(SourceToRemove { path: source.clone(), state: None }),
+                ..self.entry(name)
+            };
+            (entry, source)
         }
 
         /// Threads the storage root through, so a caller never has to borrow the
@@ -454,7 +659,7 @@ mod tests {
         let id = f.remove(1_000, Retention::Trashed, primary, dependents).unwrap();
         let storage_dir = f.store.get(id).unwrap().unwrap().storage_dir().unwrap().to_path_buf();
 
-        restore(&mut f.store, id).unwrap();
+        f.restore(id).unwrap();
 
         assert_eq!(fs::read_to_string(origins[0].join("SKILL.md")).unwrap(), "checkout");
         assert_eq!(fs::read_to_string(origins[1].join("SKILL.md")).unwrap(), "s");
@@ -473,7 +678,7 @@ mod tests {
         let id = f.remove(1_000, Retention::Trashed, entry, vec![]).unwrap();
         write_file(&origin.join("SKILL.md"), "what gstack rebuilt");
 
-        let err = restore(&mut f.store, id).unwrap_err();
+        let err = f.restore(id).unwrap_err();
 
         assert!(matches!(err, RemovalError::OriginOccupied { .. }), "got {err:?}");
         assert_eq!(
@@ -497,7 +702,7 @@ mod tests {
         std::os::unix::fs::symlink(f.tmp.path().join("not-cloned-yet"), &origin).unwrap();
 
         assert!(!origin.exists(), "the fixture really is the case exists() gets wrong");
-        let err = restore(&mut f.store, id).unwrap_err();
+        let err = f.restore(id).unwrap_err();
 
         assert!(matches!(err, RemovalError::OriginOccupied { .. }), "got {err:?}");
         assert!(fs::symlink_metadata(&origin).unwrap().is_symlink(), "the tool's link is still there");
@@ -517,7 +722,7 @@ mod tests {
         // discovered after the first would already have moved.
         fs::remove_dir_all(&unit.dependents[0].stored_path).unwrap();
 
-        let err = restore(&mut f.store, id).unwrap_err();
+        let err = f.restore(id).unwrap_err();
 
         assert!(matches!(err, RemovalError::StoredEntryMissing { .. }), "got {err:?}");
         assert!(!primary_origin.exists(), "the primary never moved");
@@ -525,10 +730,196 @@ mod tests {
         assert!(f.store.get(id).unwrap().is_some());
     }
 
+    /// ADR 0027's opt-in, end to end: the entry and the tool's content go into
+    /// one unit, and one undo brings back both.
+    ///
+    /// The `.agents` shape, so the assertion has teeth -- the entry is a
+    /// symlink, and everything that matters is at the other end of it.
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_source_stages_the_managers_content_into_the_same_unit() {
+        let mut f = Fixture::new();
+        let (entry, source) = f.install_managed("tdd", "the only copy");
+
+        let id = f.remove(1_000, Retention::Trashed, entry, vec![]).unwrap();
+
+        assert!(!source.exists(), "the tool's content was staged, since the user asked for it");
+        let unit = f.store.get(id).unwrap().unwrap();
+        assert_eq!(unit.entry_count(), 1, "entry + source is one skill");
+        let staged = unit.primary.source.as_ref().expect("the source is recorded on its own entry");
+        assert_eq!(staged.origin_path, source);
+        assert_eq!(fs::read_to_string(staged.stored_path.join("SKILL.md")).unwrap(), "the only copy");
+        assert!(unit.bytes() > 0);
+    }
+
+    /// A skill directory may legally be named anything, including the word the
+    /// staging scheme uses for the source slot. Nothing rejects such a name --
+    /// discovery takes any UTF-8 directory -- so the two staged paths must not be
+    /// able to land on each other.
+    ///
+    /// It bites hardest on exactly the shape source removal is *for*: a symlink
+    /// entry. `rename` over a non-empty directory fails, but over a symlink it
+    /// succeeds silently, so the entry would be destroyed and the ledger would
+    /// record both halves at one path -- an undo that restores a directory where
+    /// a link belongs.
+    #[cfg(unix)]
+    #[test]
+    fn a_skill_named_like_the_source_slot_does_not_stage_over_its_own_entry() {
+        let mut f = Fixture::new();
+        let (entry, source) = f.install_managed("source", "the only copy");
+        let origin = entry.entry_path.clone();
+
+        let id = f.remove(1_000, Retention::Trashed, entry, vec![]).unwrap();
+
+        let unit = f.store.get(id).unwrap().unwrap();
+        let staged_source = unit.primary.source.as_ref().unwrap();
+        assert_ne!(
+            unit.primary.stored_path, staged_source.stored_path,
+            "the entry and its source must never stage to the same path"
+        );
+        assert!(
+            fs::symlink_metadata(&unit.primary.stored_path).unwrap().is_symlink(),
+            "the staged entry is still the link it was, not the source dir moved on top of it"
+        );
+
+        f.restore(id).unwrap();
+        assert!(fs::symlink_metadata(&origin).unwrap().is_symlink(), "restored as a link");
+        assert_eq!(fs::read_to_string(source.join("SKILL.md")).unwrap(), "the only copy");
+    }
+
+    /// The reason a source is an entry's field rather than its own unit. A
+    /// restore that put back only the link would rebuild a symlink pointing at
+    /// nothing, which `discovery/scan.rs` turns into a warning and a vanished
+    /// row -- the outcome ADR 0027 rejected on evidence, reappearing as an undo.
+    #[cfg(unix)]
+    #[test]
+    fn restoring_a_removed_source_puts_back_the_content_the_entry_points_at() {
+        let mut f = Fixture::new();
+        let (entry, source) = f.install_managed("tdd", "the only copy");
+        let origin = entry.entry_path.clone();
+        let id = f.remove(1_000, Retention::Trashed, entry, vec![]).unwrap();
+
+        f.restore(id).unwrap();
+
+        assert!(fs::symlink_metadata(&origin).unwrap().is_symlink(), "the entry is a link again");
+        assert_eq!(
+            fs::read_to_string(origin.join("SKILL.md")).unwrap(),
+            "the only copy",
+            "and it resolves -- restoring the entry alone would leave it dangling"
+        );
+        assert_eq!(fs::read_to_string(source.join("SKILL.md")).unwrap(), "the only copy");
+        assert!(f.store.get(id).unwrap().is_none(), "the unit is spent");
+    }
+
+    /// A staged source is nearly all of a `.agents` removal's bytes -- the entry
+    /// is a symlink. Leaving it behind would delete the only row naming a
+    /// directory the user asked to reclaim.
+    #[cfg(unix)]
+    #[test]
+    fn purging_a_removed_source_reclaims_its_bytes_too() {
+        let mut f = Fixture::new();
+        let (entry, _) = f.install_managed("tdd", "0123456789");
+        let id = f.remove(1_000, Retention::Trashed, entry, vec![]).unwrap();
+        let unit = f.store.get(id).unwrap().unwrap();
+        let staged_source = unit.primary.source.as_ref().unwrap().stored_path.clone();
+
+        let freed = purge(&mut f.store, id).unwrap();
+
+        assert!(!staged_source.exists(), "the source's bytes are reclaimed, not stranded");
+        assert_eq!(freed, unit.bytes());
+        assert!(freed >= 10, "the source's ten bytes are in the figure");
+    }
+
+    /// A source whose own origin has been rebuilt is the same hazard one level
+    /// down: restoring over it would clobber what the tool reinstalled.
+    #[cfg(unix)]
+    #[test]
+    fn restoring_refuses_when_a_managing_tool_rebuilt_the_source() {
+        let mut f = Fixture::new();
+        let (entry, source) = f.install_managed("tdd", "the trashed copy");
+        let id = f.remove(1_000, Retention::Trashed, entry, vec![]).unwrap();
+        write_file(&source.join("SKILL.md"), "what the tool reinstalled");
+
+        let err = f.restore(id).unwrap_err();
+
+        assert!(matches!(err, RemovalError::OriginOccupied { .. }), "got {err:?}");
+        assert_eq!(fs::read_to_string(source.join("SKILL.md")).unwrap(), "what the tool reinstalled");
+        assert!(f.store.get(id).unwrap().is_some(), "the unit survives a refused restore");
+    }
+
+    /// A skill whose content was trashed while its entry stayed live is exactly
+    /// the dangling entry ADR 0027 forbids. If the source cannot be staged, the
+    /// entry goes back.
+    #[test]
+    fn a_source_that_cannot_be_staged_puts_the_entry_back() {
+        let mut f = Fixture::new();
+        let mut entry = f.install("vercel-react", "body");
+        let origin = entry.entry_path.clone();
+        // Never existed, so sizing it fails after the entry has already moved.
+        entry.source = Some(SourceToRemove { path: f.tmp.path().join("nowhere"), state: None });
+
+        let err = f.remove(1_000, Retention::Trashed, entry, vec![]).unwrap_err();
+
+        assert!(matches!(err, RemovalError::Io(_)), "got {err:?}");
+        assert!(origin.join("SKILL.md").exists(), "the entry is live again, not left pointing at nothing");
+        assert!(f.store.list().unwrap().is_empty(), "and the ledger rolled back with it");
+    }
+
+    /// The tool's bookkeeping is round-tripped through the ledger, not just the
+    /// files: ADR 0027 rejected deleting a target partly *because* it desyncs a
+    /// lock, so a restore that left it pruned would commit the same sin later.
+    #[cfg(unix)]
+    #[test]
+    fn restoring_hands_the_managing_tool_back_the_state_it_dropped() {
+        let mut f = Fixture::new();
+        let (entry, source) = f.install_managed("tdd", "body");
+        let entry = EntryToRemove {
+            source: Some(SourceToRemove {
+                path: source.clone(),
+                state: Some("what the tool dropped".to_string()),
+            }),
+            ..entry
+        };
+        let id = f.remove(1_000, Retention::Trashed, entry, vec![]).unwrap();
+
+        // The registry the restore consults, spying on what it is handed back.
+        let tool = SpyTool { root: source.parent().unwrap().to_path_buf(), relearned: Default::default() };
+        let relearned = tool.relearned.clone();
+        let tools = ManagingTools::new(vec![Box::new(tool)]);
+        super::restore(&mut f.store, &tools, id).unwrap();
+
+        assert_eq!(
+            relearned.lock().unwrap().as_deref(),
+            Some("what the tool dropped"),
+            "the tool was told about the skill again, with its own state"
+        );
+    }
+
+    /// A tool uninstalled while its skill sat in the trash must not block the
+    /// undo: the files are the point, the bookkeeping is a courtesy.
+    #[cfg(unix)]
+    #[test]
+    fn restoring_still_returns_the_files_when_no_tool_owns_the_source_any_more() {
+        let mut f = Fixture::new();
+        let (entry, source) = f.install_managed("tdd", "body");
+        let origin = entry.entry_path.clone();
+        let entry = EntryToRemove {
+            source: Some(SourceToRemove { path: source, state: Some("orphaned".to_string()) }),
+            ..entry
+        };
+        let id = f.remove(1_000, Retention::Trashed, entry, vec![]).unwrap();
+
+        // An empty registry: nothing detects the source's root any more.
+        f.restore(id).unwrap();
+
+        assert_eq!(fs::read_to_string(origin.join("SKILL.md")).unwrap(), "body");
+        assert!(f.store.get(id).unwrap().is_none(), "the undo completed");
+    }
+
     #[test]
     fn restoring_an_unknown_unit_is_an_error() {
         let mut f = Fixture::new();
-        assert!(matches!(restore(&mut f.store, TrashUnitId(42)), Err(RemovalError::UnknownUnit(42))));
+        assert!(matches!(f.restore(TrashUnitId(42)), Err(RemovalError::UnknownUnit(42))));
     }
 
     #[test]
@@ -719,6 +1110,7 @@ mod tests {
                 skill_id: skill.id.clone(),
                 declared_name: skill.frontmatter.declared_name.clone(),
                 entry_path,
+                    source: None,
             });
             real_targets.push(skill.dir_path.clone());
         }
@@ -766,12 +1158,13 @@ mod tests {
             skill_id: SkillId::Personal { name: name.clone() },
             declared_name: sample.frontmatter.declared_name.clone(),
             entry_path: entry_path.clone(),
+                source: None,
         };
         let id = remove(&mut store, &storage_root, 2_000, Retention::Trashed, entry.clone(), vec![]).unwrap();
         assert!(!entry_path.exists(), "un-discovered while trashed");
         assert_eq!(store.tombstones().unwrap().len(), baseline + 1, "and tombstoned");
 
-        restore(&mut store, id).unwrap();
+        restore(&mut store, &ManagingTools::new(vec![]), id).unwrap();
         assert_eq!(read_tree(&entry_path), expected, "restore was not byte-identical");
         assert_eq!(store.tombstones().unwrap().len(), baseline, "restoring un-tombstones it");
 
@@ -804,7 +1197,7 @@ mod tests {
         assert!(!origin.exists());
         assert!(f.store.tombstones().unwrap().is_empty());
 
-        restore(&mut f.store, id).unwrap();
+        f.restore(id).unwrap();
         assert_eq!(fs::read_to_string(origin.join("SKILL.md")).unwrap(), "body");
         assert!(f.store.tombstones().unwrap().is_empty());
     }
