@@ -1,14 +1,17 @@
 //! Reversible entry removal: move it out, put it back, or reclaim it (ADR 0029).
 //!
-//! The seam split with issue #31 is: **that** decides *what* to remove -- entry
-//! or source, which dependents cascade, whether a managing tool can make a
-//! source removal stick -- and this moves it out reversibly and records it. So
-//! nothing here reads a `SKILL.md`, resolves a symlink, or knows what gstack is.
+//! The seam splits in two, and this file is the second half. `plan` decides
+//! *what* to remove -- entry or source, which dependents cascade, whether a
+//! managing tool can make a source removal stick -- and this moves what it was
+//! handed, reversibly, and records it. So nothing in *this* file reads a
+//! `SKILL.md`, resolves a symlink, or knows what gstack is; that knowledge is
+//! confined to `plan`, which writes nothing.
 //!
 //! Harness-neutral, like `footprint/` and for the same reason (ADR 0002): the
 //! caller passes the storage root, and no Claude Code path is named here.
 
 pub mod fs_ops;
+pub mod plan;
 pub mod store;
 
 use std::fs;
@@ -26,6 +29,16 @@ use store::TrashStore;
 pub enum RemovalError {
     #[error("trash unit {0} is not in the ledger")]
     UnknownUnit(i64),
+    /// A ref the panel held onto no longer names a row in a fresh scan. The
+    /// point of resolving refs at all: this fails rather than aiming a delete at
+    /// whatever now sits where the skill used to (`plan::resolve`).
+    #[error("{name} is no longer installed, so there is nothing to remove")]
+    UnknownSkill { name: String },
+    /// The user asked for ADR 0027's second opt-in where it is not on offer --
+    /// a tool that cannot make it stick, an unrecognized manager, or a skill
+    /// whose content is its own entry.
+    #[error("{name}'s content cannot be removed: {reason}")]
+    SourceUnavailable { name: String, reason: String },
     /// ADR 0027's recorded hazard, reached: a managing tool rebuilt the path
     /// while the entry sat in the trash. Failing loudly is the point -- the
     /// alternative is clobbering what the tool just wrote.

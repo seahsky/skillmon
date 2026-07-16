@@ -121,20 +121,8 @@ impl DependentIndex {
     pub fn build(skills: &[DiscoveredSkill]) -> Self {
         let mut counts: HashMap<SkillId, u32> = HashMap::new();
         for dependent in skills {
-            let Some(root) = dependent.manager_root.as_deref() else {
-                // Unmanaged: its content is its own entry, so it resolves into
-                // nobody. Skipped before the inner loop rather than falling out
-                // of it, because a depth-1 sibling can never be an ancestor.
-                continue;
-            };
             for candidate in skills {
-                // A skill's own manager root is its content's parent, which is
-                // never inside its own directory -- but identity is cheap to
-                // assert and the alternative is trusting that forever.
-                if candidate.id == dependent.id {
-                    continue;
-                }
-                if root.starts_with(&candidate.canonical_dir) {
+                if resolves_into(dependent, candidate) {
                     *counts.entry(candidate.id.clone()).or_insert(0) += 1;
                 }
             }
@@ -145,6 +133,37 @@ impl DependentIndex {
     pub fn for_skill(&self, skill: &DiscoveredSkill) -> u32 {
         self.counts.get(&skill.id).copied().unwrap_or(0)
     }
+}
+
+/// Whether `dependent`'s content lives at or under `candidate`'s directory --
+/// the one rule behind both the count a row displays and the cascade a removal
+/// performs (issue #31).
+///
+/// Shared deliberately, rather than the planner re-deriving it. The count tells
+/// the user "removing this uninstalls 46 skills" and the cascade is what
+/// actually moves them; two copies of this rule could disagree, and then the
+/// dialog would promise one thing while the removal did another.
+fn resolves_into(dependent: &DiscoveredSkill, candidate: &DiscoveredSkill) -> bool {
+    // A skill's own manager root is its content's parent, which is never inside
+    // its own directory -- but identity is cheap to assert and the alternative is
+    // trusting that forever.
+    if candidate.id == dependent.id {
+        return false;
+    }
+    // `None` is unmanaged: its content is its own entry, so it resolves into
+    // nobody.
+    dependent.manager_root.as_deref().is_some_and(|root| root.starts_with(&candidate.canonical_dir))
+}
+
+/// Every skill that cascades when `candidate` is removed (ADR 0027): a row with
+/// dependents is a tool uninstall, not a skill removal.
+///
+/// The list behind `DependentIndex`'s count, and a **floor** for the same
+/// reason: skillmon scans Claude Code's paths alone, so a managing tool's
+/// entries for other agents are neither listed here nor moved. Nothing rendered
+/// from it may claim to be exhaustive.
+pub fn dependents_of<'a>(skills: &'a [DiscoveredSkill], candidate: &DiscoveredSkill) -> Vec<&'a DiscoveredSkill> {
+    skills.iter().filter(|dependent| resolves_into(dependent, candidate)).collect()
 }
 
 #[derive(Debug, Clone)]

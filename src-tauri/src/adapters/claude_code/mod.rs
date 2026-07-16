@@ -308,6 +308,26 @@ impl ClaudeCodeAdapter {
         watcher.sync(&self.claude_home, &known_repos, active_repo.as_ref());
     }
 
+    /// Where a removed entry of this skill is staged (ADR 0029).
+    ///
+    /// The adapter's whole contribution to the removal seam: `removal::remove`
+    /// takes a storage root and names no Claude Code path itself (ADR 0002), so
+    /// the fact that one lives under `~/.claude` and another inside a repo is
+    /// resolved here.
+    ///
+    /// A project skill stays inside its own repo, preserving ADR 0007's project
+    /// locality -- moving it to `~` would smuggle a repo's file out of the repo,
+    /// and restoring it would depend on a home directory the repo knows nothing
+    /// about. That is also what makes ADR 0029's cross-device fallback real
+    /// rather than theoretical: a cascade spanning a manager root under `~` and a
+    /// dependent in a repo on another volume crosses filesystems by construction.
+    pub fn storage_root_for(&self, id: &SkillId) -> PathBuf {
+        match id {
+            SkillId::Project { repo_path, .. } => paths::repo_removed_dir(repo_path),
+            SkillId::Personal { .. } | SkillId::Plugin { .. } => paths::removed_dir(&self.claude_home),
+        }
+    }
+
     /// How many cached exact counts were measured against a reference model
     /// other than the current one (ADR 0018) -- i.e. skillmon bumped its
     /// internal default since they were stored. A neutral count, not a
@@ -661,6 +681,36 @@ mod tests {
     use super::*;
     use crate::domain::skill::SkillId;
     use std::fs;
+
+    /// ADR 0007's project locality, which is the whole reason this is the
+    /// adapter's job rather than `removal`'s: a repo's skill is staged inside
+    /// that repo, and only a personal or plugin entry goes under `~/.claude`.
+    /// Staging a repo's file under `~` would smuggle it out of the repo and make
+    /// its restore depend on a home directory the repo knows nothing about.
+    #[test]
+    fn a_project_skill_is_staged_inside_its_own_repo_and_the_rest_under_claude_home() {
+        let adapter = ClaudeCodeAdapter::for_discovery_only(PathBuf::from("/home/me/.claude"));
+
+        assert_eq!(
+            adapter.storage_root_for(&SkillId::Project {
+                repo_path: PathBuf::from("/work/some-repo"),
+                name: "deploy".to_string(),
+            }),
+            PathBuf::from("/work/some-repo/.claude/skillmon/removed"),
+        );
+        assert_eq!(
+            adapter.storage_root_for(&SkillId::Personal { name: "grilling".to_string() }),
+            PathBuf::from("/home/me/.claude/skillmon/removed"),
+        );
+        assert_eq!(
+            adapter.storage_root_for(&SkillId::Plugin {
+                marketplace: "official".to_string(),
+                plugin: "superpowers".to_string(),
+                name: "brainstorming".to_string(),
+            }),
+            PathBuf::from("/home/me/.claude/skillmon/removed"),
+        );
+    }
 
     fn write_skill(dir: &std::path::Path, name: &str) {
         fs::create_dir_all(dir).unwrap();

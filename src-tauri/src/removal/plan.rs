@@ -1,0 +1,473 @@
+//! Deciding *what* a removal removes (ADR 0027), before anything moves.
+//!
+//! The other half of `removal`'s seam. This module resolves symlinks, asks
+//! managing tools what they can make stick, and works out which dependents
+//! cascade; `removal::remove` then moves what it was handed and knows none of
+//! that. The split is what keeps the trash engine tool-agnostic while the
+//! decisions stay in one readable place.
+//!
+//! Harness-neutral all the same: the caller supplies the skills and the storage
+//! root, and no Claude Code path is named here.
+
+use std::path::{Path, PathBuf};
+
+use crate::domain::removal::{EntryToRemove, RemovalPlan, SourceOffer, SourceToRemove};
+use crate::domain::skill::{dependents_of, DiscoveredSkill, SkillId};
+use crate::managing_tool::{ManagingTool, ManagingTools};
+
+use super::RemovalError;
+
+/// Works out what removing `skill` entails: what cascades, what a managing tool
+/// would put back, and whether its content can be removed too.
+///
+/// Reads the filesystem (a source is where `SKILL.md` actually resolves) but
+/// writes nothing -- the plan is rendered to the user and only then executed, so
+/// it must be safe to compute on a dialog open.
+pub fn plan(skills: &[DiscoveredSkill], tools: &ManagingTools, skill: &DiscoveredSkill) -> RemovalPlan {
+    let manager_root = skill.manager_root.as_deref();
+    let tool = manager_root.and_then(|root| tools.for_root(root));
+
+    RemovalPlan {
+        primary: entry_for(skill),
+        dependents: dependents_of(skills, skill).into_iter().map(entry_for).collect(),
+        source: manager_root.map(|_| source_offer(skill, tool)),
+        // A managed entry is one its manager rebuilds -- known tool or not. The
+        // hazard is ADR 0027's, and it does not depend on skillmon recognizing
+        // who will do the rebuilding.
+        rebuilt_by: manager_root.map(Path::to_path_buf),
+    }
+}
+
+/// What removing the manager's own copy would take, or why it is not on offer.
+///
+/// Every path here is refused rather than guessed: a tool that says it cannot
+/// make the removal stick is taken at its word, an unknown manager gets no
+/// offer, and a source that will not resolve is not invented.
+fn source_offer(skill: &DiscoveredSkill, tool: Option<&(dyn ManagingTool + Send + Sync)>) -> SourceOffer {
+    let Some(tool) = tool else {
+        return SourceOffer {
+            // The manager root is the honest fallback: skillmon can see where
+            // the content lives without knowing who put it there.
+            path: skill.manager_root.clone().unwrap_or_default(),
+            tool_name: None,
+            blocked: Some(
+                "skillmon does not recognize the tool managing this skill, so it cannot tell whether \
+                 removing its copy would stick. Removing the entry is always safe."
+                    .to_string(),
+            ),
+        };
+    };
+
+    let path = tool.source_of(skill);
+    let blocked = tool.can_remove_source().map(str::to_string).or_else(|| {
+        path.is_none().then(|| {
+            // Capable in principle, but its content cannot be located right now
+            // -- a broken link, or a tool mid-rebuild. Refusing is the only
+            // option: there is no path to stage.
+            format!("skillmon cannot resolve where {} keeps this skill's content right now.", tool.name())
+        })
+    });
+
+    SourceOffer {
+        path: path.or_else(|| skill.manager_root.clone()).unwrap_or_default(),
+        tool_name: Some(tool.name().to_string()),
+        blocked,
+    }
+}
+
+fn entry_for(skill: &DiscoveredSkill) -> EntryToRemove {
+    EntryToRemove {
+        skill_id: skill.id.clone(),
+        declared_name: skill.frontmatter.declared_name.clone(),
+        entry_path: skill.dir_path.clone(),
+        // Filled in by `take_source` on the user's explicit opt-in, never here:
+        // computing a plan must not decide to delete anything.
+        source: None,
+    }
+}
+
+/// Takes the user up on ADR 0027's second opt-in: drops the tool's bookkeeping
+/// and hands back the plan with the source attached, ready to stage.
+///
+/// The bookkeeping is dropped *before* the move rather than after, and that
+/// ordering is deliberate. `forget_source` is the step that can refuse -- a lock
+/// in a version skillmon does not understand -- and it must refuse while nothing
+/// has moved yet. The reverse order would leave a staged source whose tool still
+/// advertises it, which is the desync ADR 0027 rejected.
+///
+/// Only ever applies to the primary. A cascade is a tool uninstall, and taking
+/// 46 dependents' sources would mean reaching into 46 other managers.
+pub fn take_source(plan: &mut RemovalPlan, skill: &DiscoveredSkill, tools: &ManagingTools) -> Result<(), RemovalError> {
+    let Some(offer) = plan.source.as_ref() else {
+        return Err(RemovalError::SourceUnavailable {
+            name: plan.primary.declared_name.clone(),
+            reason: "this skill's content is its own entry, so there is no separate source to remove".to_string(),
+        });
+    };
+    if let Some(reason) = offer.blocked.as_deref() {
+        return Err(RemovalError::SourceUnavailable {
+            name: plan.primary.declared_name.clone(),
+            reason: reason.to_string(),
+        });
+    }
+
+    let path = offer.path.clone();
+    let root = skill.manager_root.as_deref().expect("an offer exists only for a managed skill");
+    let tool = tools.for_root(root).expect("an unblocked offer exists only where a tool was found");
+    let state = tool.forget_source(skill).map_err(|e| RemovalError::SourceUnavailable {
+        name: plan.primary.declared_name.clone(),
+        reason: e.to_string(),
+    })?;
+
+    plan.primary.source = Some(SourceToRemove { path, state });
+    Ok(())
+}
+
+/// Undoes `take_source`'s bookkeeping when the removal it was taken for did not
+/// happen.
+///
+/// Without this, a refused removal leaves the machine worse than it found it:
+/// the tool has forgotten a skill that is still installed, so its next run would
+/// not maintain it and skillmon achieved nothing. The files never moved, so
+/// there is nothing else to unwind.
+///
+/// Best-effort and logged, like the move rollbacks: this runs while an error is
+/// already on its way to the user, and there is nothing useful to return a
+/// second one to.
+pub fn untake_source(entry: &EntryToRemove, skill: &DiscoveredSkill, tools: &ManagingTools) {
+    let Some(source) = entry.source.as_ref() else { return };
+    let Some(state) = source.state.as_deref() else { return };
+    let Some(tool) = skill.manager_root.as_deref().and_then(|root| tools.for_root(root)) else { return };
+
+    if let Err(e) = tool.relearn_source(state) {
+        eprintln!(
+            "[skillmon] {} was not removed, but {} had already been told to forget it and could not be told again: {e}",
+            entry.declared_name,
+            tool.name()
+        );
+    }
+}
+
+/// Finds the row a panel's `SkillRef` named, in a **fresh** scan.
+///
+/// The whole TOCTOU story, and deliberately a narrow one: a ref names a row, and
+/// resolving it here means the removal acts on a `DiscoveredSkill` this scan
+/// just saw rather than on a path the panel remembered. It does not close the
+/// window -- nothing can, the filesystem moves underneath either -- but a stale
+/// ref now *fails* instead of aiming a delete at whatever took its place.
+pub fn resolve<'a>(skills: &'a [DiscoveredSkill], id: &SkillId) -> Result<&'a DiscoveredSkill, RemovalError> {
+    skills
+        .iter()
+        .find(|s| &s.id == id)
+        .ok_or_else(|| RemovalError::UnknownSkill { name: id.name().to_string() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::skill::{Frontmatter, SkillId};
+    use crate::managing_tool::{gstack::GstackTool, SourceError};
+    use std::fs;
+    use tempfile::{tempdir, TempDir};
+
+    /// A tool that owns one root and can remove sources -- the `.agents` answer,
+    /// without a lock file to keep. What is under test here is the plan, not any
+    /// tool's bookkeeping.
+    struct CapableTool {
+        root: PathBuf,
+        forgotten: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ManagingTool for CapableTool {
+        fn name(&self) -> &'static str {
+            "capable-tool"
+        }
+        fn detects(&self, root: &Path) -> bool {
+            root == self.root
+        }
+        fn can_remove_source(&self) -> Option<&str> {
+            None
+        }
+        fn forget_source(&self, skill: &DiscoveredSkill) -> Result<Option<String>, SourceError> {
+            self.forgotten.lock().unwrap().push(skill.directory_name().to_string());
+            Ok(Some(format!("state for {}", skill.directory_name())))
+        }
+        fn relearn_source(&self, _state: &str) -> Result<(), SourceError> {
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        tmp: TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Fixture { tmp: tempdir().unwrap() }
+        }
+
+        fn skills_dir(&self) -> PathBuf {
+            self.tmp.path().join("skills")
+        }
+
+        /// An ordinary skill: real directory, real `SKILL.md`, nobody managing it.
+        fn unmanaged(&self, name: &str) -> DiscoveredSkill {
+            let dir = self.skills_dir().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("SKILL.md"), "body").unwrap();
+            skill(name, &dir, fs::canonicalize(&dir).unwrap(), None)
+        }
+
+        /// The `.agents` shape: the entry is a symlink into the tool's tree.
+        #[cfg(unix)]
+        fn linked(&self, name: &str, tool_dir: &str) -> DiscoveredSkill {
+            let content = self.tmp.path().join(tool_dir).join(name);
+            fs::create_dir_all(&content).unwrap();
+            fs::write(content.join("SKILL.md"), "body").unwrap();
+            let entry = self.skills_dir().join(name);
+            fs::create_dir_all(self.skills_dir()).unwrap();
+            std::os::unix::fs::symlink(&content, &entry).unwrap();
+
+            let manager_root = fs::canonicalize(self.tmp.path().join(tool_dir)).unwrap();
+            skill(name, &entry, fs::canonicalize(&content).unwrap(), Some(manager_root))
+        }
+
+        fn tool_root(&self, dir: &str) -> PathBuf {
+            fs::canonicalize(self.tmp.path().join(dir)).unwrap()
+        }
+    }
+
+    fn skill(name: &str, dir: &Path, canonical: PathBuf, manager_root: Option<PathBuf>) -> DiscoveredSkill {
+        DiscoveredSkill {
+            id: SkillId::Personal { name: name.to_string() },
+            dir_path: dir.to_path_buf(),
+            canonical_dir: canonical,
+            skill_md_path: dir.join("SKILL.md"),
+            frontmatter: Frontmatter {
+                declared_name: name.to_string(),
+                description: "d".to_string(),
+                raw_block: "name: x".to_string(),
+                model_invocable: true,
+            },
+            body: "body".to_string(),
+            manager_root,
+            on_demand_files: vec![],
+            live: true,
+        }
+    }
+
+    fn no_tools() -> ManagingTools {
+        ManagingTools::new(vec![])
+    }
+
+    /// The plain case ADR 0027 allows a plain delete for: nothing manages it,
+    /// nothing resolves into it.
+    #[test]
+    fn an_unmanaged_skill_with_no_dependents_is_a_plain_skill_removal() {
+        let f = Fixture::new();
+        let skills = vec![f.unmanaged("vercel-react")];
+
+        let plan = plan(&skills, &no_tools(), &skills[0]);
+
+        assert!(!plan.is_tool_uninstall());
+        assert_eq!(plan.entry_count(), 1);
+        assert_eq!(plan.primary.entry_path, f.skills_dir().join("vercel-react"));
+        assert!(plan.source.is_none(), "its content IS its entry; there is no second thing to offer");
+        assert!(plan.rebuilt_by.is_none(), "nothing will put it back");
+    }
+
+    /// gstack's shape, and the reason the classification exists: the row is
+    /// unmanaged -- which alone reads as "safe to delete" -- while being the one
+    /// entry 46 skills resolve into.
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_row_others_resolve_into_is_a_tool_uninstall_that_cascades() {
+        let f = Fixture::new();
+        let mut skills = vec![f.unmanaged("gstack")];
+        // Their content lives inside the gstack entry, which is what makes them
+        // dependents.
+        for i in 0..3 {
+            let name = format!("shim-{i}");
+            let content = f.skills_dir().join("gstack").join(&name);
+            fs::create_dir_all(&content).unwrap();
+            fs::write(content.join("SKILL.md"), "body").unwrap();
+            let entry = f.skills_dir().join(&name);
+            fs::create_dir_all(&entry).unwrap();
+            std::os::unix::fs::symlink(content.join("SKILL.md"), entry.join("SKILL.md")).unwrap();
+            skills.push(skill(
+                &name,
+                &entry,
+                fs::canonicalize(&entry).unwrap(),
+                Some(fs::canonicalize(f.skills_dir().join("gstack")).unwrap()),
+            ));
+        }
+
+        let plan = plan(&skills, &no_tools(), &skills[0]);
+
+        assert!(plan.is_tool_uninstall(), "a row with dependents is a tool uninstall, not a skill removal");
+        assert_eq!(plan.entry_count(), 4);
+        let cascaded: Vec<&str> = plan.dependents.iter().map(|d| d.skill_id.name()).collect();
+        assert_eq!(cascaded, vec!["shim-0", "shim-1", "shim-2"]);
+    }
+
+    /// The dependents' own removals stay ordinary: a shim is nobody's manager.
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_dependent_does_not_cascade_to_its_siblings() {
+        let f = Fixture::new();
+        let skills = vec![f.linked("tdd", "agents/skills"), f.linked("grilling", "agents/skills")];
+
+        let plan = plan(&skills, &no_tools(), &skills[0]);
+
+        assert!(!plan.is_tool_uninstall());
+        assert_eq!(plan.entry_count(), 1, "a sibling under the same manager is not a dependent");
+    }
+
+    /// ADR 0027's recorded hazard, surfaced before the removal rather than
+    /// discovered after it: a managed entry is one its manager will rebuild.
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_entry_warns_that_its_manager_will_rebuild_it() {
+        let f = Fixture::new();
+        let skills = vec![f.linked("tdd", "agents/skills")];
+
+        let plan = plan(&skills, &no_tools(), &skills[0]);
+
+        assert_eq!(plan.rebuilt_by, Some(f.tool_root("agents/skills")));
+    }
+
+    /// A capable tool: the offer is live, and it names the path outside
+    /// `~/.claude` that removing it would reach.
+    #[cfg(unix)]
+    #[test]
+    fn a_capable_tool_offers_its_source_and_names_the_path() {
+        let f = Fixture::new();
+        let skills = vec![f.linked("tdd", "agents/skills")];
+        let tools = ManagingTools::new(vec![Box::new(CapableTool {
+            root: f.tool_root("agents/skills"),
+            forgotten: Default::default(),
+        })]);
+
+        let plan = plan(&skills, &tools, &skills[0]);
+        let offer = plan.source.expect("a managed skill has a source");
+
+        assert!(offer.is_available());
+        assert_eq!(offer.tool_name.as_deref(), Some("capable-tool"));
+        assert_eq!(offer.path, fs::canonicalize(f.tmp.path().join("agents/skills/tdd")).unwrap());
+    }
+
+    /// gstack's answer, carried verbatim to the dialog: the option is absent and
+    /// says why, because a missing option that does not explain itself reads as
+    /// a bug.
+    #[cfg(unix)]
+    #[test]
+    fn an_incapable_tool_blocks_its_source_offer_with_the_reason_it_gave() {
+        let f = Fixture::new();
+        // A checkout carrying gstack's marker trio, so the real tool detects it.
+        for marker in ["setup", "VERSION", "SKILL.md"] {
+            fs::create_dir_all(f.tmp.path().join("gstack")).unwrap();
+            fs::write(f.tmp.path().join("gstack").join(marker), "x").unwrap();
+        }
+        let skills = vec![f.linked("ship", "gstack")];
+        let tools = ManagingTools::new(vec![Box::new(GstackTool)]);
+
+        let plan = plan(&skills, &tools, &skills[0]);
+        let offer = plan.source.expect("a managed skill has a source");
+
+        assert!(!offer.is_available());
+        assert!(offer.blocked.unwrap().contains("reset --hard"), "the refusal must carry the tool's own reason");
+        assert_eq!(offer.tool_name.as_deref(), Some("gstack"));
+    }
+
+    /// An unknown manager is entry-only, honestly labeled -- never silently
+    /// offered a removal skillmon cannot vouch for.
+    #[cfg(unix)]
+    #[test]
+    fn an_unknown_manager_blocks_the_source_offer_and_says_so() {
+        let f = Fixture::new();
+        let skills = vec![f.linked("mystery", "some-tool/skills")];
+
+        let plan = plan(&skills, &no_tools(), &skills[0]);
+        let offer = plan.source.expect("a managed skill has a source");
+
+        assert!(!offer.is_available());
+        assert_eq!(offer.tool_name, None);
+        assert!(offer.blocked.unwrap().contains("does not recognize"));
+    }
+
+    /// Taking the opt-in attaches the source AND drops the tool's bookkeeping --
+    /// the ordering that matters, since forgetting is the step that can refuse.
+    #[cfg(unix)]
+    #[test]
+    fn taking_a_source_attaches_it_and_forgets_it_in_the_tool() {
+        let f = Fixture::new();
+        let skills = vec![f.linked("tdd", "agents/skills")];
+        let forgotten: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let tools = ManagingTools::new(vec![Box::new(CapableTool {
+            root: f.tool_root("agents/skills"),
+            forgotten: forgotten.clone(),
+        })]);
+        let mut plan = plan(&skills, &tools, &skills[0]);
+
+        take_source(&mut plan, &skills[0], &tools).unwrap();
+
+        let source = plan.primary.source.expect("the source is attached, ready to stage");
+        assert_eq!(source.path, fs::canonicalize(f.tmp.path().join("agents/skills/tdd")).unwrap());
+        assert_eq!(source.state.as_deref(), Some("state for tdd"), "the tool's state is captured for the undo");
+        assert_eq!(*forgotten.lock().unwrap(), vec!["tdd"], "and the tool was told to forget it");
+    }
+
+    /// A tool that refused is not talked round: the plan cannot be made to take
+    /// a source the tool said it cannot make stick.
+    #[cfg(unix)]
+    #[test]
+    fn taking_a_blocked_source_is_refused_with_its_reason() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.tmp.path().join("gstack")).unwrap();
+        for marker in ["setup", "VERSION", "SKILL.md"] {
+            fs::write(f.tmp.path().join("gstack").join(marker), "x").unwrap();
+        }
+        let skills = vec![f.linked("ship", "gstack")];
+        let tools = ManagingTools::new(vec![Box::new(GstackTool)]);
+        let mut plan = plan(&skills, &tools, &skills[0]);
+
+        let err = take_source(&mut plan, &skills[0], &tools).unwrap_err();
+
+        assert!(matches!(err, RemovalError::SourceUnavailable { .. }), "got {err:?}");
+        assert!(plan.primary.source.is_none(), "nothing was attached");
+    }
+
+    /// An unmanaged skill has no source to take: its entry is the content, and
+    /// ADR 0027's rule is that the entry is what gets removed.
+    #[test]
+    fn taking_a_source_from_an_unmanaged_skill_is_refused() {
+        let f = Fixture::new();
+        let skills = vec![f.unmanaged("vercel-react")];
+        let mut plan = plan(&skills, &no_tools(), &skills[0]);
+
+        assert!(matches!(
+            take_source(&mut plan, &skills[0], &no_tools()),
+            Err(RemovalError::SourceUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn resolving_finds_the_row_a_ref_names() {
+        let f = Fixture::new();
+        let skills = vec![f.unmanaged("a"), f.unmanaged("b")];
+
+        let found = resolve(&skills, &SkillId::Personal { name: "b".to_string() }).unwrap();
+        assert_eq!(found.directory_name(), "b");
+    }
+
+    /// The point of resolving at all: a ref the panel held onto after the skill
+    /// went away aims no delete, rather than aiming one at whatever is there now.
+    #[test]
+    fn resolving_a_ref_whose_skill_is_gone_fails_rather_than_guessing() {
+        let f = Fixture::new();
+        let skills = vec![f.unmanaged("a")];
+
+        let err = resolve(&skills, &SkillId::Personal { name: "since-uninstalled".to_string() }).unwrap_err();
+        assert!(matches!(err, RemovalError::UnknownSkill { .. }), "got {err:?}");
+    }
+}

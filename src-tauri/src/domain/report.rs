@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::footprint::{AlwaysOnTextKind, Footprint, TokenSource};
-use super::removal::{Retention, Tombstone, TrashUnit};
+use super::removal::{RemovalPlan, Retention, Tombstone, TrashUnit};
 use super::skill::{DiscoveredSkill, SkillId};
 
 /// One footprint layer, flattened for the IPC boundary. `exact` collapses
@@ -275,6 +275,19 @@ pub struct TrashUnitReport {
     /// only Claude Code's paths, so a tool's entries for other agents are
     /// neither cascaded nor counted. The view must not claim otherwise.
     pub bytes: u64,
+    /// Whether something has since reappeared at an origin this unit would
+    /// restore to -- ADR 0027's recorded hazard, reached.
+    ///
+    /// For a `disabled` unit this is the whole hazard: a managing tool rebuilt
+    /// the entry, so skillmon's state claims the skill is disabled while it is
+    /// live in context, and the panel has to say so rather than keep the claim.
+    ///
+    /// **Derived on every read, never stored.** A stored flag would be a second
+    /// source of truth that could contradict the disk, and the disk is the only
+    /// thing that decides -- this is literally the condition that makes a
+    /// restore fail with `OriginOccupied`, so computing it here means the panel
+    /// and the operation cannot disagree.
+    pub reverted: bool,
 }
 
 impl From<&TrashUnit> for TrashUnitReport {
@@ -288,6 +301,71 @@ impl From<&TrashUnit> for TrashUnitReport {
             entry_count: unit.entry_count() as u32,
             tool_uninstall: unit.is_tool_uninstall(),
             bytes: unit.bytes(),
+            reverted: unit.is_reverted(),
+        }
+    }
+}
+
+/// What removing a row would do, for the confirm dialog to render (ADR 0027).
+///
+/// Computed and shown *before* anything moves, because "delete this skill" has
+/// three different meanings depending on what the entry turns out to be, and the
+/// user is entitled to know which one they are looking at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemovalPlanReport {
+    pub id: SkillRef,
+    pub declared_name: String,
+    /// Whether this is a tool uninstall rather than a skill removal (ADR 0027):
+    /// the row has dependents, so removing it takes them with it.
+    pub tool_uninstall: bool,
+    /// The skills that cascade, so the dialog names them rather than quoting a
+    /// number at the user.
+    ///
+    /// A **floor**, never a total -- skillmon scans Claude Code's paths alone,
+    /// and a managing tool can have dependents it cannot see (ADR 0027). The
+    /// dialog must not claim the list is exhaustive.
+    pub dependents: Vec<SkillRef>,
+    /// The entry that will move, so the dialog can show what is being removed
+    /// rather than asserting it. Always inside a scan root.
+    pub entry_path: String,
+    /// ADR 0027's second, explicit opt-in, or `None` when the skill's content is
+    /// its own entry and there is nothing separate to offer.
+    pub source: Option<SourceOfferReport>,
+    /// The manager root that will rebuild this entry, when one will (ADR 0027's
+    /// recorded hazard). `null` for a row nothing puts back.
+    pub rebuilt_by: Option<String>,
+}
+
+/// The managing tool's copy of a skill, offered or refused with a reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceOfferReport {
+    /// Where the content really lives. Rendered in full: an option that reaches
+    /// outside `~/.claude` has to say where it reaches.
+    pub path: String,
+    /// The tool that owns it, or `null` for a manager skillmon does not know.
+    pub tool_name: Option<String>,
+    /// `null` = the option is live. Otherwise the reason it is not, which the
+    /// dialog shows *in place of* the option -- a missing affordance that does
+    /// not explain itself reads as a bug (ADR 0027).
+    pub blocked: Option<String>,
+}
+
+impl RemovalPlanReport {
+    pub fn from_plan(plan: &RemovalPlan) -> Self {
+        RemovalPlanReport {
+            id: SkillRef::from(&plan.primary.skill_id),
+            declared_name: plan.primary.declared_name.clone(),
+            tool_uninstall: plan.is_tool_uninstall(),
+            dependents: plan.dependents.iter().map(|d| SkillRef::from(&d.skill_id)).collect(),
+            entry_path: plan.primary.entry_path.display().to_string(),
+            source: plan.source.as_ref().map(|s| SourceOfferReport {
+                path: s.path.display().to_string(),
+                tool_name: s.tool_name.clone(),
+                blocked: s.blocked.clone(),
+            }),
+            rebuilt_by: plan.rebuilt_by.as_ref().map(|p| p.display().to_string()),
         }
     }
 }
@@ -654,6 +732,62 @@ mod tests {
 
         let windowed = ScanReport { usage_window_hours: Some(24), ..all_time };
         assert_eq!(serde_json::to_value(&windowed).unwrap()["usageWindowHours"], 24);
+    }
+
+    fn plan_entry(name: &str) -> crate::domain::removal::EntryToRemove {
+        crate::domain::removal::EntryToRemove {
+            skill_id: SkillId::Personal { name: name.to_string() },
+            declared_name: name.to_string(),
+            entry_path: PathBuf::from(format!("/home/me/.claude/skills/{name}")),
+            source: None,
+        }
+    }
+
+    /// gstack's row, as the dialog has to render it: a tool uninstall, naming
+    /// what cascades rather than quoting a count, with the reason its source
+    /// cannot be removed carried through verbatim.
+    #[test]
+    fn a_tool_uninstall_plan_crosses_with_its_cascade_and_its_blocked_source() {
+        let plan = RemovalPlan {
+            primary: plan_entry("gstack"),
+            dependents: vec![plan_entry("ship"), plan_entry("review")],
+            source: Some(crate::domain::removal::SourceOffer {
+                path: PathBuf::from("/home/me/.claude/skills/gstack/ship"),
+                tool_name: Some("gstack".to_string()),
+                blocked: Some("git reset --hard restores it".to_string()),
+            }),
+            rebuilt_by: Some(PathBuf::from("/home/me/.claude/skills/gstack")),
+        };
+
+        let json = serde_json::to_value(RemovalPlanReport::from_plan(&plan)).unwrap();
+
+        assert_eq!(json["toolUninstall"], true);
+        assert_eq!(json["dependents"][0]["name"], "ship");
+        assert_eq!(json["dependents"][1]["name"], "review");
+        assert_eq!(json["entryPath"], "/home/me/.claude/skills/gstack");
+        assert_eq!(json["source"]["blocked"], "git reset --hard restores it");
+        assert_eq!(json["source"]["toolName"], "gstack");
+        assert_eq!(json["rebuiltBy"], "/home/me/.claude/skills/gstack");
+    }
+
+    /// The ordinary row: nothing cascades, nothing manages it, and there is no
+    /// second option to explain away. `source: null` is "its content is its own
+    /// entry", which is a different statement from "you may not remove it".
+    #[test]
+    fn a_plain_skill_removal_plan_carries_no_cascade_and_no_source() {
+        let plan = RemovalPlan {
+            primary: plan_entry("vercel-react"),
+            dependents: vec![],
+            source: None,
+            rebuilt_by: None,
+        };
+
+        let json = serde_json::to_value(RemovalPlanReport::from_plan(&plan)).unwrap();
+
+        assert_eq!(json["toolUninstall"], false);
+        assert_eq!(json["dependents"].as_array().unwrap().len(), 0);
+        assert_eq!(json["source"], serde_json::Value::Null);
+        assert_eq!(json["rebuiltBy"], serde_json::Value::Null);
     }
 
     #[test]

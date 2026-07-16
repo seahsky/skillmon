@@ -21,8 +21,10 @@ use adapters::claude_code::paths::default_claude_home;
 use adapters::claude_code::usage_cache::SqliteUsageCache;
 use adapters::claude_code::watcher::RegistryWatcher;
 use adapters::claude_code::{fill_on_demand_ceilings, ClaudeCodeAdapter, REFERENCE_MODEL_ID};
-use domain::removal::TrashUnitId;
-use domain::report::{PurgeSummary, ScanReport, TombstoneReport, TrashUnitReport, UsageSettings};
+use domain::removal::{Retention, TrashUnitId};
+use domain::report::{
+    PurgeSummary, RemovalPlanReport, ScanReport, TombstoneReport, TrashUnitReport, UsageSettings,
+};
 use domain::scan::{ScanParams, UsageWindow};
 use domain::skill::SkillId;
 use footprint::api_key_service::{self, SetKeyOutcome};
@@ -74,16 +76,15 @@ type SharedTrashStore = Arc<Mutex<TrashStore>>;
 /// removal behind an unrelated one.
 type SharedManagingTools = Arc<ManagingTools>;
 
-// TODO(skillmon): the mutations that CREATE trash units (disable/enable,
-// uninstall, remove_plugin) land with issue #31. This file wires only the
-// reversal side (ADR 0029): list, restore, purge.
+// Every mutation below holds a `SelfWriteWindow` guard across its writes and
+// emits `registry-changed` itself once its ledger write settles -- they write
+// inside the recursively watched scan root, and suppression is not automatic
+// (issue #29, ADR 0019 Update 4). `purge`/`empty_trash` deliberately do neither:
+// they only ever touch `skillmon/removed/`, which no watcher watches
+// (`paths::removed_dir`).
 //
-// Each of those must hold a `SelfWriteWindow` guard across its writes and emit
-// `registry-changed` itself when its ledger write settles, exactly as
-// `restore_trash_unit` does -- they write inside the recursively watched scan
-// root, and suppression is not automatic (issue #29, ADR 0019 Update 4).
-// `purge`/`empty_trash` deliberately do neither: they only ever touch
-// `skillmon/removed/`, which no watcher watches (`paths::removed_dir`).
+// Plugin removal (`claude plugin uninstall`, ADR 0007) is still to come: it is a
+// CLI call rather than an entry move, so it shares none of this path.
 
 /// Discover every skill and compute its three-layer footprint (ADR 0019's
 /// scan). The synchronous core runs on the blocking pool via
@@ -179,6 +180,112 @@ fn reconcile_tombstones(report: &ScanReport, trash: &SharedTrashStore) {
     if let Err(e) = store.reconcile_tombstones(&discovered) {
         eprintln!("[skillmon] could not clear tombstones for rediscovered skills: {e}");
     }
+}
+
+/// What removing this row would actually do (ADR 0027), for the confirm dialog.
+///
+/// Read-only, and safe to call on a dialog open: it resolves symlinks and asks
+/// the managing tools what they can make stick, but moves nothing. The answer is
+/// worked out against a **fresh** discovery rather than the panel's rendered
+/// list, so a row whose skill has since been uninstalled reports that instead of
+/// describing a removal of something that is not there.
+///
+/// Discovery only -- no footprint counting -- so this costs a directory walk,
+/// not a scan.
+#[tauri::command]
+async fn plan_removal(
+    id: domain::report::SkillRef,
+    adapter: tauri::State<'_, SharedAdapter>,
+    tools: tauri::State<'_, SharedManagingTools>,
+) -> Result<RemovalPlanReport, String> {
+    let adapter = adapter.inner().clone();
+    let tools = tools.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let skill_id = SkillId::from(id);
+        let skills = adapter.lock().expect("adapter mutex poisoned").discover_skills().skills;
+        let skill = removal::plan::resolve(&skills, &skill_id).map_err(|e| e.to_string())?;
+        Ok(RemovalPlanReport::from_plan(&removal::plan::plan(&skills, &tools, skill)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Removes a skill, reversibly, and returns the trash unit that can undo it.
+///
+/// One operation for both of ADR 0027's intents: `retention` is the whole
+/// difference between disabling a skill and deleting one. `remove_source` is the
+/// second, explicit opt-in, and is refused unless the managing tool said it
+/// could make it stick.
+///
+/// The unit id comes back so the panel can offer an immediate undo without
+/// re-listing the trash to find out what it just did.
+///
+/// Lock order is adapter-then-trash, and the adapter lock is **released before**
+/// the trash one is taken: discovery is owned data, so nothing needs both at
+/// once, and holding a scan lock across a 1.1 GB move would freeze the panel for
+/// the duration. Nothing anywhere takes these in the other order, which is what
+/// keeps that from being a deadlock.
+#[tauri::command]
+async fn remove_skill(
+    id: domain::report::SkillRef,
+    retention: Retention,
+    remove_source: bool,
+    app: tauri::AppHandle,
+    adapter: tauri::State<'_, SharedAdapter>,
+    trash: tauri::State<'_, SharedTrashStore>,
+    tools: tauri::State<'_, SharedManagingTools>,
+    self_writes: tauri::State<'_, SelfWriteWindow>,
+) -> Result<i64, String> {
+    let adapter = adapter.inner().clone();
+    let trash = trash.inner().clone();
+    let tools = tools.inner().clone();
+    let self_writes = self_writes.inner().clone();
+    let now_millis = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let skill_id = SkillId::from(id);
+        let (skills, storage_root) = {
+            let adapter = adapter.lock().expect("adapter mutex poisoned");
+            (adapter.discover_skills().skills, adapter.storage_root_for(&skill_id))
+        };
+
+        let skill = removal::plan::resolve(&skills, &skill_id).map_err(|e| e.to_string())?;
+        let mut plan = removal::plan::plan(&skills, &tools, skill);
+        if remove_source {
+            removal::plan::take_source(&mut plan, skill, &tools).map_err(|e| e.to_string())?;
+        }
+
+        let mut store = trash.lock().expect("trash mutex poisoned");
+        let _writing = self_writes.open();
+        let result = removal::remove(
+            &mut store,
+            &storage_root,
+            now_millis,
+            retention,
+            plan.primary.clone(),
+            plan.dependents,
+        );
+
+        if result.is_err() {
+            // `take_source` already dropped the tool's bookkeeping, and nothing
+            // moved -- so the tool is now advertising a skill it would rebuild
+            // while skillmon has failed to remove it. Put its state back, or the
+            // refusal leaves the machine worse than it found it.
+            removal::plan::untake_source(&plan.primary, skill, &tools);
+        }
+        result.map(|id| id.0).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Emitted whatever the outcome, for the reason `restore_trash_unit` gives:
+    // a failure that rolled back best-effort is precisely the case where the
+    // tree can differ from what the panel shows, and the watcher was told not to
+    // mention it.
+    if let Err(e) = app.emit("registry-changed", ()) {
+        eprintln!("[skillmon] removal could not announce registry-changed; the panel may be stale: {e}");
+    }
+    outcome
 }
 
 /// Every staged removal, for the removed view (ADR 0029).
@@ -624,6 +731,8 @@ pub fn run() {
             set_usage_settings,
             list_trash,
             list_tombstones,
+            plan_removal,
+            remove_skill,
             restore_trash_unit,
             purge_trash_unit,
             empty_trash
