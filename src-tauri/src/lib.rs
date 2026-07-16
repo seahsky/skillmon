@@ -226,6 +226,9 @@ async fn plan_removal(
 /// the duration. Nothing anywhere takes these in the other order, which is what
 /// keeps that from being a deadlock.
 #[tauri::command]
+// A Tauri command: the trailing args are framework-injected State/AppHandle
+// handles, not a wide domain signature (as on `ClaudeCodeAdapter::new`).
+#[allow(clippy::too_many_arguments)]
 async fn remove_skill(
     id: domain::report::SkillRef,
     retention: Retention,
