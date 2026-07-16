@@ -6,6 +6,7 @@ mod adapters;
 mod domain;
 mod footprint;
 mod removal;
+mod self_write;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,6 +30,7 @@ use footprint::cache::TokenCache;
 use footprint::count_tokens_client::{AnthropicCountTokensClient, CountTokensClient};
 use footprint::tokenizer::BpeTokenizer;
 use removal::store::TrashStore;
+use self_write::SelfWriteWindow;
 
 /// The scan orchestration is synchronous (ADR 0008) and can block on file
 /// I/O or a `count_tokens` call, so it lives behind a `Mutex` and is only
@@ -64,6 +66,13 @@ type SharedTrashStore = Arc<Mutex<TrashStore>>;
 // TODO(skillmon): the mutations that CREATE trash units (disable/enable,
 // uninstall, remove_plugin) land with issue #31. This file wires only the
 // reversal side (ADR 0029): list, restore, purge.
+//
+// Each of those must hold a `SelfWriteWindow` guard across its writes and emit
+// `registry-changed` itself when its ledger write settles, exactly as
+// `restore_trash_unit` does -- they write inside the recursively watched scan
+// root, and suppression is not automatic (issue #29, ADR 0019 Update 4).
+// `purge`/`empty_trash` deliberately do neither: they only ever touch
+// `skillmon/removed/`, which no watcher watches (`paths::removed_dir`).
 
 /// Discover every skill and compute its three-layer footprint (ADR 0019's
 /// scan). The synchronous core runs on the blocking pool via
@@ -180,19 +189,50 @@ async fn list_trash(trash: tauri::State<'_, SharedTrashStore>) -> Result<Vec<Tra
 /// Undoes one staged removal, putting all of its entries back -- 47 or one (ADR
 /// 0027's single undo for a tool uninstall).
 ///
-/// Emits no event of its own: the restored entries land back inside the
-/// recursively watched scan root, so the ADR 0019 watcher raises
-/// `registry-changed` for them, and the ledger write has already completed by
-/// the time this returns.
+/// Restored entries land back inside the recursively watched scan root, so this
+/// suppresses the ADR 0019 watcher across the moves and then announces the
+/// change itself (issue #29). The watcher would otherwise raise
+/// `registry-changed` *while* the 47 moves are still running and the ledger has
+/// not settled -- a rescan of a half-restored tree, several times over. Doing it
+/// this way turns that into one rescan of a finished one.
+///
+/// The guard brackets the writes only, and is taken *after* the store lock
+/// rather than before. Taking it first would look more cautious and be strictly
+/// worse: the wait for that lock is unbounded (an `Empty trash` can hold it for
+/// as long as deleting 1.1 GB takes), and every second of it would be a second
+/// of the watcher ignoring changes while this command writes nothing at all. A
+/// mutation already writing has its own guard; it does not need this one's.
 #[tauri::command]
-async fn restore_trash_unit(unit_id: i64, trash: tauri::State<'_, SharedTrashStore>) -> Result<(), String> {
+async fn restore_trash_unit(
+    unit_id: i64,
+    app: tauri::AppHandle,
+    trash: tauri::State<'_, SharedTrashStore>,
+    self_writes: tauri::State<'_, SelfWriteWindow>,
+) -> Result<(), String> {
     let trash = trash.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let self_writes = self_writes.inner().clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
         let mut store = trash.lock().expect("trash mutex poisoned");
+        let _writing = self_writes.open();
         removal::restore(&mut store, TrashUnitId(unit_id)).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    // Emitted whatever the outcome. A restore that fails *after* moving
+    // something rolls back best-effort (`move_back` logs rather than returns),
+    // so a failed restore is precisely the case where the tree can differ from
+    // what the panel shows -- and the watcher was told not to mention it.
+    // Announcing only successes would leave exactly that state invisible. The
+    // price is a redundant rescan when the precheck refused and nothing moved,
+    // which is the same work a panel reopen does anyway.
+    //
+    // A failure to emit is logged, not discarded: it is the one thing that
+    // leaves the panel stale with nothing else due to correct it.
+    if let Err(e) = app.emit("registry-changed", ()) {
+        eprintln!("[skillmon] restore could not announce registry-changed; the panel may be stale: {e}");
+    }
+    outcome
 }
 
 /// Every removed-but-not-reinstalled skill (DESIGN.md UX #6).
@@ -513,6 +553,14 @@ pub fn run() {
             let watcher = RegistryWatcher::new(move || {
                 let _ = app_handle.emit("registry-changed", ());
             })?;
+            // Issue #29: the latch every mutation holds while it writes inside
+            // the scan root the watcher above watches recursively. Taken from
+            // the watcher rather than built here -- only it knows how long a
+            // tail its own debounce needs. Managed separately from the watcher's
+            // Mutex on purpose: a mutation must never queue behind a scan's
+            // `sync_watcher` just to say "this write is mine", and the notify
+            // callback must never block on a lock a mutation is holding.
+            let self_writes = watcher.self_writes();
             let watcher: SharedWatcher = Arc::new(Mutex::new(watcher));
 
             // Watch the static global surfaces plus any repos already known at
@@ -533,6 +581,7 @@ pub fn run() {
             app.manage(adapter);
             app.manage(watcher);
             app.manage(api_key_settings);
+            app.manage(self_writes);
             app.manage::<SharedTrashStore>(Arc::new(Mutex::new(trash_store)));
 
             // Global hotkey: Cmd/Ctrl+Shift+K toggles the panel from anywhere.

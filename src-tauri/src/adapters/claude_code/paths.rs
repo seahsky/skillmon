@@ -43,7 +43,9 @@ pub fn repo_local_settings_path(repo_path: &Path) -> PathBuf {
 /// therefore triggers no rescan of skillmon's own work -- see
 /// `the_removal_staging_root_sits_outside_every_recursively_watched_tree`. That
 /// answers only half of issue #29: taking the entry out of the scan root is
-/// still a write inside a watched tree, and still needs self-write suppression.
+/// still a write inside a watched tree. The other half is
+/// `SelfWriteWindow` (ADR 0019 Update 4), the latch a mutation holds across its
+/// writes -- these two facts are independent, and both are needed.
 ///
 /// The adapter's contribution to the removal seam: `removal::remove` takes a
 /// storage root and names no Claude Code path itself (ADR 0002). Its caller
@@ -114,5 +116,56 @@ mod tests {
         // A repo's staging root must also stay clear of the *personal* watched
         // tree, which it would not if a repo ever lived under `~/.claude/skills`.
         assert!(!repo_removed_dir(repo).starts_with(personal_skills_dir(home)));
+    }
+
+    /// The same invariant, against the real `~/.claude` and its real symlinks --
+    /// because the test above cannot see them.
+    ///
+    /// `starts_with` compares path *components*, so it answers the question as
+    /// written on disk, not as resolved. If `~/.claude/skills` were itself a
+    /// symlink to a tree that enclosed `~/.claude/skillmon`, the assertion above
+    /// would still pass while `notify` -- which watches the resolved tree --
+    /// watched every byte a removal staged, and every trash write would be
+    /// self-triggering. Nothing in the layout forbids that; only the actual
+    /// filesystem settles it, so it is asserted rather than assumed (as
+    /// `real_claude_home_subagent_rollup` asserts its own inertness).
+    ///
+    /// Read-only: it resolves paths and never writes, so it is safe against a
+    /// live install. `#[ignore]`d because it depends on this machine's `~`.
+    ///
+    /// Run by hand:
+    /// `cargo test --manifest-path src-tauri/Cargo.toml
+    /// adapters::claude_code::paths::tests::the_real_claude_home_keeps_staging_outside_the_watched_tree
+    /// -- --ignored --exact --nocapture`
+    #[test]
+    #[ignore]
+    fn the_real_claude_home_keeps_staging_outside_the_watched_tree() {
+        let home = default_claude_home();
+        let skills = personal_skills_dir(&home);
+        assert!(skills.is_dir(), "no {} -- is this machine's ~/.claude populated?", skills.display());
+
+        // The staging root does not exist until the first removal, and
+        // `canonicalize` requires the path to exist -- so resolve its nearest
+        // existing ancestor (`~/.claude`) and let `removed_dir` build the tail
+        // onto it. Through the real function, never a literal spelling of what
+        // it returns: a test that rebuilds the path by hand keeps passing after
+        // `removed_dir` moves the staging root somewhere self-triggering, which
+        // is the one thing it exists to catch.
+        let real_home = home.canonicalize().expect("~/.claude must resolve");
+        let real_skills = skills.canonicalize().expect("~/.claude/skills must resolve");
+        let real_removed = removed_dir(&real_home);
+
+        assert!(
+            !real_removed.starts_with(&real_skills),
+            "staging at {} lands inside the recursively watched {} -- every trash write would rescan itself",
+            real_removed.display(),
+            real_skills.display()
+        );
+        eprintln!(
+            "\n=== real layout: staging {} is outside the watched {} (skills symlink: {}) ===\n",
+            real_removed.display(),
+            real_skills.display(),
+            std::fs::symlink_metadata(&skills).map(|m| m.is_symlink()).unwrap_or(false),
+        );
     }
 }
