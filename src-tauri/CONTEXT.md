@@ -40,7 +40,25 @@ _Avoid_: current repo, cwd
 
 **Plugin skill**:
 A skill shipped inside a plugin, removable only by removing the whole plugin.
+Where it lives is the plugin's to declare, in its plugin manifest; skillmon never assumes `skills/` (ADR 0030).
 _Avoid_: bundled skill
+
+**Plugin manifest**:
+A plugin's own `<installPath>/.claude-plugin/plugin.json`, which declares where its skills live.
+Its `skills` field is `string | array` and *adds to* the always-scanned default `skills/` rather than replacing it.
+A manifest that exists but will not parse is a `DiscoveryWarning`, never a silent fall back to that default: a plugin resolving to zero skills must stay distinguishable from a plugin that ships zero (ADR 0030).
+_Avoid_: plugin.json (ambiguous — `<installPath>/plugin.json` is a real path that no plugin uses, and reading it was issue #33)
+
+**Declared skill path**:
+One entry of a plugin manifest's `skills`, relative to the plugin root.
+It names one skill if it holds `SKILL.md` directly, otherwise a directory of them scanned depth-1.
+Only the declared set enters context: a plugin may ship more `SKILL.md` than it declares, so the declared paths are the authority, not the tree on disk.
+_Avoid_: skills dir (a declared path is often a single skill), configured path
+
+**Category dir**:
+A directory inside a plugin's tree that organizes skills rather than being one — recognized because the manifest declares a path strictly beneath it.
+Not a malformed skill, and not reported as one; treating it as one is what made `mattpocock-skills` read as broken rather than nested (ADR 0030).
+_Avoid_: group dir, namespace dir
 
 **Manager root**:
 The directory that owns a skill's real content, when that content does not live in the skill's own entry under the scan root (ADR 0026).

@@ -319,7 +319,7 @@ mod tests {
         TrashedEntry {
             source: Some(TrashedSource {
                 origin_path: PathBuf::from(format!("/home/me/.agents/skills/{name}")),
-                stored_path: PathBuf::from(format!("/home/me/.claude/skillmon/removed/1/0-source")),
+                stored_path: PathBuf::from("/home/me/.claude/skillmon/removed/1/0-source"),
                 bytes: source_bytes,
                 state: Some(r#"{"key":"tdd"}"#.to_string()),
             }),

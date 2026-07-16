@@ -22,6 +22,19 @@ pub fn global_settings_path(claude_home: &Path) -> PathBuf {
     claude_home.join("settings.json")
 }
 
+/// A plugin's own manifest, rooted at the `installPath` its install record
+/// names -- never at `<installPath>/plugin.json`, which is where discovery
+/// looked for it and where zero of the 11 plugins on a real machine keep it.
+/// Reading the wrong path meant the manifest's relocation field never once
+/// fired, and a plugin that relocates its skills entirely (`impeccable`)
+/// resolved to no skills at all (issue #33).
+///
+/// `.claude-plugin/plugin.json` is the only location the plugin reference
+/// documents.
+pub fn plugin_manifest_path(install_path: &Path) -> PathBuf {
+    install_path.join(".claude-plugin").join("plugin.json")
+}
+
 pub fn repo_skills_dir(repo_path: &Path) -> PathBuf {
     repo_path.join(".claude").join("skills")
 }

@@ -587,7 +587,7 @@ mod tests {
         let id = super::super::remove(&mut store, &storage_root, 1_000, Retention::Trashed, p.primary, p.dependents)
             .unwrap();
 
-        assert!(!fs::symlink_metadata(&entry).is_ok(), "the entry left the scan root");
+        assert!(fs::symlink_metadata(&entry).is_err(), "the entry left the scan root");
         assert!(!content.exists(), "and so did the tool's copy, since that was asked for");
         let unit = store.get(id).unwrap().unwrap();
         eprintln!("=== staged {} + its .agents content: {} bytes ===", name, unit.bytes());

@@ -1,4 +1,4 @@
-use crate::adapters::claude_code::discovery::scan::discover_skills_in_dir;
+use crate::adapters::claude_code::discovery::scan::{discover_skills_in_dir, ChildDirs};
 use crate::adapters::claude_code::discovery::transcript::{enumerate_known_repos, RepoInfo};
 use crate::adapters::claude_code::paths::repo_skills_dir;
 use crate::domain::skill::{DiscoveredSkill, DiscoveryWarning, SkillId};
@@ -12,10 +12,10 @@ pub fn discover_project_skills(
         .map(|repo| {
             let skills_dir = repo_skills_dir(&repo.repo_path);
             let repo_path = repo.repo_path.clone();
-            let (skills, warnings) = discover_skills_in_dir(&skills_dir, move |name| SkillId::Project {
-                repo_path: repo_path.clone(),
-                name,
-            });
+            let (skills, warnings) =
+                discover_skills_in_dir(&skills_dir, ChildDirs::AreSkillEntries, move |name| {
+                    SkillId::Project { repo_path: repo_path.clone(), name }
+                });
             (repo, skills, warnings)
         })
         .collect()

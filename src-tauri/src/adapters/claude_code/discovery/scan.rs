@@ -4,8 +4,25 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// What a scanned root's child directories are meant to be, which decides
+/// whether one holding no `SKILL.md` is anomalous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildDirs {
+    /// Every child is meant to be a skill entry. One with no `SKILL.md` is
+    /// stale or half-installed, and the user -- who put it there -- can act on
+    /// that, so it is reported.
+    AreSkillEntries,
+    /// The children may be organizational. A plugin that declares its skills'
+    /// paths explicitly is telling us its tree is nested: `mattpocock-skills`
+    /// keeps 6 category dirs under `skills/` and declares 22 paths beneath them.
+    /// Those dirs are not malformed skills, and reporting them as such is what
+    /// misclassified the plugin as broken rather than nested (issue #33).
+    MayBeCategories,
+}
+
 pub fn discover_skills_in_dir(
     dir: &Path,
+    children: ChildDirs,
     make_id: impl Fn(String) -> SkillId,
 ) -> (Vec<DiscoveredSkill>, Vec<DiscoveryWarning>) {
     let mut skills = Vec::new();
@@ -58,61 +75,111 @@ pub fn discover_skills_in_dir(
             }
             continue;
         }
-        let name = match dir_path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
+        // An organizational directory, not a malformed skill. Tested with
+        // `symlink_metadata` so that only a directory holding no `SKILL.md`
+        // *entry at all* is passed over: a broken `SKILL.md` symlink still
+        // reaches the reader below and warns, because absent and broken are
+        // different facts and only one of them is ordinary.
+        if children == ChildDirs::MayBeCategories
+            && fs::symlink_metadata(dir_path.join("SKILL.md")).is_err()
+        {
+            continue;
+        }
 
-        // Warned, not swallowed: this is the directory the dependent test
-        // compares against (ADR 0026), so a raw path here answers "nothing
-        // resolves into me" for a row that may be a manager root -- and that
-        // zero reads as "nothing to cascade" on a removal (ADR 0027).
-        //
-        // The `is_dir()` above already resolved this path, so what's left is a
-        // narrow race: a managing tool rebuilding `~/.claude/skills` underneath
-        // the scan, which is not hypothetical -- it is why ADR 0019 needs
-        // self-write suppression at all. The fallback names no other directory,
-        // so the row claims no dependents rather than guessing at some.
-        let canonical_dir = match fs::canonicalize(&dir_path) {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                warnings.push(DiscoveryWarning {
-                    path: dir_path.clone(),
-                    reason: format!("cannot resolve directory, so its dependents cannot be counted: {err}"),
-                });
-                dir_path.clone()
-            }
-        };
+        let (skill, entry_warnings) = build_skill(dir_path, canonical_root.as_deref(), &make_id);
+        warnings.extend(entry_warnings);
+        skills.extend(skill);
+    }
 
-        let skill_md_path = dir_path.join("SKILL.md");
-        let manager_root = canonical_root
-            .as_deref()
-            .and_then(|root| resolve_manager_root(root, &name, &skill_md_path));
-        let content = match fs::read_to_string(&skill_md_path) {
-            Ok(c) => c,
-            Err(_) => {
-                warnings.push(DiscoveryWarning {
-                    path: skill_md_path,
-                    reason: "no readable SKILL.md".to_string(),
-                });
-                continue;
-            }
-        };
+    (skills, warnings)
+}
 
-        let (frontmatter, body) = match parse_skill_md(&content) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                warnings.push(DiscoveryWarning {
-                    path: skill_md_path,
-                    reason: format!("malformed frontmatter: {e}"),
-                });
-                continue;
-            }
-        };
+/// The one skill a path names *directly*: a directory whose own `SKILL.md`
+/// makes it a skill rather than a directory of them. That is how a plugin
+/// manifest's `skills` entries are read (issue #33) -- `"./skills/engineering/tdd"`
+/// names one skill, and the documented `"skills": ["./"]` names the plugin root
+/// itself.
+///
+/// The scan root a `manager_root` is judged against is the directory this skill
+/// sits in, exactly as a scanned entry is judged against the root it was listed
+/// from. So a plugin skill symlinked out to another tree reports its manager the
+/// same way a personal one does, with no rule of its own.
+pub fn discover_skill_at_dir(
+    dir: &Path,
+    make_id: impl Fn(String) -> SkillId,
+) -> (Option<DiscoveredSkill>, Vec<DiscoveryWarning>) {
+    let canonical_root = dir.parent().and_then(|parent| fs::canonicalize(parent).ok());
+    build_skill(dir.to_path_buf(), canonical_root.as_deref(), &make_id)
+}
 
-        let on_demand_files = list_on_demand_files(&dir_path, &skill_md_path);
+/// The skill rooted at `dir_path`, plus whatever is anomalous about it. Both are
+/// returned because they are not exclusive: a directory that will not resolve
+/// still yields a skill, on a `dir_path` fallback that warns.
+///
+/// `canonical_root` is the resolved directory this entry would sit in if it were
+/// unmanaged -- the scan root when listing a directory's children, the parent
+/// when a path names one skill directly. It is the left side of the
+/// `manager_root` comparison (ADR 0026), and `None` when it cannot be resolved,
+/// which reports the skill as unmanaged rather than guessing at a manager.
+fn build_skill(
+    dir_path: PathBuf,
+    canonical_root: Option<&Path>,
+    make_id: &impl Fn(String) -> SkillId,
+) -> (Option<DiscoveredSkill>, Vec<DiscoveryWarning>) {
+    let mut warnings = Vec::new();
+    let Some(name) = dir_path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+        return (None, warnings);
+    };
 
-        skills.push(DiscoveredSkill {
+    // Warned, not swallowed: this is the directory the dependent test
+    // compares against (ADR 0026), so a raw path here answers "nothing
+    // resolves into me" for a row that may be a manager root -- and that
+    // zero reads as "nothing to cascade" on a removal (ADR 0027).
+    //
+    // The caller's `is_dir()` already resolved this path, so what's left is a
+    // narrow race: a managing tool rebuilding `~/.claude/skills` underneath
+    // the scan, which is not hypothetical -- it is why ADR 0019 needs
+    // self-write suppression at all. The fallback names no other directory,
+    // so the row claims no dependents rather than guessing at some.
+    let canonical_dir = match fs::canonicalize(&dir_path) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            warnings.push(DiscoveryWarning {
+                path: dir_path.clone(),
+                reason: format!("cannot resolve directory, so its dependents cannot be counted: {err}"),
+            });
+            dir_path.clone()
+        }
+    };
+
+    let skill_md_path = dir_path.join("SKILL.md");
+    let manager_root = canonical_root.and_then(|root| resolve_manager_root(root, &name, &skill_md_path));
+    let content = match fs::read_to_string(&skill_md_path) {
+        Ok(c) => c,
+        Err(_) => {
+            warnings.push(DiscoveryWarning {
+                path: skill_md_path,
+                reason: "no readable SKILL.md".to_string(),
+            });
+            return (None, warnings);
+        }
+    };
+
+    let (frontmatter, body) = match parse_skill_md(&content) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            warnings.push(DiscoveryWarning {
+                path: skill_md_path,
+                reason: format!("malformed frontmatter: {e}"),
+            });
+            return (None, warnings);
+        }
+    };
+
+    let on_demand_files = list_on_demand_files(&dir_path, &skill_md_path);
+
+    (
+        Some(DiscoveredSkill {
             id: make_id(name),
             canonical_dir,
             dir_path,
@@ -122,10 +189,9 @@ pub fn discover_skills_in_dir(
             manager_root,
             on_demand_files,
             live: true,
-        });
-    }
-
-    (skills, warnings)
+        }),
+        warnings,
+    )
 }
 
 /// The directory owning a skill's real content, or `None` when the skill owns
@@ -240,7 +306,7 @@ mod tests {
         write_skill(tmp.path(), "grilling", "grilling", "Interview relentlessly.", "Body.");
 
         let (skills, warnings) =
-            discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+            discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills.len(), 1);
         assert!(warnings.is_empty());
@@ -255,7 +321,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
 
-        let (skills, warnings) = discover_skills_in_dir(&missing, |name| SkillId::Personal { name });
+        let (skills, warnings) = discover_skills_in_dir(&missing, ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert!(skills.is_empty());
         assert!(warnings.is_empty());
@@ -269,7 +335,7 @@ mod tests {
         fs::create_dir_all(&bad_dir).unwrap();
         fs::write(bad_dir.join("SKILL.md"), "not frontmatter at all").unwrap();
 
-        let (skills, warnings) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let (skills, warnings) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].directory_name(), "good");
@@ -282,7 +348,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("empty-dir")).unwrap();
 
-        let (skills, warnings) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let (skills, warnings) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert!(skills.is_empty());
         assert_eq!(warnings.len(), 1);
@@ -299,7 +365,7 @@ mod tests {
         fs::create_dir_all(&scan_root).unwrap();
         symlink(store.join("linked"), scan_root.join("linked")).unwrap();
 
-        let (skills, warnings) = discover_skills_in_dir(&scan_root, |name| SkillId::Personal { name });
+        let (skills, warnings) = discover_skills_in_dir(&scan_root, ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills.len(), 1);
         assert!(warnings.is_empty());
@@ -323,7 +389,7 @@ mod tests {
         fs::create_dir_all(&shim).unwrap();
         symlink(tool.join("ship").join("SKILL.md"), shim.join("SKILL.md")).unwrap();
 
-        let (skills, warnings) = discover_skills_in_dir(&scan_root, |name| SkillId::Personal { name });
+        let (skills, warnings) = discover_skills_in_dir(&scan_root, ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills.len(), 1);
         assert!(warnings.is_empty());
@@ -345,7 +411,7 @@ mod tests {
         fs::create_dir_all(&scan_root).unwrap();
         symlink(Path::new("../store/tdd"), scan_root.join("tdd")).unwrap();
 
-        let (skills, warnings) = discover_skills_in_dir(&scan_root, |name| SkillId::Personal { name });
+        let (skills, warnings) = discover_skills_in_dir(&scan_root, ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills.len(), 1);
         assert!(warnings.is_empty());
@@ -360,7 +426,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "mine", "mine", "hand installed", "Body.");
 
-        let (skills, warnings) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let (skills, warnings) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills.len(), 1);
         assert!(warnings.is_empty());
@@ -395,7 +461,7 @@ mod tests {
         }
 
         let (skills, warnings) =
-            discover_skills_in_dir(&scan_root, |name| SkillId::Personal { name });
+            discover_skills_in_dir(&scan_root, ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         fs::set_permissions(&scan_root, fs::Permissions::from_mode(0o700)).unwrap();
 
@@ -411,7 +477,7 @@ mod tests {
         fs::create_dir_all(&scan_root).unwrap();
         symlink("/nonexistent/target", scan_root.join("dangling")).unwrap();
 
-        let (skills, warnings) = discover_skills_in_dir(&scan_root, |name| SkillId::Personal { name });
+        let (skills, warnings) = discover_skills_in_dir(&scan_root, ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert!(skills.is_empty());
         assert_eq!(warnings.len(), 1);
@@ -425,7 +491,7 @@ mod tests {
         // but is not anomalous either - it must not produce a warning.
         fs::write(tmp.path().join(".DS_Store"), b"junk").unwrap();
 
-        let (skills, warnings) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let (skills, warnings) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert!(skills.is_empty());
         assert!(warnings.is_empty());
@@ -438,7 +504,7 @@ mod tests {
         fs::write(tmp.path().join("domain-modeling").join("CONTEXT-FORMAT.md"), "format doc").unwrap();
         fs::write(tmp.path().join("domain-modeling").join("ADR-FORMAT.md"), "adr doc").unwrap();
 
-        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let (skills, _) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].on_demand_files.len(), 2);
@@ -459,7 +525,7 @@ mod tests {
             fs::write(junk.join("blob"), "not a reference file").unwrap();
         }
 
-        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let (skills, _) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills[0].on_demand_files, vec![skill_dir.join("REFERENCE.md")]);
     }
@@ -476,7 +542,7 @@ mod tests {
         write_skill(&skill_dir.join("skills"), "browse", "browse", "drives a browser", "Body.");
         fs::write(skill_dir.join("skills").join("browse").join("PLAYBOOK.md"), "nested ref").unwrap();
 
-        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let (skills, _) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills[0].on_demand_files, vec![skill_dir.join("REFERENCE.md")]);
     }
@@ -498,7 +564,7 @@ mod tests {
         symlink(real.join("SKILL.md"), shim.join("SKILL.md")).unwrap();
         fs::write(shim.join("PLAYBOOK.md"), "the shim's own bundled ref").unwrap();
 
-        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let (skills, _) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
         let gstack = skills.iter().find(|s| s.directory_name() == "gstack").unwrap();
 
         assert_eq!(gstack.on_demand_files, vec![skill_dir.join("REFERENCE.md")]);
@@ -515,7 +581,7 @@ mod tests {
         // an ordinary reference file sharing that parent still counts.
         fs::write(skills_subdir.join("INDEX.md"), "index of the nested skills").unwrap();
 
-        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let (skills, _) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills[0].on_demand_files, vec![skills_subdir.join("INDEX.md")]);
     }
@@ -528,7 +594,7 @@ mod tests {
         fs::create_dir_all(&refs).unwrap();
         fs::write(refs.join("ADR-FORMAT.md"), "adr doc").unwrap();
 
-        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let (skills, _) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills[0].on_demand_files, vec![refs.join("ADR-FORMAT.md")]);
     }
@@ -546,7 +612,7 @@ mod tests {
         // (issue #26).
         symlink(&refs, refs.join("self")).unwrap();
 
-        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let (skills, _) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills[0].on_demand_files, vec![refs.join("ADR-FORMAT.md")]);
     }
@@ -561,7 +627,7 @@ mod tests {
         fs::write(refs.join("ADR-FORMAT.md"), "adr doc").unwrap();
         symlink(&refs, skill_dir.join("also-references")).unwrap();
 
-        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Personal { name });
+        let (skills, _) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills[0].on_demand_files, vec![refs.join("ADR-FORMAT.md")]);
     }
@@ -571,7 +637,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "foo", "foo", "desc", "Body.");
 
-        let (skills, _) = discover_skills_in_dir(tmp.path(), |name| SkillId::Plugin {
+        let (skills, _) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Plugin {
             marketplace: "test-market".to_string(),
             plugin: "test-plugin".to_string(),
             name,
