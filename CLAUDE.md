@@ -41,7 +41,14 @@ Three things to carry forward.
 **The fix was not "walk deeper"** — `mattpocock-skills` ships 40 `SKILL.md` and declares 22; the undeclared 18 never load, so a recursive walk trades a 40-skill under-count for an 18-skill over-count (ADR 0028's error class). Depth-1 per candidate dir is load-bearing in *both* directions now, and both errors are silent.
 **The docs corrected the issue**: `skills` *adds to* the always-scanned default `skills/` rather than replacing it, as #33 proposed. Identical numbers on all 11 plugins here, divergent for a plugin shipping both — check `code.claude.com/docs/en/plugins-reference.md`, not the manifests on disk.
 **A fixture was the accomplice**: the old test wrote `plugin.json` where discovery looked for it, so relocation looked covered while never once executing. Tests now build the manifest through a helper, and the `#[ignore]`d `real_claude_home_plugin_skills` asserts the property (no plugin resolves to zero while declaring skills) rather than counts a version bump invalidates.
-Known gap left open deliberately: **skill naming** (**#41**). The reference says a plugin skill's invocation name is its frontmatter `name`, with the directory basename only a fallback; skillmon keys `SkillId` on the basename. They agree for all 55 skills here, and `name_mismatch` (#27) surfaces divergence, so it is a no-op today — except for the root-`SKILL.md` single-skill layout, where the basename is the install dir and so a version string. Changing it touches `SkillId`'s documented "name *is* the directory name" invariant, usage attribution keys, and removal's id→dir mapping.
+**#41 has landed** (ADR 0031): a plugin-root `SKILL.md` (`"skills": ["./"]`, or the auto v2.1.142+ single-skill layout) now takes its invocation name from the frontmatter `name`, not the version-string install dir it sits in.
+The scope was settled by the docs, not the manifests: `skills.md`'s "How a skill gets its command name" says *"the plugin-root case is the one place where name does set the command name."* So a plugin `skills/` subdirectory, a declared non-root path (`mattpocock-skills`'s `./skills/engineering/tdd`), and every personal/project skill keep the directory basename; only the install root reads frontmatter.
+That is narrower than the `discover_skill_at_dir` seam the issue named, which also serves declared non-root paths that must not flip.
+Discovery resolves it via a `NamePolicy` (`DirectoryBasename` by default, `FrontmatterName` only for the install-root dir).
+`SkillId::name` is now the *invocation name*; `directory_name()` was renamed `invocation_name()` to stop lying, and `name_mismatch` compares against it, so a plugin-root skill (whose identity already *is* its declared name) shows no mismatch.
+It aligns identity with `UsageKey`, which joins on the invocation name: a version-string basename would never match a transcript's `attributionSkill`.
+A no-op on all 55 skills here (none use the plugin-root layout), asserted against synthetic fixtures and the real-home test.
+The basename fallback for a nameless root `SKILL.md` is documented but unreachable, since the parser requires `name`; the `.agents` lock inversion reads the folder off `dir_path`, not the identity.
 
 The "restart Claude Code to apply" nudge shipped with #31 (ADR 0007): sticky until dismissed, since a rescan does not restart anyone's session.
 
@@ -59,7 +66,7 @@ The "restart Claude Code to apply" nudge shipped with #31 (ADR 0007): sticky unt
 
 - `src-tauri/` — Rust core (Cargo crate `skillmon`, lib `skillmon_lib`): `src/lib.rs` is the entry point. Will hold the harness adapter, skill discovery, footprint counter, transcript attribution, mutation ops, `rusqlite` persistence, file watcher. Capabilities in `src-tauri/capabilities/`.
 - `src/` — SvelteKit-TS frontend (adapter-static, SPA): `src/routes/` pages, `src/app.html`. Becomes the tray panel: skill list, three-layer footprint columns, usage column, sort/group, disable/uninstall.
-- `CONTEXT-MAP.md` → `src-tauri/CONTEXT.md` glossary · `docs/DESIGN.md` design · `docs/adr/` decisions (0001–0025).
+- `CONTEXT-MAP.md` → `src-tauri/CONTEXT.md` glossary · `docs/DESIGN.md` design · `docs/adr/` decisions (0001–0031).
 
 ## Project rules
 

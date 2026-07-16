@@ -1100,7 +1100,7 @@ mod tests {
         let mut entries: Vec<EntryToRemove> = Vec::new();
         let mut real_targets: Vec<PathBuf> = Vec::new();
         for skill in &discovery.skills {
-            let name = skill.directory_name();
+            let name = skill.invocation_name();
             let entry_path = scan_root.join(name);
             if entry_path.exists() {
                 continue; // two repos can ship the same project-skill name
@@ -1147,7 +1147,7 @@ mod tests {
         // Its own identity, since it is a distinct entry from the linked one
         // above and must not collide with that tombstone.
         let sample = &discovery.skills[0];
-        let name = format!("unmanaged-{}", sample.directory_name());
+        let name = format!("unmanaged-{}", sample.invocation_name());
         let entry_path = scan_root.join(&name);
         replicate(&sample.dir_path, &entry_path);
         let expected = read_tree(&entry_path);
@@ -1180,7 +1180,7 @@ mod tests {
         );
         eprintln!(
             "=== unmanaged round-trip on real content: {} ({} bytes) reclaimed, real install intact ===\n",
-            sample.directory_name(),
+            sample.invocation_name(),
             freed
         );
     }

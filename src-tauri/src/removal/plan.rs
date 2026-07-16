@@ -201,8 +201,8 @@ mod tests {
             None
         }
         fn forget_source(&self, skill: &DiscoveredSkill) -> Result<Option<String>, SourceError> {
-            self.forgotten.lock().unwrap().push(skill.directory_name().to_string());
-            Ok(Some(format!("state for {}", skill.directory_name())))
+            self.forgotten.lock().unwrap().push(skill.invocation_name().to_string());
+            Ok(Some(format!("state for {}", skill.invocation_name())))
         }
         fn relearn_source(&self, _state: &str) -> Result<(), SourceError> {
             Ok(())
@@ -521,7 +521,7 @@ mod tests {
             assert_eq!(p.rebuilt_by.is_some(), skill.manager_root.is_some());
             eprintln!(
                 "  {:<28} managed={:<5} dependents={:<3} source={}",
-                skill.directory_name(),
+                skill.invocation_name(),
                 skill.manager_root.is_some(),
                 p.dependents.len(),
                 match p.source.as_ref() {
@@ -554,7 +554,7 @@ mod tests {
 
         // A real skill's real content, installed the way `.agents` installs one.
         let sample = &discovery.skills[0];
-        let name = sample.directory_name().to_string();
+        let name = sample.invocation_name().to_string();
         let content = agents_skills.join(&name);
         copy_tree(&sample.dir_path, &content);
         let entry = scan_root.join(&name);
@@ -620,7 +620,7 @@ mod tests {
         let skills = vec![f.unmanaged("a"), f.unmanaged("b")];
 
         let found = resolve(&skills, &SkillId::Personal { name: "b".to_string() }).unwrap();
-        assert_eq!(found.directory_name(), "b");
+        assert_eq!(found.invocation_name(), "b");
     }
 
     /// The point of resolving at all: a ref the panel held onto after the skill

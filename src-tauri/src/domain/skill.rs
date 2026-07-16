@@ -62,8 +62,16 @@ pub struct DiscoveredSkill {
 }
 
 impl SkillId {
-    /// The directory name every variant carries, so reading it costs callers no
-    /// match on the kind.
+    /// The skill's **invocation name** -- the stable identity it is keyed,
+    /// listed, and invoked by -- carried by every variant so reading it costs
+    /// callers no match on the kind.
+    ///
+    /// This is the directory basename for every layout except a plugin-root
+    /// single-`SKILL.md` (`"skills": ["./"]` or the auto v2.1.142+ layout),
+    /// where the basename is the install directory -- a version string for a
+    /// marketplace install -- and the invocation name comes from the frontmatter
+    /// `name` instead (issue #41, ADR 0031). Discovery resolves that at build
+    /// time (`NamePolicy`), so consumers here just read the settled name.
     pub fn name(&self) -> &str {
         match self {
             SkillId::Personal { name } => name,
@@ -74,7 +82,13 @@ impl SkillId {
 }
 
 impl DiscoveredSkill {
-    pub fn directory_name(&self) -> &str {
+    /// The invocation name -- the identity Claude Code lists and invokes, and
+    /// what usage attribution, the listing memo, and removal all key on. Equal
+    /// to the directory basename for every skill but a plugin-root one, whose
+    /// name comes from frontmatter (`SkillId::name`, issue #41). Read the
+    /// physical folder off `dir_path` when that, rather than the identity, is
+    /// what a caller needs.
+    pub fn invocation_name(&self) -> &str {
         self.id.name()
     }
 
@@ -82,8 +96,14 @@ impl DiscoveredSkill {
     /// shows both names rather than silently picking one (CONTEXT.md "Declared
     /// name"). The rule for what counts as divergence stays here, in the
     /// domain, rather than being re-derived in the panel.
+    ///
+    /// Compared against the *invocation* name, not the raw folder: a plugin-root
+    /// skill's identity already *is* its frontmatter `name`, so there is nothing
+    /// to surface (issue #41). The flag fires only where the identity skillmon
+    /// keys and shows genuinely differs from the frontmatter name -- a personal
+    /// directory `connect-chrome` declaring `open-gstack-browser`.
     pub fn name_mismatch(&self) -> bool {
-        self.directory_name() != self.frontmatter.declared_name
+        self.invocation_name() != self.frontmatter.declared_name
     }
 }
 
@@ -208,9 +228,9 @@ mod tests {
     }
 
     #[test]
-    fn directory_name_reads_from_skill_id_not_frontmatter() {
+    fn invocation_name_reads_from_skill_id_not_frontmatter() {
         let skill = sample_skill("connect-chrome", "open-gstack-browser");
-        assert_eq!(skill.directory_name(), "connect-chrome");
+        assert_eq!(skill.invocation_name(), "connect-chrome");
     }
 
     #[test]

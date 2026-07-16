@@ -16,14 +16,18 @@ _Avoid_: command, tool, prompt
 
 **Skill identity**:
 The stable key that survives rescans and lets footprint history, tombstones, quarantine-origin, and attributed usage all point at the same row: `Personal(name)`, `Project(repo_path, name)`, or `Plugin(marketplace, plugin, name)`.
-`name` here is the **directory name**, not the frontmatter `name:` field — the two can diverge (observed in the wild: a personal skill directory named `connect-chrome` with frontmatter `name: open-gstack-browser`) and the directory is what's filesystem-stable and what mutations actually operate on.
-Never keyed by plugin version — an upgrade must not orphan usage history or reset a tombstone.
+`name` here is the **invocation name**, the identity Claude Code lists and invokes.
+It is the directory basename for every layout but one: a plugin-root `SKILL.md` (`"skills": ["./"]`, or the auto v2.1.142+ single-skill layout) takes its name from the frontmatter `name:` instead, because its basename is the version-string install dir and would change on every update (ADR 0031).
+For every other skill the basename *is* the invocation name, and it can still diverge from the frontmatter `name:` (observed: a personal directory `connect-chrome` with frontmatter `name: open-gstack-browser`), surfaced as a Declared name mismatch rather than silently resolved.
+Never keyed by plugin version: an upgrade must not orphan usage history or reset a tombstone, which is exactly why the plugin-root exception exists.
+Read the physical folder off `dir_path` where a mutation needs it (the `.agents` lock inversion), not off the identity.
 Distinct from the footprint cache key, which is content-hash-based (see Context footprint).
-_Avoid_: skill ID, UUID
+_Avoid_: skill ID, UUID, directory name (the identity is the invocation name, which is usually but not always the directory)
 
 **Declared name**:
 The frontmatter `name:` field, shown to the user/model as the skill's label.
-When it diverges from the directory name (part of skill identity), the UI surfaces both rather than silently picking one — the user may know the skill by either.
+When it diverges from the invocation name (part of skill identity), the UI surfaces both rather than silently picking one, since the user may know the skill by either.
+For a plugin-root skill the invocation name already *is* the frontmatter `name`, so there is nothing to surface: the mismatch flag fires only where the identity skillmon keys genuinely differs from the declared name.
 _Avoid_: display name
 
 **Personal skill**:
@@ -137,7 +141,7 @@ _Avoid_: size, weight, cost
 
 **Always-on layer**:
 The rendered listing line(s) Claude Code injects for the skill on every request while it is enabled — the persistent tax that justifies disabling an unused skill.
-Not fixed to "frontmatter `name` + `description`": it uses the directory name rather than the frontmatter `name:` field, and can carry extra rendered decorations beyond the description (observed: a "Voice triggers" line on a gstack-managed skill, absent on others).
+Not fixed to "frontmatter `name` + `description`": it is keyed by the invocation name (the directory basename for most skills, the frontmatter `name` for a plugin-root one; see Skill identity), and can carry extra rendered decorations beyond the description (observed: a "Voice triggers" line on a gstack-managed skill, absent on others).
 Read from a live transcript when one exists (native, high confidence); reconstructed from raw frontmatter only for a skill no transcript has ever included, and flagged as lower confidence.
 _Avoid_: frontmatter cost
 

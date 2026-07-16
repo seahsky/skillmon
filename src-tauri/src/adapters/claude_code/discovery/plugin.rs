@@ -1,5 +1,5 @@
 use crate::adapters::claude_code::discovery::scan::{
-    discover_skill_at_dir, discover_skills_in_dir, ChildDirs,
+    discover_skill_at_dir, discover_skills_in_dir, ChildDirs, NamePolicy,
 };
 use crate::adapters::claude_code::paths::{installed_plugins_path, plugin_manifest_path, plugin_skills_dir};
 use crate::domain::skill::{DiscoveredSkill, DiscoveryWarning, InstallScope, SkillId};
@@ -192,6 +192,11 @@ struct SkillDir {
     /// to this plugin, and the always-on total sums discovered skills (ADR
     /// 0003), so the same skill would land in the headline twice.
     escapes: bool,
+    /// Whether this path *is* the plugin install root -- the auto single-skill
+    /// layout, or a declared `"skills": ["./"]`. Only there does a directory
+    /// holding `SKILL.md` directly take its invocation name from frontmatter
+    /// rather than its (version-string) basename (issue #41, ADR 0031).
+    is_plugin_root: bool,
     children: ChildDirs,
 }
 
@@ -205,6 +210,18 @@ fn contains(root: &Path, path: &Path) -> bool {
     match (fs::canonicalize(root), fs::canonicalize(path)) {
         (Ok(root), Ok(path)) => path.starts_with(root),
         _ => path.starts_with(root),
+    }
+}
+
+/// Whether `path` resolves to `install_path` itself -- the plugin root. Compared
+/// as canonical paths so `install_path.join("./")` (a declared `"skills": ["./"]`)
+/// is recognized as the root despite the trailing `.`. A path that cannot be
+/// resolved is not the root: `canonicalize` fails on what is not on disk, and a
+/// declaration naming nothing is not the install directory.
+fn resolves_to(install_path: &Path, path: &Path) -> bool {
+    match (fs::canonicalize(install_path), fs::canonicalize(path)) {
+        (Ok(root), Ok(path)) => root == path,
+        _ => false,
     }
 }
 
@@ -255,6 +272,7 @@ fn skill_dirs(install_path: &Path, manifest: &ManifestSkills) -> Vec<SkillDir> {
             path: install_path.to_path_buf(),
             declared: false,
             escapes: false,
+            is_plugin_root: true,
             children: ChildDirs::AreSkillEntries,
         }];
     }
@@ -267,11 +285,22 @@ fn skill_dirs(install_path: &Path, manifest: &ManifestSkills) -> Vec<SkillDir> {
     let dirs = std::iter::once(default)
         .map(|path| (path, false))
         .chain(declared.iter().cloned().map(|path| (path, true)))
-        .map(|(path, was_declared)| SkillDir {
-            children: classify_children(&path, &declared),
-            escapes: was_declared && !contains(install_path, &path),
-            path,
-            declared: was_declared,
+        .map(|(path, was_declared)| {
+            // A declared `"skills": ["./"]` resolves back to the install root and
+            // is the same plugin-root case as the auto layout above. The default
+            // `skills/` and every nested declared path resolve elsewhere.
+            // `children`/`escapes` are judged on the path as spelled, then the
+            // root is normalized to the install dir so its `dir_path` and
+            // manager-root resolution match the auto layout instead of trailing
+            // a `.` component.
+            let is_plugin_root = resolves_to(install_path, &path);
+            SkillDir {
+                children: classify_children(&path, &declared),
+                escapes: was_declared && !contains(install_path, &path),
+                path: if is_plugin_root { install_path.to_path_buf() } else { path },
+                is_plugin_root,
+                declared: was_declared,
+            }
         });
 
     // A manifest may name the default explicitly (`"skills": ["./skills", …]`),
@@ -330,7 +359,12 @@ pub fn discover_plugin_skills(record: &PluginInstallRecord) -> (Vec<DiscoveredSk
         // enter context (the error class of #26); walking shallower is how the
         // declared 22 came back as 0.
         let (found, found_warnings) = if dir.path.join("SKILL.md").is_file() {
-            let (skill, w) = discover_skill_at_dir(&dir.path, plugin_id_maker(record));
+            // Only a plugin-root `SKILL.md` names from frontmatter; a declared
+            // non-root path holding `SKILL.md` directly still names from its
+            // directory (issue #41, ADR 0031).
+            let policy =
+                if dir.is_plugin_root { NamePolicy::FrontmatterName } else { NamePolicy::DirectoryBasename };
+            let (skill, w) = discover_skill_at_dir(&dir.path, policy, plugin_id_maker(record));
             (skill.into_iter().collect(), w)
         } else {
             discover_skills_in_dir(&dir.path, dir.children, plugin_id_maker(record))
@@ -470,7 +504,7 @@ mod tests {
     }
 
     fn skill_names(skills: &[DiscoveredSkill]) -> Vec<String> {
-        let mut names: Vec<String> = skills.iter().map(|s| s.directory_name().to_string()).collect();
+        let mut names: Vec<String> = skills.iter().map(|s| s.invocation_name().to_string()).collect();
         names.sort();
         names
     }
@@ -713,17 +747,17 @@ mod tests {
     /// machine; without it, such a plugin would be invisible in exactly the way
     /// this issue is about.
     ///
-    /// Pins the known-wrong name rather than asserting around it. This is the
-    /// one layout where keying `SkillId` on the directory basename is not a
-    /// no-op: the basename here is the *install directory*, which for a
-    /// marketplace-installed plugin is a version string (`1.2.0`, `unknown`)
-    /// that changes on every update, and the reference says the invocation name
-    /// comes from the frontmatter `name` with the basename only as a fallback.
-    /// skillmon's naming rule is deliberately unchanged (ADR 0030) -- the panel
-    /// surfaces the divergence through `name_mismatch` (issue #27) rather than
-    /// silently picking one -- so this test documents the gap where it bites.
+    /// This is the one layout where keying `SkillId` on the directory basename
+    /// would be wrong: the basename here is the *install directory*, which for a
+    /// marketplace-installed plugin is a version string (`1.2.0`, `unknown`) that
+    /// changes on every update. skills.md is explicit that "the plugin-root case
+    /// is the one place where name does set the command name," so the invocation
+    /// name is the frontmatter `name` (`solo`), not the version directory, and
+    /// there is no `name_mismatch` to surface -- the identity already *is* the
+    /// declared name (issue #41, ADR 0031). The manifest's own `name`
+    /// (`solo-plugin`) is the plugin's, never the skill's.
     #[test]
-    fn plugin_with_only_a_root_skill_md_is_loaded_as_a_single_skill() {
+    fn plugin_with_only_a_root_skill_md_is_named_from_frontmatter_not_the_version_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let install_path = tmp.path().join("2.1.0");
         write_skill(&install_path, "solo");
@@ -734,8 +768,57 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(skills[0].frontmatter.declared_name, "solo");
-        assert_eq!(skills[0].directory_name(), "2.1.0", "the known naming gap, surfaced not hidden");
-        assert!(skills[0].name_mismatch(), "the panel must show both names, never silently pick one");
+        assert_eq!(skills[0].invocation_name(), "solo", "the frontmatter name, not the version dir 2.1.0");
+        assert!(!skills[0].name_mismatch(), "the invocation name already is the declared name");
+        match &skills[0].id {
+            SkillId::Plugin { name, .. } => assert_eq!(name, "solo", "the stable identity, not 2.1.0"),
+            other => panic!("expected Plugin id, got {other:?}"),
+        }
+    }
+
+    /// The explicit form of the plugin-root layout: `"skills": ["./"]` naming the
+    /// install root, the exact example the plugins reference gives. It resolves
+    /// to the same directory as the auto layout, so it takes the same rule --
+    /// frontmatter `name`, not the version-string install dir (issue #41).
+    #[test]
+    fn declared_dot_slash_root_is_named_from_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("1.2.0");
+        write_skill(&install_path, "rooted");
+        write_manifest(&install_path, r#"{"skills": ["./"]}"#);
+
+        let (skills, warnings) = discover_plugin_skills(&record_for(&install_path));
+
+        assert_eq!(skills.len(), 1);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(skills[0].invocation_name(), "rooted", "the frontmatter name, not 1.2.0");
+        assert!(!skills[0].name_mismatch());
+        // Normalized to the install dir, so it is unmanaged like the auto layout
+        // rather than reading its parent as a manager root.
+        assert_eq!(skills[0].manager_root, None);
+    }
+
+    /// The counterpart, and the decision skills.md forces: a declared path that
+    /// holds `SKILL.md` directly but is *not* the install root -- a
+    /// `mattpocock-skills`-shaped `./skills/engineering/tdd` -- still names its
+    /// skill from the `tdd` directory, never the frontmatter. "The plugin-root
+    /// case is the one place where name does set the command name." The frontmatter
+    /// deliberately diverges here so a rule applied too broadly would fail the test.
+    #[test]
+    fn declared_non_root_direct_path_is_named_from_its_directory_not_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("plugin-install");
+        fs::create_dir_all(&install_path).unwrap();
+        write_manifest(&install_path, r#"{"skills": ["./skills/engineering/tdd"]}"#);
+        write_skill(&install_path.join("skills").join("engineering").join("tdd"), "renamed-in-frontmatter");
+
+        let (skills, warnings) = discover_plugin_skills(&record_for(&install_path));
+
+        assert_eq!(skills.len(), 1);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(skills[0].invocation_name(), "tdd", "the directory name, not the frontmatter name");
+        assert_eq!(skills[0].frontmatter.declared_name, "renamed-in-frontmatter");
+        assert!(skills[0].name_mismatch(), "a plugin skills/ subdir shows both names, like any skill");
     }
 
     #[test]
@@ -796,7 +879,11 @@ mod tests {
     ///   -- `mattpocock-skills` (22) and `impeccable` (18) both did, which is
     ///   the bug;
     /// * no `no readable SKILL.md` warning survives -- a category dir is a
-    ///   nested layout, not a malformed skill.
+    ///   nested layout, not a malformed skill;
+    /// * every plugin skill's invocation name equals its directory basename --
+    ///   issue #41's "all 55 keep their current names" no-op, asserted rather
+    ///   than assumed: no plugin here uses the plugin-root layout, so the
+    ///   frontmatter-name rule fires nowhere and renames nothing.
     ///
     /// Read-only. `#[ignore]`d because it depends on this machine's `~`.
     ///
@@ -841,6 +928,16 @@ mod tests {
                 assert!(
                     !skills.is_empty(),
                     "{} declares {declared} skills paths and resolved none -- the #33 silent zero",
+                    record.plugin_at_marketplace,
+                );
+            }
+
+            for skill in &skills {
+                let basename = skill.dir_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                assert_eq!(
+                    skill.invocation_name(),
+                    basename,
+                    "{}: a real plugin skill was renamed by the #41 rule -- none here use the plugin-root layout",
                     record.plugin_at_marketplace,
                 );
             }
