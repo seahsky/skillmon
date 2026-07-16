@@ -30,7 +30,7 @@ pub fn plan(skills: &[DiscoveredSkill], tools: &ManagingTools, skill: &Discovere
     RemovalPlan {
         primary: entry_for(skill),
         dependents: dependents_of(skills, skill).into_iter().map(entry_for).collect(),
-        source: manager_root.map(|_| source_offer(skill, tool)),
+        source: manager_root.map(|root| source_offer(skill, root, tool)),
         // A managed entry is one its manager rebuilds -- known tool or not. The
         // hazard is ADR 0027's, and it does not depend on skillmon recognizing
         // who will do the rebuilding.
@@ -43,12 +43,21 @@ pub fn plan(skills: &[DiscoveredSkill], tools: &ManagingTools, skill: &Discovere
 /// Every path here is refused rather than guessed: a tool that says it cannot
 /// make the removal stick is taken at its word, an unknown manager gets no
 /// offer, and a source that will not resolve is not invented.
-fn source_offer(skill: &DiscoveredSkill, tool: Option<&(dyn ManagingTool + Send + Sync)>) -> SourceOffer {
+///
+/// `manager_root` is passed rather than re-read off the skill, so "an offer
+/// exists only for a managed skill" is a fact about the signature instead of an
+/// invariant this function would have to paper over with an empty path -- and an
+/// empty path would reach the dialog as a blank "content lives at" line.
+fn source_offer(
+    skill: &DiscoveredSkill,
+    manager_root: &Path,
+    tool: Option<&(dyn ManagingTool + Send + Sync)>,
+) -> SourceOffer {
     let Some(tool) = tool else {
         return SourceOffer {
             // The manager root is the honest fallback: skillmon can see where
             // the content lives without knowing who put it there.
-            path: skill.manager_root.clone().unwrap_or_default(),
+            path: manager_root.to_path_buf(),
             tool_name: None,
             blocked: Some(
                 "skillmon does not recognize the tool managing this skill, so it cannot tell whether \
@@ -69,7 +78,9 @@ fn source_offer(skill: &DiscoveredSkill, tool: Option<&(dyn ManagingTool + Send 
     });
 
     SourceOffer {
-        path: path.or_else(|| skill.manager_root.clone()).unwrap_or_default(),
+        // Falls back to the manager root only on the branch just blocked above,
+        // so the dialog still names a real directory while refusing.
+        path: path.unwrap_or_else(|| manager_root.to_path_buf()),
         tool_name: Some(tool.name().to_string()),
         blocked,
     }

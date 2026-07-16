@@ -145,17 +145,6 @@ export function sourceOptionLabel(source: SourceOfferReport): string {
 }
 
 /**
- * Why the source option is missing, when it is missing.
- *
- * Rendered in place of the option rather than instead of nothing: a reason is
- * what keeps an absent affordance from reading as a bug, which is exactly why
- * `can_remove_source` returns one (ADR 0027).
- */
-export function sourceBlockedNote(source: SourceOfferReport): string | null {
-  return source.blocked;
-}
-
-/**
  * The two intents, as a labeled choice over one operation (ADR 0027).
  *
  * Both are the same reversible move; only what may later reclaim them differs.

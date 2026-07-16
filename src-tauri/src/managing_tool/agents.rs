@@ -31,6 +31,9 @@ use serde_json::{Map, Value};
 use super::{ManagingTool, SourceError};
 use crate::domain::skill::DiscoveredSkill;
 
+/// The label the panel shows and the errors name. One `const` rather than a
+/// literal per site: it reaches the user through two channels (`name()` and
+/// every `SourceError`), and two spellings of one tool would read as two tools.
 const TOOL: &str = "the skills CLI (.agents)";
 /// `CURRENT_VERSION` in the CLI. A lock at any other version has a shape this
 /// build has not read, so it is refused rather than rewritten.
@@ -194,7 +197,7 @@ struct ForgottenEntry {
 
 impl ManagingTool for AgentsTool {
     fn name(&self) -> &'static str {
-        "the skills CLI (.agents)"
+        TOOL
     }
 
     fn detects(&self, root: &Path) -> bool {

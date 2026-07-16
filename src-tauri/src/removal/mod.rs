@@ -14,6 +14,7 @@ pub mod fs_ops;
 pub mod plan;
 pub mod store;
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -162,7 +163,7 @@ fn stage_one(entry: &EntryToRemove, ordinal: usize, storage_dir: &Path) -> Resul
     // entry is put back before the error goes up -- a skill whose content was
     // trashed while its entry stayed live is a dangling entry, the one shape
     // ADR 0027 refuses to produce.
-    let source = match stage_source(entry, ordinal, storage_dir) {
+    let source = match stage_source(entry, ordinal, storage_dir, name) {
         Ok(source) => source,
         Err(e) => {
             move_back(std::iter::once((stored_path.as_path(), entry.entry_path.as_path())));
@@ -182,15 +183,23 @@ fn stage_one(entry: &EntryToRemove, ordinal: usize, storage_dir: &Path) -> Resul
 
 /// Stages the managing tool's own copy beside its entry, under the same unit.
 ///
-/// `-source` rather than another ordinal: the two are one skill, so one undo has
-/// to put back both (`domain::removal::TrashedSource`). The tool's bookkeeping
-/// was already dropped by the planner and is only carried through to the ledger
-/// here -- this module knows no tools (see the module docs).
-fn stage_source(entry: &EntryToRemove, ordinal: usize, storage_dir: &Path) -> Result<Option<TrashedSource>, RemovalError> {
+/// Under the same ordinal rather than one of its own: the two are one skill, so
+/// one undo has to put back both (`domain::removal::TrashedSource`). The tool's
+/// bookkeeping was already dropped by the planner and is only carried through to
+/// the ledger here -- this module knows no tools (see the module docs).
+///
+/// The name is built from the entry's own stored name, and that is what keeps
+/// the two from landing on each other. A bare `{ordinal}-source` would collide
+/// with a skill directory legitimately named `source`, and nothing rejects that
+/// name -- discovery takes any UTF-8 directory. Deriving it instead makes the
+/// collision unrepresentable: within one ordinal the entry is `{name}` and its
+/// source is `source-{name}`, and no string equals its own extension; across
+/// ordinals the prefix already differs.
+fn stage_source(entry: &EntryToRemove, ordinal: usize, storage_dir: &Path, entry_name: &OsStr) -> Result<Option<TrashedSource>, RemovalError> {
     let Some(source) = entry.source.as_ref() else { return Ok(None) };
 
     let bytes = fs_ops::entry_size(&source.path)?;
-    let stored_path = storage_dir.join(format!("{ordinal}-source"));
+    let stored_path = storage_dir.join(format!("{ordinal}-source-{}", entry_name.to_string_lossy()));
     fs_ops::move_entry(&source.path, &stored_path)?;
 
     Ok(Some(TrashedSource {
@@ -741,6 +750,41 @@ mod tests {
         assert_eq!(staged.origin_path, source);
         assert_eq!(fs::read_to_string(staged.stored_path.join("SKILL.md")).unwrap(), "the only copy");
         assert!(unit.bytes() > 0);
+    }
+
+    /// A skill directory may legally be named anything, including the word the
+    /// staging scheme uses for the source slot. Nothing rejects such a name --
+    /// discovery takes any UTF-8 directory -- so the two staged paths must not be
+    /// able to land on each other.
+    ///
+    /// It bites hardest on exactly the shape source removal is *for*: a symlink
+    /// entry. `rename` over a non-empty directory fails, but over a symlink it
+    /// succeeds silently, so the entry would be destroyed and the ledger would
+    /// record both halves at one path -- an undo that restores a directory where
+    /// a link belongs.
+    #[cfg(unix)]
+    #[test]
+    fn a_skill_named_like_the_source_slot_does_not_stage_over_its_own_entry() {
+        let mut f = Fixture::new();
+        let (entry, source) = f.install_managed("source", "the only copy");
+        let origin = entry.entry_path.clone();
+
+        let id = f.remove(1_000, Retention::Trashed, entry, vec![]).unwrap();
+
+        let unit = f.store.get(id).unwrap().unwrap();
+        let staged_source = unit.primary.source.as_ref().unwrap();
+        assert_ne!(
+            unit.primary.stored_path, staged_source.stored_path,
+            "the entry and its source must never stage to the same path"
+        );
+        assert!(
+            fs::symlink_metadata(&unit.primary.stored_path).unwrap().is_symlink(),
+            "the staged entry is still the link it was, not the source dir moved on top of it"
+        );
+
+        f.restore(id).unwrap();
+        assert!(fs::symlink_metadata(&origin).unwrap().is_symlink(), "restored as a link");
+        assert_eq!(fs::read_to_string(source.join("SKILL.md")).unwrap(), "the only copy");
     }
 
     /// The reason a source is an entry's field rather than its own unit. A

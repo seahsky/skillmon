@@ -10,7 +10,6 @@ import {
   removalTitle,
   retentionDescription,
   revertedNote,
-  sourceBlockedNote,
   sourceOptionLabel,
   trashUnitSummary,
   type RemovalPlanReport,
@@ -145,20 +144,6 @@ describe("source offers", () => {
     expect(label).toContain("/home/me/.agents/skills/tdd");
   });
 
-  // The reason is the whole point of `can_remove_source` returning one: an
-  // absent option that cannot explain itself reads as a bug.
-  it("passes a tool's own refusal through verbatim", () => {
-    const source: SourceOfferReport = {
-      path: "/home/me/.claude/skills/gstack/ship",
-      toolName: "gstack",
-      blocked: "gstack rebuilds every skill it knows, and /gstack-upgrade runs git reset --hard.",
-    };
-    expect(sourceBlockedNote(source)).toBe(source.blocked);
-  });
-
-  it("has no note when the option is live", () => {
-    expect(sourceBlockedNote({ path: "/x", toolName: "t", blocked: null })).toBeNull();
-  });
 });
 
 describe("retentionDescription", () => {

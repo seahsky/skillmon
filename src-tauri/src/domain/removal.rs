@@ -10,10 +10,10 @@ use super::skill::SkillId;
 /// thing that distinguishes them. Keeping the intent in state rather than in the
 /// destination path is what let ADR 0027 collapse ADR 0007's two mechanisms into
 /// one code path.
-/// `Deserialize` too, unlike the read-only report DTOs: the retention intent is
-/// the one thing the *user* chooses about a removal, so it crosses inbound on
-/// `remove_skill` (issue #31). Disable and delete are the same operation, and
-/// this is the whole of what distinguishes them.
+///
+/// `Deserialize`, unlike the read-only report DTOs, because it is the one thing
+/// about a removal the *user* chooses: it crosses inbound on `remove_skill`
+/// (issue #31).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Retention {
@@ -140,7 +140,12 @@ pub struct TrashedEntry {
 impl TrashedEntry {
     /// What removing this one skill took off the disk: its entry, plus the
     /// managing tool's copy when that was removed too.
-    pub fn bytes(&self) -> u64 {
+    ///
+    /// Named apart from the `bytes` field on purpose. `entry.bytes` compiles and
+    /// means something narrower, and it under-reports worst on exactly the rows
+    /// where it matters -- a `.agents` entry is a symlink of a few bytes, and
+    /// everything reclaimable is in the source beside it.
+    pub fn total_bytes(&self) -> u64 {
         self.bytes + self.source.as_ref().map_or(0, |s| s.bytes)
     }
 }
@@ -191,7 +196,7 @@ impl TrashUnit {
     /// agents are neither cascaded nor counted here. This is not the tool's disk
     /// footprint and must not be presented as one.
     pub fn bytes(&self) -> u64 {
-        self.entries().map(TrashedEntry::bytes).sum()
+        self.entries().map(TrashedEntry::total_bytes).sum()
     }
 
     /// The directory holding this unit's staged entries, derived from where the
@@ -375,7 +380,7 @@ mod tests {
     #[test]
     fn an_entry_with_a_removed_source_counts_both_halves() {
         let e = entry_with_source("tdd", 20, 40_000);
-        assert_eq!(e.bytes(), 40_020);
+        assert_eq!(e.total_bytes(), 40_020);
 
         let u = unit(e, vec![]);
         assert_eq!(u.bytes(), 40_020);
@@ -387,7 +392,7 @@ mod tests {
     /// alone, so there is nothing extra to reclaim.
     #[test]
     fn an_entry_without_a_removed_source_counts_only_the_entry() {
-        assert_eq!(entry("ship", 20).bytes(), 20);
+        assert_eq!(entry("ship", 20).total_bytes(), 20);
     }
 
     /// ADR 0027's hazard, on the shape it actually bites: a gstack shim

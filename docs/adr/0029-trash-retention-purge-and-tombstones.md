@@ -6,7 +6,8 @@ Accepted; the engine landed with issue #28 and its callers and view with issue #
 Implements DESIGN.md UX decision #6, completes the open end of ADR 0027 (`Trashed` = "eligible for purge" never said eligible *by what*), and discharges the cross-device `rename(2)` fallback ADR 0007 flagged and left unaddressed.
 
 One amendment from issue #31: a trash **entry** may now carry the managing tool's copy of the same skill (`TrashedSource`), staged under the same unit, so one undo restores an entry and the content it points at together — see ADR 0027's Update for why it cannot be a unit of its own.
-The retention-window auto-purge this ADR admits as a setting is **not** built: nothing self-empties, which is this ADR's own decision, and a toggle for an unimplemented behaviour would be worse than its absence. Its absence remains the default.
+The retention-window auto-purge this ADR admits as a setting is **not** built: nothing self-empties, which is this ADR's own decision, and a toggle for an unimplemented behaviour would be worse than its absence.
+Its absence remains the default.
 
 ## Context
 

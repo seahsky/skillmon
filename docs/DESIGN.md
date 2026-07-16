@@ -75,7 +75,8 @@ Two things follow from the entry rule.
 A row that other skills resolve into is not a skill removal but a **tool uninstall**: it cascades to every dependent as one unit with one undo, and the dependent count it quotes is a floor, since skillmon scans Claude Code's paths alone.
 And removing a *managed* skill's entry alone is reverted the next time its manager runs — so the panel says so before the removal, and the removed view reconciles the claim afterwards rather than going on asserting a skill is disabled while it is live.
 
-Removing the managing tool's own copy is a second, explicit opt-in, offered only where that tool can make it stick (`.agents` can, and its lock entry is pruned and restored with the files; gstack cannot, because `/gstack-upgrade` runs `git reset --hard`, and it says so). Tool-specific knowledge lives in a `ManagingTool` seam parallel to the harness adapter, never inside it.
+Removing the managing tool's own copy is a second, explicit opt-in, offered only where that tool can make it stick (`.agents` can, and its lock entry is pruned and restored with the files; gstack cannot, because `/gstack-upgrade` runs `git reset --hard`, and it says so).
+Tool-specific knowledge lives in a `ManagingTool` seam parallel to the harness adapter, never inside it.
 
 Every mutation applies to new sessions only, because enablement is read at session start, so the UI surfaces a "restart Claude Code to apply" nudge after any change.
 
