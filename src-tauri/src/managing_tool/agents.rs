@@ -215,7 +215,18 @@ impl ManagingTool for AgentsTool {
         let Some(mut lock) = self.read_lock()? else { return Ok(None) };
         let skills = lock.get_mut("skills").and_then(Value::as_object_mut).expect("read_lock checked `skills`");
 
-        let Some(key) = Self::lock_key_for(skills, skill.directory_name()) else {
+        // The `.agents` lock keys the *on-disk* folder name (sanitized), so the
+        // inversion needs that folder, not the invocation identity -- read it
+        // straight off `dir_path` rather than through `invocation_name()`, which
+        // for a plugin-root skill would be the frontmatter name (issue #41). A
+        // `.agents` entry is always a personal skill, where the two coincide, but
+        // sourcing the folder here keeps that a fact of the data, not a coincidence.
+        // A discovered skill always has a UTF-8 basename; if that ever fails there
+        // is no folder to invert, so there is nothing in the lock to forget.
+        let Some(folder) = skill.dir_path.file_name().and_then(|n| n.to_str()) else {
+            return Ok(None);
+        };
+        let Some(key) = Self::lock_key_for(skills, folder) else {
             // The content is still staged and the entry still removed; the lock
             // simply never knew about this skill (installed by hand, or removed
             // from the lock already). Nothing to undo, so nothing to return.

@@ -35,6 +35,8 @@ Skills reach a machine three ways, and the distinction drives the whole UI.
   Each declared directory is one skill if it holds `SKILL.md` directly (`./skills/engineering/implement`), otherwise a directory of them scanned depth-1 (`./.claude/skills`).
   Both stay depth-1 deliberately: a plugin can ship more `SKILL.md` than it declares (`mattpocock-skills` ships 40, declares 22), and only the declared set enters context, so walking deeper would invent skills the way walking shallower lost them.
   A manifest that exists but will not parse is a `DiscoveryWarning`, never a silent fall back to the default — a plugin resolving to zero skills must stay distinguishable from a plugin that ships zero.
+  A plugin skill's invocation name (its stable identity) is its directory basename, with one exception: a `SKILL.md` sitting directly in the install root (`"skills": ["./"]`, or the auto v2.1.142+ single-skill layout), where the basename is the version-string install dir and the name comes from the frontmatter `name` instead, basename as fallback (ADR 0031).
+  This is *the one place* the frontmatter sets the name (`skills.md`); a plugin `skills/` subdirectory, and every personal or project skill, keep the directory name.
 
 Plugin state is registry-driven, and enablement is repo-scoped, not a single global flag (ADR 0015).
 

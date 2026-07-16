@@ -24,7 +24,7 @@ const SKILL_LISTING_MARKER: &str = "skill_listing";
 /// A one-pass index of the most-recent rendered bullet per skill, so a full
 /// scan reads each transcript **once** instead of re-reading every transcript
 /// per skill (which on a real machine is O(skills × transcripts × bytes) --
-/// tens of GB of reads). Keyed `directory_name → project_dir → (mtime,
+/// tens of GB of reads). Keyed `invocation_name → project_dir → (mtime,
 /// bullet)`, keeping the most-recent bullet per `(name, repo)` so a lookup
 /// can be scoped to the repos a skill can actually render in (decision #7 /
 /// ADR 0016): personal and plugin skills look across every repo, a project
@@ -189,7 +189,7 @@ pub fn always_on_text_from_index(
     if let Some(absent) = not_listed(skill) {
         return absent;
     }
-    match index.resolve(skill.directory_name(), search_project_dirs) {
+    match index.resolve(skill.invocation_name(), search_project_dirs) {
         Some(bullet) => AlwaysOnText { text: bullet.to_string(), kind: AlwaysOnTextKind::Native },
         None => AlwaysOnText { text: reconstruct_bullet(skill), kind: AlwaysOnTextKind::Reconstructed },
     }
@@ -313,17 +313,17 @@ pub fn always_on_text(skill: &DiscoveredSkill, search_project_dirs: &[PathBuf]) 
     if let Some(absent) = not_listed(skill) {
         return absent;
     }
-    match find_rendered_bullet(skill.directory_name(), search_project_dirs) {
+    match find_rendered_bullet(skill.invocation_name(), search_project_dirs) {
         Some(text) => AlwaysOnText { text, kind: AlwaysOnTextKind::Native },
         None => AlwaysOnText { text: reconstruct_bullet(skill), kind: AlwaysOnTextKind::Reconstructed },
     }
 }
 
 fn reconstruct_bullet(skill: &DiscoveredSkill) -> String {
-    format!("- {}: {}", skill.directory_name(), skill.frontmatter.description)
+    format!("- {}: {}", skill.invocation_name(), skill.frontmatter.description)
 }
 
-fn find_rendered_bullet(directory_name: &str, search_project_dirs: &[PathBuf]) -> Option<String> {
+fn find_rendered_bullet(invocation_name: &str, search_project_dirs: &[PathBuf]) -> Option<String> {
     for transcript_path in transcripts_by_recency(search_project_dirs) {
         let Ok(content) = fs::read_to_string(&transcript_path) else { continue };
         for line in content.lines() {
@@ -335,7 +335,7 @@ fn find_rendered_bullet(directory_name: &str, search_project_dirs: &[PathBuf]) -
             if listing.kind != "skill_listing" {
                 continue;
             }
-            if let Some(bullet) = extract_bullet(&listing.content, &listing.names, directory_name) {
+            if let Some(bullet) = extract_bullet(&listing.content, &listing.names, invocation_name) {
                 return Some(bullet);
             }
         }

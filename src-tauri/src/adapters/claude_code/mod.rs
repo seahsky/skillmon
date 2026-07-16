@@ -363,7 +363,7 @@ impl ClaudeCodeAdapter {
 
         let all_project_dirs: Vec<PathBuf> = known_repos.iter().map(|r| r.project_dir.clone()).collect();
         let wanted: HashSet<String> =
-            discovery.skills.iter().map(|s| s.directory_name().to_string()).collect();
+            discovery.skills.iter().map(|s| s.invocation_name().to_string()).collect();
         let (transcripts, enumerated_dirs) = transcript_refs_by_recency(&all_project_dirs);
         let (index, _stats) = ListingIndex::build_incremental(&transcripts, &wanted, &self.listing_cache);
         // Bound the memo (see the former scan_all): only prune when the
@@ -973,7 +973,7 @@ mod tests {
 
         let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
         let discovery = adapter.discover_skills();
-        let skill = discovery.skills.iter().find(|s| s.directory_name() == "grilling").unwrap();
+        let skill = discovery.skills.iter().find(|s| s.invocation_name() == "grilling").unwrap();
 
         let footprint = adapter.compute_footprint(skill);
 
@@ -1155,7 +1155,7 @@ mod tests {
 
         // And it agrees with the single-skill path's confidence + tokens.
         let discovery = adapter.discover_skills();
-        let skill = discovery.skills.iter().find(|s| s.directory_name() == "grilling").unwrap();
+        let skill = discovery.skills.iter().find(|s| s.invocation_name() == "grilling").unwrap();
         let per_skill = adapter.compute_footprint(skill);
         assert_eq!(per_skill.always_on.text_kind, AlwaysOnTextKind::Native);
         assert_eq!(grilling.always_on.tokens, per_skill.always_on.count.tokens);
@@ -1525,7 +1525,7 @@ mod tests {
                 Some(root) => root.display().to_string(),
                 None => "<unmanaged>".to_string(),
             };
-            by_root.entry(root).or_default().push(skill.directory_name());
+            by_root.entry(root).or_default().push(skill.invocation_name());
         }
         eprintln!("\n=== manager roots (issue #25) ===");
         for (root, mut names) in by_root {
@@ -1551,7 +1551,7 @@ mod tests {
             eprintln!("  no skill on this machine is a manager root for another");
         }
         for (skill, count) in &providers {
-            eprintln!("  {:>3}  {}  ({})", count, skill.directory_name(), skill.canonical_dir.display());
+            eprintln!("  {:>3}  {}  ({})", count, skill.invocation_name(), skill.canonical_dir.display());
         }
         for skill in &discovery.skills {
             // True on any machine, and the guard against the one shape that
@@ -1560,7 +1560,7 @@ mod tests {
             assert!(
                 (dependents.for_skill(skill) as usize) < discovery.skills.len().max(1),
                 "{} cannot provide for every discovered skill including itself",
-                skill.directory_name()
+                skill.invocation_name()
             );
         }
 
@@ -1568,7 +1568,7 @@ mod tests {
             .skills
             .iter()
             .filter(|s| !s.frontmatter.model_invocable)
-            .map(|s| s.directory_name())
+            .map(|s| s.invocation_name())
             .collect();
         eprintln!("\n=== never listed, so always-on is zero (issue #24) ===");
         eprintln!("  {} of {} skills: {:?}", never_listed.len(), discovery.skills.len(), never_listed);
@@ -1581,7 +1581,7 @@ mod tests {
             let footprint = adapter.compute_footprint(skill);
             eprintln!(
                 "  {:<28} always_on={} tokens (exact={}, {:?})  on_invoke={}",
-                skill.directory_name(),
+                skill.invocation_name(),
                 footprint.always_on.count.tokens,
                 footprint.always_on.count.source == TokenSource::Exact,
                 footprint.always_on.text_kind,
@@ -1591,7 +1591,7 @@ mod tests {
                 footprint.always_on.text_kind,
                 AlwaysOnTextKind::NotListed,
                 "{} declares disable-model-invocation, so it has no listing line",
-                skill.directory_name()
+                skill.invocation_name()
             );
             assert_eq!(footprint.always_on.count.tokens, 0, "a never-listed skill costs no always-on");
             assert_eq!(
@@ -1618,13 +1618,13 @@ mod tests {
                 SkillId::from(report.id.clone()),
                 skill.id,
                 "{}: the ref the panel holds must resolve back to the skill it names",
-                skill.directory_name()
+                skill.invocation_name()
             );
             assert_eq!(
                 report.manager_root,
                 skill.manager_root.as_ref().map(|p| p.display().to_string()),
                 "{}: the manager root must reach the panel intact",
-                skill.directory_name()
+                skill.invocation_name()
             );
 
             if report.manager_root.is_some() {
@@ -1825,7 +1825,7 @@ mod tests {
     }
 
     fn find<'a>(discovery: &'a DiscoveryResult, name: &str) -> &'a DiscoveredSkill {
-        discovery.skills.iter().find(|s| s.directory_name() == name).unwrap()
+        discovery.skills.iter().find(|s| s.invocation_name() == name).unwrap()
     }
 
     /// C1: the interactive scan tokenizes the body (on-invoke) but performs

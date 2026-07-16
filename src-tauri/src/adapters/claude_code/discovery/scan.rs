@@ -20,6 +20,40 @@ pub enum ChildDirs {
     MayBeCategories,
 }
 
+/// How a discovered skill's *invocation* name -- the identity it is keyed and
+/// listed by -- is chosen. Claude Code reads that name from the directory
+/// basename in every layout but one, so `DirectoryBasename` is the default and
+/// `FrontmatterName` is the deliberate exception (issue #41).
+///
+/// `FrontmatterName` is the plugin-root single-`SKILL.md` layout only (a
+/// `SKILL.md` directly in the plugin install root, i.e. `"skills": ["./"]` or
+/// the auto v2.1.142+ layout). There is no skill directory to take the name
+/// from, so the frontmatter `name` sets it, with the basename -- a version
+/// string for a marketplace install -- as the fallback. skills.md "How a skill
+/// gets its command name": *"the plugin-root case is the one place where name
+/// does set the command name."* Every other layout -- personal, project, a
+/// plugin `skills/` subdirectory, and a declared non-root path that happens to
+/// hold `SKILL.md` directly -- keeps the basename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamePolicy {
+    DirectoryBasename,
+    FrontmatterName,
+}
+
+impl NamePolicy {
+    /// The invocation name for a skill with this directory basename and declared
+    /// frontmatter `name`. `FrontmatterName` still falls back to the basename
+    /// when the frontmatter name is empty, matching the reference's own fallback
+    /// -- though in practice skillmon's parser requires a non-empty `name`, so a
+    /// nameless root `SKILL.md` never reaches here (it warns as malformed).
+    fn resolve(self, directory_basename: &str, declared_name: &str) -> String {
+        match self {
+            NamePolicy::FrontmatterName if !declared_name.is_empty() => declared_name.to_string(),
+            NamePolicy::DirectoryBasename | NamePolicy::FrontmatterName => directory_basename.to_string(),
+        }
+    }
+}
+
 pub fn discover_skills_in_dir(
     dir: &Path,
     children: ChildDirs,
@@ -86,7 +120,10 @@ pub fn discover_skills_in_dir(
             continue;
         }
 
-        let (skill, entry_warnings) = build_skill(dir_path, canonical_root.as_deref(), &make_id);
+        // A directory's depth-1 children are never the plugin-root layout: each
+        // is a skill *directory* Claude Code names from its basename (issue #41).
+        let (skill, entry_warnings) =
+            build_skill(dir_path, canonical_root.as_deref(), NamePolicy::DirectoryBasename, &make_id);
         warnings.extend(entry_warnings);
         skills.extend(skill);
     }
@@ -104,12 +141,18 @@ pub fn discover_skills_in_dir(
 /// sits in, exactly as a scanned entry is judged against the root it was listed
 /// from. So a plugin skill symlinked out to another tree reports its manager the
 /// same way a personal one does, with no rule of its own.
+///
+/// `name_policy` distinguishes the two shapes a direct path can take: the caller
+/// passes `FrontmatterName` only when `dir` is a plugin's install root (issue
+/// #41), and `DirectoryBasename` for every other direct path -- a declared
+/// `./skills/engineering/tdd` still names its skill from the `tdd` directory.
 pub fn discover_skill_at_dir(
     dir: &Path,
+    name_policy: NamePolicy,
     make_id: impl Fn(String) -> SkillId,
 ) -> (Option<DiscoveredSkill>, Vec<DiscoveryWarning>) {
     let canonical_root = dir.parent().and_then(|parent| fs::canonicalize(parent).ok());
-    build_skill(dir.to_path_buf(), canonical_root.as_deref(), &make_id)
+    build_skill(dir.to_path_buf(), canonical_root.as_deref(), name_policy, &make_id)
 }
 
 /// The skill rooted at `dir_path`, plus whatever is anomalous about it. Both are
@@ -124,10 +167,15 @@ pub fn discover_skill_at_dir(
 fn build_skill(
     dir_path: PathBuf,
     canonical_root: Option<&Path>,
+    name_policy: NamePolicy,
     make_id: &impl Fn(String) -> SkillId,
 ) -> (Option<DiscoveredSkill>, Vec<DiscoveryWarning>) {
     let mut warnings = Vec::new();
-    let Some(name) = dir_path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+    // The physical folder name -- what `manager_root` is judged against below,
+    // and the fallback for the invocation name. Distinct from the invocation
+    // name only for a plugin-root skill, whose folder is a version string but
+    // whose identity is its frontmatter `name` (issue #41).
+    let Some(directory_basename) = dir_path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
         return (None, warnings);
     };
 
@@ -153,7 +201,8 @@ fn build_skill(
     };
 
     let skill_md_path = dir_path.join("SKILL.md");
-    let manager_root = canonical_root.and_then(|root| resolve_manager_root(root, &name, &skill_md_path));
+    let manager_root =
+        canonical_root.and_then(|root| resolve_manager_root(root, &directory_basename, &skill_md_path));
     let content = match fs::read_to_string(&skill_md_path) {
         Ok(c) => c,
         Err(_) => {
@@ -178,9 +227,11 @@ fn build_skill(
 
     let on_demand_files = list_on_demand_files(&dir_path, &skill_md_path);
 
+    let invocation_name = name_policy.resolve(&directory_basename, &frontmatter.declared_name);
+
     (
         Some(DiscoveredSkill {
-            id: make_id(name),
+            id: make_id(invocation_name),
             canonical_dir,
             dir_path,
             skill_md_path,
@@ -310,7 +361,7 @@ mod tests {
 
         assert_eq!(skills.len(), 1);
         assert!(warnings.is_empty());
-        assert_eq!(skills[0].directory_name(), "grilling");
+        assert_eq!(skills[0].invocation_name(), "grilling");
         assert_eq!(skills[0].frontmatter.description, "Interview relentlessly.");
         assert_eq!(skills[0].body, "Body.\n");
         assert!(skills[0].live);
@@ -338,7 +389,7 @@ mod tests {
         let (skills, warnings) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
 
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].directory_name(), "good");
+        assert_eq!(skills[0].invocation_name(), "good");
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].reason.contains("malformed frontmatter"));
     }
@@ -393,7 +444,7 @@ mod tests {
 
         assert_eq!(skills.len(), 1);
         assert!(warnings.is_empty());
-        assert_eq!(skills[0].directory_name(), "ship");
+        assert_eq!(skills[0].invocation_name(), "ship");
         assert_eq!(
             skills[0].manager_root.as_deref(),
             Some(fs::canonicalize(&tool).unwrap().as_path())
@@ -565,7 +616,7 @@ mod tests {
         fs::write(shim.join("PLAYBOOK.md"), "the shim's own bundled ref").unwrap();
 
         let (skills, _) = discover_skills_in_dir(tmp.path(), ChildDirs::AreSkillEntries, |name| SkillId::Personal { name });
-        let gstack = skills.iter().find(|s| s.directory_name() == "gstack").unwrap();
+        let gstack = skills.iter().find(|s| s.invocation_name() == "gstack").unwrap();
 
         assert_eq!(gstack.on_demand_files, vec![skill_dir.join("REFERENCE.md")]);
     }
@@ -633,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn make_id_closure_receives_directory_name() {
+    fn make_id_closure_receives_the_resolved_invocation_name() {
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "foo", "foo", "desc", "Body.");
 
@@ -651,5 +702,42 @@ mod tests {
                 name: "foo".to_string(),
             }
         );
+    }
+
+    /// `discover_skill_at_dir` with `DirectoryBasename` keys identity on the
+    /// folder, ignoring a divergent frontmatter `name` -- the rule for every
+    /// direct path but a plugin root (issue #41).
+    #[test]
+    fn discover_skill_at_dir_with_basename_policy_keys_on_the_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "tdd", "renamed-in-frontmatter", "desc", "Body.");
+
+        let (skill, warnings) = discover_skill_at_dir(&tmp.path().join("tdd"), NamePolicy::DirectoryBasename, |name| {
+            SkillId::Personal { name }
+        });
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let skill = skill.unwrap();
+        assert_eq!(skill.invocation_name(), "tdd");
+        assert_eq!(skill.frontmatter.declared_name, "renamed-in-frontmatter");
+    }
+
+    /// `FrontmatterName` keys identity on the declared `name`, falling back to
+    /// the basename only when the frontmatter name is empty -- the plugin-root
+    /// rule, exercised at the seam that implements it.
+    #[test]
+    fn discover_skill_at_dir_with_frontmatter_policy_keys_on_the_declared_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A version-string directory, the exact shape a marketplace install takes.
+        write_skill(tmp.path(), "1.2.0", "my-skill", "desc", "Body.");
+
+        let (skill, warnings) = discover_skill_at_dir(&tmp.path().join("1.2.0"), NamePolicy::FrontmatterName, |name| {
+            SkillId::Personal { name }
+        });
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let skill = skill.unwrap();
+        assert_eq!(skill.invocation_name(), "my-skill", "the frontmatter name, not the version dir");
+        assert!(!skill.name_mismatch());
     }
 }
