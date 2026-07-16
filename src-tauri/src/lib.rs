@@ -5,6 +5,7 @@
 mod adapters;
 mod domain;
 mod footprint;
+mod removal;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,13 +19,16 @@ use adapters::claude_code::paths::default_claude_home;
 use adapters::claude_code::usage_cache::SqliteUsageCache;
 use adapters::claude_code::watcher::RegistryWatcher;
 use adapters::claude_code::{fill_on_demand_ceilings, ClaudeCodeAdapter, REFERENCE_MODEL_ID};
-use domain::report::{ScanReport, UsageSettings};
+use domain::removal::TrashUnitId;
+use domain::report::{PurgeSummary, ScanReport, TombstoneReport, TrashUnitReport, UsageSettings};
 use domain::scan::{ScanParams, UsageWindow};
+use domain::skill::SkillId;
 use footprint::api_key_service::{self, SetKeyOutcome};
 use footprint::api_key_store::{ApiKeyStore, KeychainApiKeyStore};
 use footprint::cache::TokenCache;
 use footprint::count_tokens_client::{AnthropicCountTokensClient, CountTokensClient};
 use footprint::tokenizer::BpeTokenizer;
+use removal::store::TrashStore;
 
 /// The scan orchestration is synchronous (ADR 0008) and can block on file
 /// I/O or a `count_tokens` call, so it lives behind a `Mutex` and is only
@@ -49,8 +53,17 @@ struct ApiKeySettings {
 }
 type SharedApiKeySettings = Arc<Mutex<ApiKeySettings>>;
 
-// TODO(skillmon): remaining IPC surface (disable/enable, uninstall,
-// remove_plugin) lands with later plans.
+/// The trash ledger (issue #28, ADR 0029), managed SEPARATELY from the adapter
+/// for the same reason `ApiKeySettings` is. A purge deletes real trees -- 1.1 GB
+/// for a gstack uninstall -- and blocks for as long as that takes, so sharing
+/// the adapter's scan `Mutex` would freeze the whole panel behind an
+/// `Empty trash`. Its `rusqlite` connection is `Send` but not `Sync`, so the
+/// `Mutex` is mandatory rather than merely convenient.
+type SharedTrashStore = Arc<Mutex<TrashStore>>;
+
+// TODO(skillmon): the mutations that CREATE trash units (disable/enable,
+// uninstall, remove_plugin) land with issue #31. This file wires only the
+// reversal side (ADR 0029): list, restore, purge.
 
 /// Discover every skill and compute its three-layer footprint (ADR 0019's
 /// scan). The synchronous core runs on the blocking pool via
@@ -77,6 +90,7 @@ async fn list_skills(
     app: tauri::AppHandle,
     adapter: tauri::State<'_, SharedAdapter>,
     watcher: tauri::State<'_, SharedWatcher>,
+    trash: tauri::State<'_, SharedTrashStore>,
 ) -> Result<ScanReport, String> {
     let adapter = adapter.inner().clone();
     let watcher = watcher.inner().clone();
@@ -120,7 +134,112 @@ async fn list_skills(
         spawn_on_demand_fill(app, fill_adapter);
     }
 
+    reconcile_tombstones(&outcome.report, trash.inner());
+
     Ok(outcome.report)
+}
+
+/// DESIGN.md UX #6's "reinstalling restores continuity", applied off every scan:
+/// a skill that is discoverable again is not removed, whatever the ledger last
+/// recorded (ADR 0029).
+///
+/// Driven by rediscovery rather than by restore alone because it has to cover
+/// the case the ledger cannot see -- a user reinstalling by hand, past skillmon
+/// entirely. Usage history is not touched here and never was: it is keyed by
+/// `message.id` and outlives any removal (ADR 0024), so continuity is the
+/// absence of a deletion rather than a recovery.
+///
+/// `try_lock`, deliberately: an `Empty trash` can hold this store for as long as
+/// deleting 1.1 GB takes, and blocking a scan behind it would freeze the panel
+/// to reconcile bookkeeping nothing is waiting on. Skipping is free -- the pass
+/// is idempotent and the next scan runs it again.
+fn reconcile_tombstones(report: &ScanReport, trash: &SharedTrashStore) {
+    let Ok(mut store) = trash.try_lock() else { return };
+    let discovered: Vec<SkillId> = report.skills.iter().map(|s| SkillId::from(s.id.clone())).collect();
+    if let Err(e) = store.reconcile_tombstones(&discovered) {
+        eprintln!("[skillmon] could not clear tombstones for rediscovered skills: {e}");
+    }
+}
+
+/// Every staged removal, for the removed view (ADR 0029).
+///
+/// Includes `disabled` units as well as `trashed` ones: they are the same
+/// operation with different retention (ADR 0027), and the panel decides which
+/// affordances each label earns.
+#[tauri::command]
+async fn list_trash(trash: tauri::State<'_, SharedTrashStore>) -> Result<Vec<TrashUnitReport>, String> {
+    let trash = trash.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = trash.lock().expect("trash mutex poisoned");
+        store.list().map(|units| units.iter().map(TrashUnitReport::from).collect()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Undoes one staged removal, putting all of its entries back -- 47 or one (ADR
+/// 0027's single undo for a tool uninstall).
+///
+/// Emits no event of its own: the restored entries land back inside the
+/// recursively watched scan root, so the ADR 0019 watcher raises
+/// `registry-changed` for them, and the ledger write has already completed by
+/// the time this returns.
+#[tauri::command]
+async fn restore_trash_unit(unit_id: i64, trash: tauri::State<'_, SharedTrashStore>) -> Result<(), String> {
+    let trash = trash.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = trash.lock().expect("trash mutex poisoned");
+        removal::restore(&mut store, TrashUnitId(unit_id)).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Every removed-but-not-reinstalled skill (DESIGN.md UX #6).
+///
+/// Separate from `list_trash` because the two outlive each other: a purged
+/// skill has no trash unit left, and a tombstone is then the only handle the
+/// panel has on it. Listing only units would make the reclaimed skills -- the
+/// exact rows tombstones exist for -- invisible.
+#[tauri::command]
+async fn list_tombstones(trash: tauri::State<'_, SharedTrashStore>) -> Result<Vec<TombstoneReport>, String> {
+    let trash = trash.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = trash.lock().expect("trash mutex poisoned");
+        store.tombstones().map(|ts| ts.iter().map(TombstoneReport::from).collect()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Reclaims one trashed unit's bytes and reports what it freed. The user's
+/// explicit say-so is the only thing that reclaims anything (ADR 0029); nothing
+/// here runs on a timer.
+///
+/// Errors on a `disabled` unit rather than obliging: retained indefinitely means
+/// indefinitely.
+#[tauri::command]
+async fn purge_trash_unit(unit_id: i64, trash: tauri::State<'_, SharedTrashStore>) -> Result<u64, String> {
+    let trash = trash.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = trash.lock().expect("trash mutex poisoned");
+        removal::purge(&mut store, TrashUnitId(unit_id)).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Reclaims every trashed unit, skipping disabled ones, and reports the real
+/// total rather than the figure the panel offered.
+#[tauri::command]
+async fn empty_trash(trash: tauri::State<'_, SharedTrashStore>) -> Result<PurgeSummary, String> {
+    let trash = trash.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = trash.lock().expect("trash mutex poisoned");
+        removal::empty_trash(&mut store).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The user's usage-toast settings (issue #14): the rolling-24h budget on/off +
@@ -356,6 +475,11 @@ pub fn run() {
             // ceiling memo, opened WAL so the background fill's separate
             // connection to the same file never blocks or poisons this one.
             let on_demand_cache = SqliteOnDemandCache::open(&data_dir.join("on_demand_index.sqlite"))?;
+            // Fifth persisted sqlite file (issue #28): the trash ledger. Unlike
+            // the four above it is NOT a cache -- nothing can re-derive where a
+            // trashed entry came from, so it never wipes on a version bump and
+            // losing it would strand real files with no undo (ADR 0029).
+            let trash_store = TrashStore::open(&data_dir.join("removal.sqlite"))?;
             let adapter = ClaudeCodeAdapter::new(
                 default_claude_home(),
                 cache,
@@ -409,6 +533,7 @@ pub fn run() {
             app.manage(adapter);
             app.manage(watcher);
             app.manage(api_key_settings);
+            app.manage::<SharedTrashStore>(Arc::new(Mutex::new(trash_store)));
 
             // Global hotkey: Cmd/Ctrl+Shift+K toggles the panel from anywhere.
             // A conflict (another app already owns the combo) is non-fatal --
@@ -433,7 +558,12 @@ pub fn run() {
             set_api_key,
             delete_api_key,
             get_usage_settings,
-            set_usage_settings
+            set_usage_settings,
+            list_trash,
+            list_tombstones,
+            restore_trash_unit,
+            purge_trash_unit,
+            empty_trash
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
