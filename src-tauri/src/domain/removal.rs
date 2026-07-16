@@ -255,10 +255,6 @@ impl RemovalPlan {
     pub fn is_tool_uninstall(&self) -> bool {
         !self.dependents.is_empty()
     }
-
-    pub fn entry_count(&self) -> usize {
-        1 + self.dependents.len()
-    }
 }
 
 /// The managing tool's copy of a skill, offered for removal or refused with a
@@ -274,13 +270,11 @@ pub struct SourceOffer {
     pub tool_name: Option<String>,
     /// `None` = removable. `Some(reason)` = it is not, and this is why -- a
     /// missing option must explain itself or it reads as a bug.
+    ///
+    /// The reason *is* the flag, deliberately: a separate bool could disagree
+    /// with it, and the disagreement that matters is "unavailable, with nothing
+    /// to tell the user why".
     pub blocked: Option<String>,
-}
-
-impl SourceOffer {
-    pub fn is_available(&self) -> bool {
-        self.blocked.is_none()
-    }
 }
 
 /// The retained "(removed)" marker for an uninstalled skill (DESIGN.md UX #6).

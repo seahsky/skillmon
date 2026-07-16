@@ -58,7 +58,7 @@ _Avoid_: custom skill, own skill, hand-installed skill
 
 **Managing tool**:
 The external program that owns a manager root and rebuilds the entries under it.
-Never itself discovered; skillmon models it by one property only — whether it can make a source removal stick (ADR 0027).
+Never itself discovered, and never asked to remove anything: skillmon models it by whether it can make a source removal *stick*, and by the bookkeeping that makes it — forgetting a skill it maintains, and being told about it again if the removal is undone (ADR 0027).
 _Avoid_: manager (a tool is not a skill), package manager, installer
 
 **Dependent skill**:
@@ -217,7 +217,14 @@ _Avoid_: deleted row, archive
 **Trash unit**:
 One removal, and one undo: the entry the user acted on plus every dependent that cascaded with it (47 for a tool uninstall, 1 for a skill removal), moved out of the scan root together and restored together.
 The unit skillmon lists in the removed view, reclaims, and undoes; entries never leave one individually.
+Its entry count counts *skills*, not staged directories — a source rides inside its own skill's entry, not beside it as another member.
 _Avoid_: trash entry (an entry is one member of a unit), batch
+
+**Staged source**:
+The managing tool's copy of a skill, moved out with that skill's entry when the user took the source-removal opt-in, and carried *inside* its entry rather than beside it.
+The nesting is the point: one undo has to restore an entry and the content it resolves to together, or the restore rebuilds a link pointing at nothing — a dangling entry, which discovery turns into a warning and a vanished row (ADR 0027 Update).
+Carries the tool's dropped bookkeeping verbatim, opaque to skillmon, so a restore hands it back unread.
+_Avoid_: source entry (it is not a member of the unit), target copy
 
 **Retention**:
 Whether a removed entry is kept indefinitely (`Disabled`) or is eligible for purge (`Trashed`).

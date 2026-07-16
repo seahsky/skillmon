@@ -65,7 +65,18 @@ Transcripts are parsed incrementally: each file carries a byte-offset checkpoint
 ## Mutation model
 
 Plugin operations go through the `claude plugin {disable,enable,uninstall,marketplace remove}` CLI — the format-stable interface for the evolving `version: 2` JSON — with an atomic JSON rewrite as the documented fallback.
-Personal skills have no native toggle, so skillmon supplies its own reversible one: quarantine the skill directory out of the depth-1 scan root into `~/.claude/skillmon/disabled/…` (recording origin, including any symlink target), and delete via a two-phase move to `skillmon/trash/` then purge.
+
+Personal and project skills have no native toggle, so skillmon supplies its own reversible one.
+**skillmon removes the entry, never through it** (ADR 0027): a removal moves what sits in the scan root — a symlink, or a shim directory — so damaging a managing tool's content is impossible by construction rather than by warning.
+Disable and delete are the *same* move to the same place (`~/.claude/skillmon/removed/<unit>/`, or the repo's own for a project skill), differing only in a recorded retention intent: `Disabled` is kept indefinitely, `Trashed` is reclaimable on the user's explicit say-so.
+Nothing self-empties; a purge keeps the tombstone, so a user can reclaim a gigabyte and keep their totals honest (ADR 0029).
+
+Two things follow from the entry rule.
+A row that other skills resolve into is not a skill removal but a **tool uninstall**: it cascades to every dependent as one unit with one undo, and the dependent count it quotes is a floor, since skillmon scans Claude Code's paths alone.
+And removing a *managed* skill's entry alone is reverted the next time its manager runs — so the panel says so before the removal, and the removed view reconciles the claim afterwards rather than going on asserting a skill is disabled while it is live.
+
+Removing the managing tool's own copy is a second, explicit opt-in, offered only where that tool can make it stick (`.agents` can, and its lock entry is pruned and restored with the files; gstack cannot, because `/gstack-upgrade` runs `git reset --hard`, and it says so). Tool-specific knowledge lives in a `ManagingTool` seam parallel to the harness adapter, never inside it.
+
 Every mutation applies to new sessions only, because enablement is read at session start, so the UI surfaces a "restart Claude Code to apply" nudge after any change.
 
 ## Cross-platform parity (macOS ↔ Windows)

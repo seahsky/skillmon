@@ -9,7 +9,7 @@
 //! Harness-neutral all the same: the caller supplies the skills and the storage
 //! root, and no Claude Code path is named here.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::domain::removal::{EntryToRemove, RemovalPlan, SourceOffer, SourceToRemove};
 use crate::domain::skill::{dependents_of, DiscoveredSkill, SkillId};
@@ -168,6 +168,7 @@ mod tests {
     use crate::domain::skill::{Frontmatter, SkillId};
     use crate::managing_tool::{gstack::GstackTool, SourceError};
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::{tempdir, TempDir};
 
     /// A tool that owns one root and can remove sources -- the `.agents` answer,
@@ -270,7 +271,7 @@ mod tests {
         let plan = plan(&skills, &no_tools(), &skills[0]);
 
         assert!(!plan.is_tool_uninstall());
-        assert_eq!(plan.entry_count(), 1);
+        assert_eq!(plan.dependents.len(), 0);
         assert_eq!(plan.primary.entry_path, f.skills_dir().join("vercel-react"));
         assert!(plan.source.is_none(), "its content IS its entry; there is no second thing to offer");
         assert!(plan.rebuilt_by.is_none(), "nothing will put it back");
@@ -305,7 +306,7 @@ mod tests {
         let plan = plan(&skills, &no_tools(), &skills[0]);
 
         assert!(plan.is_tool_uninstall(), "a row with dependents is a tool uninstall, not a skill removal");
-        assert_eq!(plan.entry_count(), 4);
+        assert_eq!(plan.dependents.len(), 3);
         let cascaded: Vec<&str> = plan.dependents.iter().map(|d| d.skill_id.name()).collect();
         assert_eq!(cascaded, vec!["shim-0", "shim-1", "shim-2"]);
     }
@@ -320,7 +321,7 @@ mod tests {
         let plan = plan(&skills, &no_tools(), &skills[0]);
 
         assert!(!plan.is_tool_uninstall());
-        assert_eq!(plan.entry_count(), 1, "a sibling under the same manager is not a dependent");
+        assert_eq!(plan.dependents.len(), 0, "a sibling under the same manager is not a dependent");
     }
 
     /// ADR 0027's recorded hazard, surfaced before the removal rather than
@@ -351,7 +352,7 @@ mod tests {
         let plan = plan(&skills, &tools, &skills[0]);
         let offer = plan.source.expect("a managed skill has a source");
 
-        assert!(offer.is_available());
+        assert!(offer.blocked.is_none());
         assert_eq!(offer.tool_name.as_deref(), Some("capable-tool"));
         assert_eq!(offer.path, fs::canonicalize(f.tmp.path().join("agents/skills/tdd")).unwrap());
     }
@@ -374,7 +375,7 @@ mod tests {
         let plan = plan(&skills, &tools, &skills[0]);
         let offer = plan.source.expect("a managed skill has a source");
 
-        assert!(!offer.is_available());
+        assert!(offer.blocked.is_some());
         assert!(offer.blocked.unwrap().contains("reset --hard"), "the refusal must carry the tool's own reason");
         assert_eq!(offer.tool_name.as_deref(), Some("gstack"));
     }
@@ -390,7 +391,7 @@ mod tests {
         let plan = plan(&skills, &no_tools(), &skills[0]);
         let offer = plan.source.expect("a managed skill has a source");
 
-        assert!(!offer.is_available());
+        assert!(offer.blocked.is_some());
         assert_eq!(offer.tool_name, None);
         assert!(offer.blocked.unwrap().contains("does not recognize"));
     }
@@ -514,7 +515,7 @@ mod tests {
                 p.dependents.len(),
                 match p.source.as_ref() {
                     None => "n/a (its entry is its content)".to_string(),
-                    Some(s) if s.is_available() => format!("removable via {}", s.tool_name.as_deref().unwrap_or("?")),
+                    Some(s) if s.blocked.is_none() => format!("removable via {}", s.tool_name.as_deref().unwrap_or("?")),
                     Some(s) => format!("blocked: {}", s.blocked.as_deref().unwrap_or("?").split('.').next().unwrap()),
                 }
             );
@@ -563,7 +564,7 @@ mod tests {
         let tools = ManagingTools::new(vec![Box::new(AgentsTool::new(agents_skills, lock_path.clone()))]);
 
         let mut p = plan(&skills, &tools, &skills[0]);
-        assert!(p.source.as_ref().unwrap().is_available(), ".agents must be able to remove its own copy");
+        assert!(p.source.as_ref().unwrap().blocked.is_none(), ".agents must be able to remove its own copy");
         take_source(&mut p, &skills[0], &tools).unwrap();
         assert!(
             !fs::read_to_string(&lock_path).unwrap().contains(&format!("\"{name}\"")),
