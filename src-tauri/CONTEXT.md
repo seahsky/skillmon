@@ -209,6 +209,26 @@ _Avoid_: sidechain (internal term only)
 
 **Tombstone**:
 A retained "(removed)" history row for an uninstalled skill, so trend totals stay honest and reinstalling restores continuity.
+Keyed by skill identity, written when an entry is trashed (never when it is merely disabled), and it **outlives the purge**: the bytes are the undo, the tombstone is the history, and reclaiming the first must not touch the second (ADR 0029).
+Cleared by rediscovery rather than by restore alone, so a reinstall past skillmon entirely still restores continuity.
+The usage it exists for is not stored in it — usage is keyed by message id and was never deleted, so continuity is the absence of a deletion rather than a recovery.
+_Avoid_: deleted row, archive
+
+**Trash unit**:
+One removal, and one undo: the entry the user acted on plus every dependent that cascaded with it (47 for a tool uninstall, 1 for a skill removal), moved out of the scan root together and restored together.
+The unit skillmon lists in the removed view, reclaims, and undoes; entries never leave one individually.
+_Avoid_: trash entry (an entry is one member of a unit), batch
+
+**Retention**:
+Whether a removed entry is kept indefinitely (`Disabled`) or is eligible for purge (`Trashed`).
+The whole difference between disabling a skill and deleting one: both are the same move to the same place, and this label is all that distinguishes them (ADR 0027).
+_Avoid_: status, state
+
+**Purge**:
+Reclaiming a trashed unit's bytes, which is the only irreversible step in a removal.
+Happens on the user's explicit say-so and never otherwise — nothing self-empties, and no retention window deletes on a timer (ADR 0029).
+Refused outright for a disabled unit.
+_Avoid_: empty, clean up, garbage collect (nothing here is automatic)
 
 ### Actions
 
@@ -224,4 +244,5 @@ _Avoid_: delete, remove
 
 **Two-phase delete (trash)**:
 Uninstall that moves a skill to a trash area first and purges only after confirmation, so no delete is irreversible until purge.
+The two phases are no longer two mechanisms: the move is the same one quarantine uses, distinguished only by its retention (ADR 0027), and the confirmation is a user action rather than an elapsed window (ADR 0029).
 _Avoid_: delete

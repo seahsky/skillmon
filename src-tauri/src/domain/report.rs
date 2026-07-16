@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::footprint::{AlwaysOnTextKind, Footprint, TokenSource};
+use super::removal::{Retention, Tombstone, TrashUnit};
 use super::skill::{DiscoveredSkill, SkillId};
 
 /// One footprint layer, flattened for the IPC boundary. `exact` collapses
@@ -223,6 +224,97 @@ pub struct ScanReport {
     /// the last 24h. Lets the panel label the usage sub-line honestly (issue
     /// #14). The 24h budget toast is independent of this and always 24h.
     pub usage_window_hours: Option<u32>,
+}
+
+/// One row of the removed view (ADR 0029): a staged removal the user can undo
+/// or reclaim.
+///
+/// Carries no paths. A trash unit is named by its id, for the reason `SkillRef`
+/// gives: the panel's handle on a mutation should be a name, never an operand,
+/// so a stale one aims no delete at all rather than aiming one at a stray path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashUnitReport {
+    pub id: i64,
+    /// `disabled` never appears in the removed view's purge affordances --
+    /// it is retained indefinitely, and `empty_trash` skips it (ADR 0027).
+    pub retention: Retention,
+    /// Unix epoch millis. The panel subtracts "now" to render an age; the core
+    /// holds no wall clock (issue #14).
+    pub removed_at_millis: i64,
+    /// The row the user acted on, so the panel can label the unit and, once the
+    /// skill is reinstalled, line it back up with its history.
+    pub primary: SkillRef,
+    /// The primary's frontmatter `name:`, kept because the files are gone: after
+    /// a purge there is no `SKILL.md` left to read a label out of.
+    pub declared_name: String,
+    pub entry_count: u32,
+    /// Whether this was a tool uninstall rather than a skill removal (ADR 0027),
+    /// which is what the "47 entries" framing hangs off.
+    pub tool_uninstall: bool,
+    /// What purging this reclaims -- the number that makes explicit purge work
+    /// instead of a timer (ADR 0029).
+    ///
+    /// A **floor**, never the managing tool's total disk cost: skillmon scans
+    /// only Claude Code's paths, so a tool's entries for other agents are
+    /// neither cascaded nor counted. The view must not claim otherwise.
+    pub bytes: u64,
+}
+
+impl From<&TrashUnit> for TrashUnitReport {
+    fn from(unit: &TrashUnit) -> Self {
+        TrashUnitReport {
+            id: unit.id.0,
+            retention: unit.retention,
+            removed_at_millis: unit.removed_at_millis,
+            primary: SkillRef::from(&unit.primary.skill_id),
+            declared_name: unit.primary.declared_name.clone(),
+            entry_count: unit.entry_count() as u32,
+            tool_uninstall: unit.is_tool_uninstall(),
+            bytes: unit.bytes(),
+        }
+    }
+}
+
+/// One "(removed)" row of the removed view (DESIGN.md UX #6).
+///
+/// A tombstone outlives the trash unit that produced it, so this is the *only*
+/// handle the panel has on a skill whose bytes have been reclaimed. Its `id` is
+/// what lines the row back up with its retained usage history, and what a
+/// reinstall matches on to restore continuity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TombstoneReport {
+    pub id: SkillRef,
+    /// The frontmatter `name:` as of removal. Frozen deliberately: there is no
+    /// `SKILL.md` left to re-read, so this is the last thing that knows what the
+    /// user called it.
+    pub declared_name: String,
+    pub removed_at_millis: i64,
+}
+
+impl From<&Tombstone> for TombstoneReport {
+    fn from(tombstone: &Tombstone) -> Self {
+        TombstoneReport {
+            id: SkillRef::from(&tombstone.skill_id),
+            declared_name: tombstone.declared_name.clone(),
+            removed_at_millis: tombstone.removed_at_millis,
+        }
+    }
+}
+
+/// What an `empty_trash` actually reclaimed, so the panel reports the real
+/// figure rather than echoing back the one it offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeSummary {
+    pub units: u32,
+    pub bytes: u64,
+    /// Units that could not be reclaimed and are still staged. Carried rather
+    /// than folded into an error, because a sweep that freed 1.1 GB and failed
+    /// on one tree did not fail -- but it did not fully succeed either, and the
+    /// panel must be able to say so instead of claiming a clean sweep.
+    pub failed: u32,
 }
 
 /// The user-configurable usage-toast settings (issue #14), round-tripped by the
