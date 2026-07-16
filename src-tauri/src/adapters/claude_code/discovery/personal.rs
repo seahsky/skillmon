@@ -1,11 +1,11 @@
-use crate::adapters::claude_code::discovery::scan::discover_skills_in_dir;
+use crate::adapters::claude_code::discovery::scan::{discover_skills_in_dir, ChildDirs};
 use crate::adapters::claude_code::paths::personal_skills_dir;
 use crate::domain::skill::{DiscoveredSkill, DiscoveryWarning, SkillId};
 use std::path::Path;
 
 pub fn discover_personal_skills(claude_home: &Path) -> (Vec<DiscoveredSkill>, Vec<DiscoveryWarning>) {
     let root = personal_skills_dir(claude_home);
-    discover_skills_in_dir(&root, |name| SkillId::Personal { name })
+    discover_skills_in_dir(&root, ChildDirs::AreSkillEntries, |name| SkillId::Personal { name })
 }
 
 #[cfg(test)]

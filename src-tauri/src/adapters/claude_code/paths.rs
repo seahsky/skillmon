@@ -22,6 +22,28 @@ pub fn global_settings_path(claude_home: &Path) -> PathBuf {
     claude_home.join("settings.json")
 }
 
+/// A plugin's own manifest, rooted at the `installPath` its install record
+/// names -- never at `<installPath>/plugin.json`, which is where discovery
+/// looked for it and where zero of the 11 plugins on a real machine keep it.
+/// Reading the wrong path meant the manifest's relocation field never once
+/// fired, and a plugin that relocates its skills entirely (`impeccable`)
+/// resolved to no skills at all (issue #33).
+///
+/// `.claude-plugin/plugin.json` is the only location the plugin reference
+/// documents.
+pub fn plugin_manifest_path(install_path: &Path) -> PathBuf {
+    install_path.join(".claude-plugin").join("plugin.json")
+}
+
+/// The directory a plugin's skills are read from when its manifest declares
+/// nothing -- and, because `skills` adds to its default rather than replacing
+/// it, read even when the manifest declares something (ADR 0030). Beside
+/// `personal_skills_dir` and `repo_skills_dir` because it is the same kind of
+/// fact, and the last plugin path left inline is the one that caused issue #33.
+pub fn plugin_skills_dir(install_path: &Path) -> PathBuf {
+    install_path.join("skills")
+}
+
 pub fn repo_skills_dir(repo_path: &Path) -> PathBuf {
     repo_path.join(".claude").join("skills")
 }
@@ -79,6 +101,20 @@ mod tests {
             Path::new("/tmp/fake-home/.claude/plugins/installed_plugins.json")
         );
         assert_eq!(global_settings_path(home), Path::new("/tmp/fake-home/.claude/settings.json"));
+
+        // The manifest path every plugin on disk actually uses. Spelled out
+        // here because reading `<installPath>/plugin.json` -- a path that
+        // exists for no plugin -- is what made every plugin's relocation field
+        // dead code (issue #33, ADR 0030).
+        let install = Path::new("/tmp/fake-home/.claude/plugins/cache/market/plug/1.0.0");
+        assert_eq!(
+            plugin_manifest_path(install),
+            Path::new("/tmp/fake-home/.claude/plugins/cache/market/plug/1.0.0/.claude-plugin/plugin.json")
+        );
+        assert_eq!(
+            plugin_skills_dir(install),
+            Path::new("/tmp/fake-home/.claude/plugins/cache/market/plug/1.0.0/skills")
+        );
 
         let repo = Path::new("/tmp/some-repo");
         assert_eq!(repo_skills_dir(repo), Path::new("/tmp/some-repo/.claude/skills"));

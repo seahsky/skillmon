@@ -29,7 +29,12 @@ Skills reach a machine three ways, and the distinction drives the whole UI.
 
 - **Personal skills** — `~/.claude/skills/<name>/SKILL.md`, discovered depth-1 only (immediate children of the scan root). There is no native enable/disable flag for these.
 - **Project skills** — `<repo>/.claude/skills/<name>/SKILL.md`, scoped to one repository and only co-resident in context when you are working in that repo.
-- **Plugin skills** — installed at the path recorded in the plugin's `installed_plugins.json` record (`installPath`), never reconstructed from `cache/<marketplace>/<plugin>/<version>/` — a version directory can literally be named `unknown`. Plugin-locked: you cannot remove one skill, only the whole plugin. A plugin's own `plugin.json` may relocate its skills dir (for example `./.claude/skills`), so lock detection must read that field, not assume `skills/`.
+- **Plugin skills** — installed at the path recorded in the plugin's `installed_plugins.json` record (`installPath`), never reconstructed from `cache/<marketplace>/<plugin>/<version>/` — a version directory can literally be named `unknown`. Plugin-locked: you cannot remove one skill, only the whole plugin.
+  Where a plugin's skills live is the plugin's own to declare, in `<installPath>/.claude-plugin/plugin.json` — never `<installPath>/plugin.json`, where no plugin on a real machine keeps it (ADR 0030).
+  Its `skills` field is `string | array`, and it *adds to* the always-scanned default `skills/` rather than replacing it.
+  Each declared directory is one skill if it holds `SKILL.md` directly (`./skills/engineering/implement`), otherwise a directory of them scanned depth-1 (`./.claude/skills`).
+  Both stay depth-1 deliberately: a plugin can ship more `SKILL.md` than it declares (`mattpocock-skills` ships 40, declares 22), and only the declared set enters context, so walking deeper would invent skills the way walking shallower lost them.
+  A manifest that exists but will not parse is a `DiscoveryWarning`, never a silent fall back to the default — a plugin resolving to zero skills must stay distinguishable from a plugin that ships zero.
 
 Plugin state is registry-driven, and enablement is repo-scoped, not a single global flag (ADR 0015).
 
