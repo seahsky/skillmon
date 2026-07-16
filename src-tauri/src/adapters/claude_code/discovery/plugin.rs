@@ -1,7 +1,7 @@
 use crate::adapters::claude_code::discovery::scan::{
     discover_skill_at_dir, discover_skills_in_dir, ChildDirs,
 };
-use crate::adapters::claude_code::paths::{installed_plugins_path, plugin_manifest_path};
+use crate::adapters::claude_code::paths::{installed_plugins_path, plugin_manifest_path, plugin_skills_dir};
 use crate::domain::skill::{DiscoveredSkill, DiscoveryWarning, InstallScope, SkillId};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -160,17 +160,11 @@ fn read_manifest_skills(install_path: &Path) -> (ManifestSkills, Vec<DiscoveryWa
         return (ManifestSkills::Undeclared, Vec::new());
     }
 
+    let unreadable = |reason: String| (ManifestSkills::Unreadable, vec![DiscoveryWarning { path: path.clone(), reason }]);
+
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(err) => {
-            return (
-                ManifestSkills::Unreadable,
-                vec![DiscoveryWarning {
-                    path,
-                    reason: format!("plugin.json exists but could not be read: {err}"),
-                }],
-            );
-        }
+        Err(err) => return unreadable(format!("plugin manifest exists but could not be read: {err}")),
     };
 
     match serde_json::from_str::<PluginManifest>(&content) {
@@ -180,13 +174,7 @@ fn read_manifest_skills(install_path: &Path) -> (ManifestSkills, Vec<DiscoveryWa
                 .map_or(ManifestSkills::Undeclared, |s| ManifestSkills::Declared(s.into_dirs())),
             Vec::new(),
         ),
-        Err(err) => (
-            ManifestSkills::Unreadable,
-            vec![DiscoveryWarning {
-                path,
-                reason: format!("plugin.json exists but could not be parsed: {err}"),
-            }],
-        ),
+        Err(err) => unreadable(format!("plugin manifest exists but could not be parsed: {err}")),
     }
 }
 
@@ -198,7 +186,26 @@ struct SkillDir {
     /// default `skills/` is ordinary -- 3 of 11 plugins ship none -- so it does
     /// not.
     declared: bool,
+    /// Whether this path climbs out of the plugin root. The reference requires
+    /// every manifest path to be relative to it and start with `./`; one that
+    /// is not would attribute another plugin's -- or the user's own -- skills
+    /// to this plugin, and the always-on total sums discovered skills (ADR
+    /// 0003), so the same skill would land in the headline twice.
+    escapes: bool,
     children: ChildDirs,
+}
+
+/// Whether `path` stays inside `root`, compared as resolved paths so a
+/// `..` that merely doubles back (`./skills/../skills`) is judged by where it
+/// lands rather than how it is spelled. Falls back to the literal comparison
+/// while either path is absent, which is the honest answer for a declaration
+/// that names nothing on disk: it is refused as escaping only if it also reads
+/// as escaping literally, and otherwise warns as a missing declared path.
+fn contains(root: &Path, path: &Path) -> bool {
+    match (fs::canonicalize(root), fs::canonicalize(path)) {
+        (Ok(root), Ok(path)) => path.starts_with(root),
+        _ => path.starts_with(root),
+    }
 }
 
 /// Whether a candidate directory is a category tree rather than a flat list of
@@ -234,7 +241,7 @@ fn classify_children(dir: &Path, declared_paths: &[PathBuf]) -> ChildDirs {
 /// marketplace source resolution, which discovery does not do today; no plugin
 /// on this machine takes that shape.)
 fn skill_dirs(install_path: &Path, manifest: &ManifestSkills) -> Vec<SkillDir> {
-    let default = install_path.join("skills");
+    let default = plugin_skills_dir(install_path);
 
     // The documented single-skill layout (Claude Code v2.1.142+): a `SKILL.md`
     // at the plugin root, no `skills/`, and no `skills` field. `Unreadable`
@@ -247,6 +254,7 @@ fn skill_dirs(install_path: &Path, manifest: &ManifestSkills) -> Vec<SkillDir> {
         return vec![SkillDir {
             path: install_path.to_path_buf(),
             declared: false,
+            escapes: false,
             children: ChildDirs::AreSkillEntries,
         }];
     }
@@ -261,6 +269,7 @@ fn skill_dirs(install_path: &Path, manifest: &ManifestSkills) -> Vec<SkillDir> {
         .chain(declared.iter().cloned().map(|path| (path, true)))
         .map(|(path, was_declared)| SkillDir {
             children: classify_children(&path, &declared),
+            escapes: was_declared && !contains(install_path, &path),
             path,
             declared: was_declared,
         });
@@ -290,6 +299,16 @@ pub fn discover_plugin_skills(record: &PluginInstallRecord) -> (Vec<DiscoveredSk
     let mut skills = Vec::new();
 
     for dir in skill_dirs(&record.install_path, &manifest) {
+        if dir.escapes {
+            warnings.push(DiscoveryWarning {
+                path: dir.path,
+                reason: format!(
+                    "{} declares a skills path outside the plugin, which is not read",
+                    record.plugin_at_marketplace
+                ),
+            });
+            continue;
+        }
         if !dir.path.is_dir() {
             if dir.declared {
                 warnings.push(DiscoveryWarning {
@@ -633,6 +652,47 @@ mod tests {
         assert!(warnings[0].reason.contains("declares a skills path"), "{:?}", warnings[0]);
     }
 
+    /// "All paths must be relative to the plugin root and start with `./`". A
+    /// path that climbs out of it would credit another plugin's skills to this
+    /// one -- and since the always-on total is a sum over discovered skills
+    /// (ADR 0003), those skills would be counted twice in the headline. Nothing
+    /// on disk does this; the guard is cheap and the failure is silent.
+    #[test]
+    fn declared_path_escaping_the_plugin_root_is_refused_and_warned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("plugin-install");
+        fs::create_dir_all(&install_path).unwrap();
+        write_skill(&tmp.path().join("other-plugin").join("skills").join("not-mine"), "not-mine");
+        write_manifest(&install_path, r#"{"skills": ["../other-plugin/skills"]}"#);
+
+        let (skills, warnings) = discover_plugin_skills(&record_for(&install_path));
+
+        assert!(skills.is_empty(), "another plugin's skills are not this plugin's");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].reason.contains("outside the plugin"), "{:?}", warnings[0]);
+    }
+
+    #[test]
+    fn declared_absolute_path_is_refused_and_warned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("plugin-install");
+        fs::create_dir_all(&install_path).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        write_skill(&elsewhere.join("stolen"), "stolen");
+        // `Path::join` on an absolute path discards the root entirely, so an
+        // absolute declaration silently becomes the path itself.
+        write_manifest(
+            &install_path,
+            &format!(r#"{{"skills": ["{}"]}}"#, elsewhere.display()),
+        );
+
+        let (skills, warnings) = discover_plugin_skills(&record_for(&install_path));
+
+        assert!(skills.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].reason.contains("outside the plugin"), "{:?}", warnings[0]);
+    }
+
     /// ...whereas a missing default `skills/` is ordinary: 3 of 11 plugins on
     /// disk ship none, and nothing declared it.
     #[test]
@@ -652,10 +712,20 @@ mod tests {
     /// plugin" (Claude Code v2.1.142+). Fires on none of the 11 plugins on this
     /// machine; without it, such a plugin would be invisible in exactly the way
     /// this issue is about.
+    ///
+    /// Pins the known-wrong name rather than asserting around it. This is the
+    /// one layout where keying `SkillId` on the directory basename is not a
+    /// no-op: the basename here is the *install directory*, which for a
+    /// marketplace-installed plugin is a version string (`1.2.0`, `unknown`)
+    /// that changes on every update, and the reference says the invocation name
+    /// comes from the frontmatter `name` with the basename only as a fallback.
+    /// skillmon's naming rule is deliberately unchanged (ADR 0030) -- the panel
+    /// surfaces the divergence through `name_mismatch` (issue #27) rather than
+    /// silently picking one -- so this test documents the gap where it bites.
     #[test]
     fn plugin_with_only_a_root_skill_md_is_loaded_as_a_single_skill() {
         let tmp = tempfile::tempdir().unwrap();
-        let install_path = tmp.path().join("plugin-install");
+        let install_path = tmp.path().join("2.1.0");
         write_skill(&install_path, "solo");
         write_manifest(&install_path, r#"{"name": "solo-plugin"}"#);
 
@@ -664,6 +734,8 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(skills[0].frontmatter.declared_name, "solo");
+        assert_eq!(skills[0].directory_name(), "2.1.0", "the known naming gap, surfaced not hidden");
+        assert!(skills[0].name_mismatch(), "the panel must show both names, never silently pick one");
     }
 
     #[test]
