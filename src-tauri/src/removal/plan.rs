@@ -451,6 +451,157 @@ mod tests {
         ));
     }
 
+    /// CLAUDE.md's verification bar for issue #31: exercise the whole flow --
+    /// plan, take the source, remove, restore -- against this machine's **real**
+    /// `~/.claude` and the **real** `.agents` lock, rather than only over
+    /// synthetic fixtures. Mutations must round-trip (disable -> enable,
+    /// uninstall -> restore).
+    ///
+    /// Nothing live is mutated, and that is not timidity. Removal is destructive
+    /// and `~/.claude/skills` is the user's only copy, so a test that removed
+    /// from it would be the exact overreach this module exists to prevent.
+    /// Instead: a real skill's **real content** is replicated into a tempdir laid
+    /// out as `.agents` lays one out, and the user's **real** `.skill-lock.json`
+    /// is copied beside it -- so the lock parser meets the actual file, with its
+    /// actual version and its actual sibling keys, and the round trip is asserted
+    /// byte-for-byte against it.
+    ///
+    /// Run by hand:
+    /// `cargo test --manifest-path src-tauri/Cargo.toml
+    /// removal::plan::tests::real_claude_home_plan_remove_and_restore -- --ignored --exact --nocapture`
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn real_claude_home_plan_remove_and_restore() {
+        use crate::adapters::claude_code::paths::default_claude_home;
+        use crate::adapters::claude_code::ClaudeCodeAdapter;
+        use crate::domain::removal::Retention;
+        use crate::managing_tool::agents::AgentsTool;
+        use crate::removal::store::TrashStore;
+
+        fn copy_tree(from: &Path, to: &Path) {
+            let meta = fs::symlink_metadata(from).unwrap();
+            if meta.is_symlink() {
+                std::os::unix::fs::symlink(fs::read_link(from).unwrap(), to).unwrap();
+            } else if meta.is_dir() {
+                fs::create_dir_all(to).unwrap();
+                for child in fs::read_dir(from).unwrap() {
+                    let child = child.unwrap();
+                    copy_tree(&child.path(), &to.join(child.file_name()));
+                }
+            } else {
+                fs::copy(from, to).unwrap();
+            }
+        }
+
+        let real_home = default_claude_home();
+        let discovery = ClaudeCodeAdapter::for_discovery_only(real_home.clone()).discover_skills();
+        assert!(!discovery.skills.is_empty(), "no skills discovered -- is this machine's ~/.claude populated?");
+
+        // Every real row plans without panicking, and every classification is
+        // self-consistent. This is the pass that would catch a real entry shape
+        // the synthetic fixtures do not have.
+        let real_tools = ManagingTools::from_env();
+        for skill in &discovery.skills {
+            let p = plan(&discovery.skills, &real_tools, skill);
+            assert_eq!(p.is_tool_uninstall(), !p.dependents.is_empty());
+            assert_eq!(p.source.is_some(), skill.manager_root.is_some(), "an offer exists iff the skill is managed");
+            assert_eq!(p.rebuilt_by.is_some(), skill.manager_root.is_some());
+            eprintln!(
+                "  {:<28} managed={:<5} dependents={:<3} source={}",
+                skill.directory_name(),
+                skill.manager_root.is_some(),
+                p.dependents.len(),
+                match p.source.as_ref() {
+                    None => "n/a (its entry is its content)".to_string(),
+                    Some(s) if s.is_available() => format!("removable via {}", s.tool_name.as_deref().unwrap_or("?")),
+                    Some(s) => format!("blocked: {}", s.blocked.as_deref().unwrap_or("?").split('.').next().unwrap()),
+                }
+            );
+        }
+        eprintln!("\n=== {} real skills planned ===", discovery.skills.len());
+
+        // The `.agents` round trip, on real content and the real lock format.
+        let tmp = tempdir().unwrap();
+        let scan_root = tmp.path().join("skills");
+        let agents_skills = tmp.path().join(".agents/skills");
+        let lock_path = tmp.path().join(".agents/.skill-lock.json");
+        fs::create_dir_all(&scan_root).unwrap();
+        fs::create_dir_all(&agents_skills).unwrap();
+
+        let real_lock = dirs::home_dir().unwrap().join(".agents/.skill-lock.json");
+        let had_real_lock = real_lock.is_file();
+        if had_real_lock {
+            // The user's actual file, copied -- never edited in place.
+            fs::copy(&real_lock, &lock_path).unwrap();
+            eprintln!("=== using the real ~/.agents/.skill-lock.json ({} bytes) ===", fs::metadata(&real_lock).unwrap().len());
+        } else {
+            fs::write(&lock_path, r#"{"version":3,"skills":{},"dismissed":{}}"#).unwrap();
+            eprintln!("=== no real lock on this machine; using a minimal v3 one ===");
+        }
+
+        // A real skill's real content, installed the way `.agents` installs one.
+        let sample = &discovery.skills[0];
+        let name = sample.directory_name().to_string();
+        let content = agents_skills.join(&name);
+        copy_tree(&sample.dir_path, &content);
+        let entry = scan_root.join(&name);
+        std::os::unix::fs::symlink(&content, &entry).unwrap();
+
+        // Teach the lock about it, through the tool's own writer, so the entry
+        // under test is shaped exactly as the CLI would have shaped it.
+        let tool = AgentsTool::new(agents_skills.clone(), lock_path.clone());
+        tool.relearn_source(&format!(
+            r#"{{"key":"{name}","entry":{{"source":"mattpocock/skills","sourceType":"github","skillFolderHash":"deadbeef"}}}}"#
+        ))
+        .unwrap();
+        let lock_with_skill = fs::read_to_string(&lock_path).unwrap();
+
+        let manager_root = fs::canonicalize(&agents_skills).unwrap();
+        let discovered = skill(&name, &entry, fs::canonicalize(&content).unwrap(), Some(manager_root));
+        let skills = vec![discovered];
+        let tools = ManagingTools::new(vec![Box::new(AgentsTool::new(agents_skills, lock_path.clone()))]);
+
+        let mut p = plan(&skills, &tools, &skills[0]);
+        assert!(p.source.as_ref().unwrap().is_available(), ".agents must be able to remove its own copy");
+        take_source(&mut p, &skills[0], &tools).unwrap();
+        assert!(
+            !fs::read_to_string(&lock_path).unwrap().contains(&format!("\"{name}\"")),
+            "the lock entry was pruned"
+        );
+
+        let mut store = TrashStore::open_in_memory().unwrap();
+        let storage_root = tmp.path().join("skillmon/removed");
+        let id = super::super::remove(&mut store, &storage_root, 1_000, Retention::Trashed, p.primary, p.dependents)
+            .unwrap();
+
+        assert!(!fs::symlink_metadata(&entry).is_ok(), "the entry left the scan root");
+        assert!(!content.exists(), "and so did the tool's copy, since that was asked for");
+        let unit = store.get(id).unwrap().unwrap();
+        eprintln!("=== staged {} + its .agents content: {} bytes ===", name, unit.bytes());
+        assert!(unit.bytes() > 0);
+
+        super::super::restore(&mut store, &tools, id).unwrap();
+
+        assert!(fs::symlink_metadata(&entry).unwrap().is_symlink(), "the entry is a link again");
+        assert!(entry.join("SKILL.md").exists(), "and it resolves -- not a dangling shim");
+        assert_eq!(
+            fs::read_to_string(entry.join("SKILL.md")).unwrap(),
+            fs::read_to_string(sample.dir_path.join("SKILL.md")).unwrap(),
+            "the restored content is the real skill's, byte for byte"
+        );
+        assert_eq!(
+            fs::read_to_string(&lock_path).unwrap(),
+            lock_with_skill,
+            "the real lock round-tripped exactly -- ADR 0027 rejected desyncing it"
+        );
+        assert!(
+            sample.dir_path.join("SKILL.md").exists(),
+            "the real skill this fixture was copied from must be untouched"
+        );
+        eprintln!("=== round trip on real content + the real lock format: intact ===\n");
+    }
+
     #[test]
     fn resolving_finds_the_row_a_ref_names() {
         let f = Fixture::new();
