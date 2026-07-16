@@ -47,3 +47,55 @@ The rescan loop and Tauri command layer this update deferred to now exist, and t
 The incremental listing index (ADR 0022) does not change this ADR's stance that transcripts are deliberately *not* watched.
 Freshness stays lazy, evaluated on the next `scan_all` (a panel reopen or a registry-change rescan); the persisted `(mtime, size)` memo only makes that lazy check cheap by skipping the re-read of unchanged transcripts.
 No continuous transcript watcher is added, so the third leg of the rescan model is intact.
+
+## Update 4 (a rescan trigger excludes skillmon's own writes)
+
+This ADR's first leg watches the personal skills dir **recursively**, and never asked who was writing.
+That was free while skillmon only read, and stops being free the moment it mutates: ADR 0027's removals move entries *out of* that root and restores move them back *in*, so skillmon's own mutations trigger rescans of skillmon's own work.
+A tool uninstall moves 47 entries, and the debouncer flushes mid-cascade, while the ledger recording the unit has not committed.
+The panel renders a tree that is genuinely half-removed at that instant (issue #29).
+
+**A watcher event is suppressed while skillmon is writing, and the mutation announces its own completion instead.**
+A mutation holds a `SelfWriteWindow` guard (`src-tauri/src/self_write.rs`) across its writes; the debouncer callback drops any batch arriving while that latch is open; the mutation emits `registry-changed` itself once its ledger write has settled.
+The result is one rescan of a finished tree rather than N of an unfinished one.
+`purge`/`empty_trash` need neither, and that is not an oversight: they only ever touch `skillmon/removed/`, which no watcher watches.
+
+Two things about the mechanism are load-bearing and non-obvious.
+
+**Suppression must outlive the write.**
+A guard is released when `rename(2)` returns, but the event that rename raised has not been *delivered* yet: the debouncer holds it for a further `DEBOUNCE_WINDOW`.
+A latch that closed with the write would therefore suppress nothing at all, every self-write event landing just after it closed.
+Hence a tail, derived from the debounce (`SELF_WRITE_TAIL = DEBOUNCE_WINDOW * 2`) rather than picked, so the two cannot drift.
+
+**The staging root is outside every watched tree, and that is a separate fact from this one.**
+`~/.claude/skillmon/removed/` sits under `~/.claude` but not under `~/.claude/skills` (`paths::removed_dir`, asserted by `the_removal_staging_root_sits_outside_every_recursively_watched_tree`), so the *destination* of a removal is not self-triggering.
+It answers only half of issue #29, since taking the entry out of the scan root is still a write inside a watched tree, which is why the latch exists as well.
+
+### Consequences
+
+**An external change landing inside the window is attributed to skillmon and dropped.**
+This is the real price, stated plainly rather than buried: the latch knows only that skillmon was writing, never which write an event came from.
+
+**And it drops that batch across every watched surface, not merely the one being written.**
+All the watched paths share one debouncer and one callback, which consults the latch once per batch, so a removal in `~/.claude/skills` also swallows a concurrent `installed_plugins.json` event it could in principle have attributed exactly.
+The blast radius is therefore wider than "the tree the mutation touched", and is recorded here rather than left to be discovered.
+It is accepted because it changes nothing in practice: the rescan the mutation itself emits reads *all* the surfaces fresh, so a plugin install landing during the mutation is picked up regardless of whose event announced it.
+
+The exposure is a sub-second tail after a mutation the user themselves just triggered, and three things make it proportionate.
+ADR 0027 measured that neither managing tool runs a daemon, so nothing races skillmon in the background; a collision needs the user to run `/gstack-upgrade` in the same second they clicked uninstall.
+A change landing *during* the mutation is caught anyway by the rescan the mutation itself emits, which reads the whole tree fresh, leaving only the tail after it exposed.
+And this ADR already holds that the watcher is a "your list may be stale" nudge rather than a live-state mirror, with a lazy check on panel open and a manual rescan button as the escape hatch, so the failure mode is one this design has always accepted.
+
+**A guard brackets the writes, never the wait for a lock.**
+Taking it before the store mutex would look more cautious and be strictly worse: that wait is unbounded (an `Empty trash` holds the store for as long as deleting 1.1 GB takes), and every second of it would suppress the watcher while the queued command writes nothing.
+A mutation that is already writing holds its own guard, so it never needs a queued one's.
+
+The latch is deliberately **not** the watcher's `Mutex` to acquire: a mutation must never queue behind a scan's `sync_watcher` merely to say "this write is mine".
+It has a lock of its own, which the notify callback does take, but only ever to read or stamp one `Instant`, never across a scan, a move, or any other real work.
+
+## Options considered (Update 4)
+
+- **Per-path attribution**: register the paths a mutation is about to touch and drop only their events. Finer in principle, and it would not swallow a concurrent external change. Rejected as unreliable rather than merely costly: moving `skills/foo` out also fires an event on `skills/` itself, and that directory is the parent of *every* skill, so suppressing it swallows exactly the changes the watcher exists for, while not suppressing it lets every self-write through the parent's event. The existing callback also resolves no paths at all (it reacts to "any event in the batch"), so path attribution would be a larger change than the problem warrants, sold on a precision it cannot deliver.
+- **Coalesce rather than drop**: remember that events were suppressed and flush one rescan when the window expires, losing nothing. Rejected: the flush needs a timer thread, because the last event of a mutation arrives *after* the mutation has returned and there is nothing left to fire it. That is real machinery to close a sub-second hole that a panel reopen already closes, and it is the same over-engineering ADR 0027 rejected when it declined desired-state reconciliation on the same measured evidence.
+- **Have mutations stop the watcher and restart it**, with no latch and no tail. Rejected: `unwatch`/`watch` cycles drop events genuinely unrelated to the mutation for the whole duration (a strictly wider blind spot than the tail), and a mutation that panicked between the two would leave the watcher permanently off, where a dropped RAII guard cannot.
+- **A latch held across the write, with a tail sized from the debounce**: chosen.
