@@ -10,11 +10,15 @@
   import {
     coResidentAlwaysOn,
     DEFAULT_SORT,
+    dependentsBadge,
+    dependentsTitle,
     estimatedLayerCount,
     groupByPlugin,
     groupProjectsByRepo,
     layerDisplay,
     mainSkills,
+    managerRootDisplay,
+    managerRootTitle,
     normalizeApiKey,
     repoBasename,
     scannedPaths,
@@ -295,40 +299,68 @@
 {/snippet}
 
 {#snippet skillRow(skill: SkillReport, inRepoSection = false)}
-  <div class="row" role="row" class:inactive={!skill.live}>
-    <div class="col name" role="cell">
-      <div class="name-line">
-        <span class="skill-name" title={skillNameTitle(skill)}>{skill.id.name}</span>
-        {#if skill.id.kind === "plugin"}
-          <span class="badge plugin" title="Plugin-locked: remove the whole plugin, not one skill">
-            {skill.id.plugin}
-          </span>
-        {:else if skill.id.kind === "project" && !inRepoSection}
-          <span class="badge project" title={skill.id.repoPath}>{repoBasename(skill.id.repoPath)}</span>
-        {/if}
-        {#if !skill.live}
-          <span class="badge inactive-badge" title="Not live in the active context (contributes zero live footprint)">inactive</span>
+  {@const dependents = dependentsBadge(skill.providesFor)}
+  <!-- A managed skill renders as two rows (itself, then its manager root), and
+       `rowgroup` is what ties them together: it keeps the path from reading as a
+       standalone row to a screen reader, and gives hover one element to light up
+       instead of highlighting half a skill. -->
+  <div class="skill-group" role="rowgroup" class:inactive={!skill.live}>
+    <div class="row" role="row" class:has-manager={!!skill.managerRoot}>
+      <div class="col name" role="cell">
+        <div class="name-line">
+          <span class="skill-name" title={skillNameTitle(skill)}>{skill.id.name}</span>
+          {#if skill.id.kind === "plugin"}
+            <span class="badge plugin" title="Plugin-locked: remove the whole plugin, not one skill">
+              {skill.id.plugin}
+            </span>
+          {:else if skill.id.kind === "project" && !inRepoSection}
+            <span class="badge project" title={skill.id.repoPath}>{repoBasename(skill.id.repoPath)}</span>
+          {/if}
+          {#if dependents}
+            <!-- Never demoted to the manager root's line: this is the fact that
+                 inverts the row's meaning. Unmanaged reads as "safe to delete"
+                 on exactly the row that takes 46 skills with it. -->
+            <span class="badge dependents" title={dependentsTitle(skill.providesFor)}>{dependents}</span>
+          {/if}
+          {#if !skill.live}
+            <span class="badge inactive-badge" title="Not live in the active context (contributes zero live footprint)">inactive</span>
+          {/if}
+        </div>
+        {#if skill.usage}
+          <div class="usage" title={usageTitle(skill.usage)}>
+            {usageDisplay(skill.usage, report?.usageWindowHours ?? null)}
+          </div>
         {/if}
       </div>
-      {#if skill.usage}
-        <div class="usage" title={usageTitle(skill.usage)}>
-          {usageDisplay(skill.usage, report?.usageWindowHours ?? null)}
-        </div>
+
+      {#if skill.alwaysOnText === "notListed"}
+        <!-- A real 0, not the "…" a pending ceiling gets nor an em dash: this
+             cost is known to be nothing, not unknown (issue #24). -->
+        <div class="col num not-listed" role="cell" title={alwaysOnTitle(skill)}>0</div>
+      {:else}
+        {@render layerCell(skill.alwaysOn, alwaysOnTitle(skill), skill.alwaysOnText === "reconstructed")}
+      {/if}
+      {@render layerCell(skill.onInvoke, layerTitle(skill.onInvoke))}
+      {#if skill.onDemand === null}
+        <div class="col num pending" role="cell" title={onDemandTitle(null)}>…</div>
+      {:else}
+        {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand))}
       {/if}
     </div>
 
-    {#if skill.alwaysOnText === "notListed"}
-      <!-- A real 0, not the "…" a pending ceiling gets nor an em dash: this
-           cost is known to be nothing, not unknown (issue #24). -->
-      <div class="col num not-listed" role="cell" title={alwaysOnTitle(skill)}>0</div>
-    {:else}
-      {@render layerCell(skill.alwaysOn, alwaysOnTitle(skill), skill.alwaysOnText === "reconstructed")}
-    {/if}
-    {@render layerCell(skill.onInvoke, layerTitle(skill.onInvoke))}
-    {#if skill.onDemand === null}
-      <div class="col num pending" role="cell" title={onDemandTitle(null)}>…</div>
-    {:else}
-      {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand))}
+    {#if skill.managerRoot}
+      <!-- The path, elided but never renamed: no basename rule survives a real
+           machine (ADR 0026). A row of its own, rather than a fifth cell or a
+           line inside the name cell: a real manager root is a deep path, the
+           name column cannot hold one without eliding away the very segment that
+           names the manager, and a fifth cell would make the row ragged against
+           a four-column header. "in" because a bare path under a row named
+           `ship` would read as `ship`'s own directory, which it is not. -->
+      <div class="manager-row" role="row">
+        <span class="manager" role="cell" title={managerRootTitle(skill.managerRoot)}>
+          in {managerRootDisplay(skill.managerRoot)}
+        </span>
+      </div>
     {/if}
   </div>
 {/snippet}
@@ -795,10 +827,13 @@
     font-weight: 600;
     z-index: 1;
   }
-  .row:not(.header):hover {
+  /* Hover and liveness belong to the skill, not to one of the rows it renders
+     as: a managed skill is a row plus its manager-root row, and highlighting or
+     dimming half of one would read as two unrelated things. */
+  .skill-group:hover {
     background: rgba(57, 108, 216, 0.06);
   }
-  .row.inactive {
+  .skill-group.inactive {
     opacity: 0.55;
   }
 
@@ -841,15 +876,40 @@
     flex: 0 1 auto;
     min-width: 2.75rem;
   }
-  /* Attributed usage: a demoted proxy below the name, never a headline column
-     and never blended with the exact footprint (ADR 0003). */
-  .usage {
+  /* The demoted sub-lines under a row.
+
+     `.usage` is attributed usage: a proxy, never a headline column and never
+     blended with the exact footprint (ADR 0003). `.manager` is the manager
+     root: who restores this row, which matters when removing it, not while
+     reading the footprint. Both are clipped as a backstop only: the ellipsis
+     takes the tail, and for a path the tail is the half worth reading, so
+     `managerRootDisplay` elides from the left before it ever gets here. */
+  .usage,
+  .manager {
     font-size: 10px;
     color: var(--faint);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
     max-width: 100%;
+  }
+  /* The manager root's continuation row: the path gets the whole row's width
+     instead of the name column's ~112px. The width IS the design: at this size
+     a real manager root fits whole, and nothing has to guess which of its
+     segments identifies the manager. It carries the border its row gave up, so
+     the two read as one row and no rule is drawn between a skill and its path. */
+  .manager-row {
+    padding: 0 12px 5px;
+    border-bottom: 1px solid var(--line);
+  }
+  /* The border moves to the manager row, so no rule is drawn between a skill and
+     its own path. Gated on the same condition that renders that row, so the two
+     cannot disagree. */
+  .row.has-manager {
+    border-bottom: none;
+  }
+  .manager {
+    display: block;
   }
   .col.num {
     text-align: right;
@@ -918,6 +978,14 @@
   .badge.inactive-badge {
     background: transparent;
     border: 1px solid var(--line);
+  }
+  /* The one badge that is a warning: removing this row removes everything that
+     resolves into it (ADR 0027). Rare by nature, since it marks a managing
+     tool's own entry, 1 row of 71 on a real machine, so the colour costs
+     nothing and earns the glance. */
+  .badge.dependents {
+    background: #fbeee8;
+    color: #a4501c;
   }
 
   /* An estimate is muted and marked; it never blends with an exact count. */
@@ -1218,6 +1286,10 @@
     .badge.project {
       background: #1f3524;
       color: #8fd39c;
+    }
+    .badge.dependents {
+      background: #40281c;
+      color: #e8a677;
     }
     .state.error code {
       color: #ff9a90;

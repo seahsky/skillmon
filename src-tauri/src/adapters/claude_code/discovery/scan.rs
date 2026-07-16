@@ -63,6 +63,27 @@ pub fn discover_skills_in_dir(
             None => continue,
         };
 
+        // Warned, not swallowed: this is the directory the dependent test
+        // compares against (ADR 0026), so a raw path here answers "nothing
+        // resolves into me" for a row that may be a manager root -- and that
+        // zero reads as "nothing to cascade" on a removal (ADR 0027).
+        //
+        // The `is_dir()` above already resolved this path, so what's left is a
+        // narrow race: a managing tool rebuilding `~/.claude/skills` underneath
+        // the scan, which is not hypothetical -- it is why ADR 0019 needs
+        // self-write suppression at all. The fallback names no other directory,
+        // so the row claims no dependents rather than guessing at some.
+        let canonical_dir = match fs::canonicalize(&dir_path) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                warnings.push(DiscoveryWarning {
+                    path: dir_path.clone(),
+                    reason: format!("cannot resolve directory, so its dependents cannot be counted: {err}"),
+                });
+                dir_path.clone()
+            }
+        };
+
         let skill_md_path = dir_path.join("SKILL.md");
         let manager_root = canonical_root
             .as_deref()
@@ -93,6 +114,7 @@ pub fn discover_skills_in_dir(
 
         skills.push(DiscoveredSkill {
             id: make_id(name),
+            canonical_dir,
             dir_path,
             skill_md_path,
             frontmatter,

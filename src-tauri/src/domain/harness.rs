@@ -1,6 +1,6 @@
 use crate::domain::footprint::Footprint;
 use crate::domain::report::{ScanReport, SkillReport};
-use crate::domain::skill::{DiscoveredSkill, DiscoveryResult};
+use crate::domain::skill::{DependentIndex, DiscoveredSkill, DiscoveryResult};
 
 /// Abstracts everything agent-specific: where skills live, how footprint is
 /// read, how enable/disable is mutated (mutation methods land in a later
@@ -40,10 +40,21 @@ pub trait HarnessAdapter {
     /// to include. The Claude Code adapter overrides this to honor the flag.
     fn scan_all(&self, _include_subagents: bool) -> ScanReport {
         let discovery = self.discover_skills();
+        // Harness-neutral, and derived from what discovery already resolved, so
+        // every adapter gets its dependent counts from the same rule rather than
+        // each re-deriving one (ADR 0026).
+        let dependents = DependentIndex::build(&discovery.skills);
         let skills = discovery
             .skills
             .iter()
-            .map(|skill| SkillReport::from_parts(skill, &self.compute_footprint(skill), None))
+            .map(|skill| {
+                SkillReport::from_parts(
+                    skill,
+                    &self.compute_footprint(skill),
+                    None,
+                    dependents.for_skill(skill),
+                )
+            })
             .collect();
         let warnings = discovery
             .warnings

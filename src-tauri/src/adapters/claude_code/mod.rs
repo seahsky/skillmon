@@ -17,7 +17,7 @@ use crate::domain::footprint::{AlwaysOnFootprint, Footprint, LayerCount, AlwaysO
 use crate::domain::harness::HarnessAdapter;
 use crate::domain::report::{ScanReport, SkillReport, UsageSettings};
 use crate::domain::scan::{ScanOutcome, ScanParams, UsageWindow, DAY_MILLIS, HOUR_MILLIS};
-use crate::domain::skill::{DiscoveredSkill, DiscoveryResult, SkillId};
+use crate::domain::skill::{DependentIndex, DiscoveredSkill, DiscoveryResult, SkillId};
 use crate::footprint::api_key_store::ApiKeyStore;
 use crate::footprint::cache::TokenCache;
 use crate::footprint::compute::count_text;
@@ -390,6 +390,11 @@ impl ClaudeCodeAdapter {
             }
         };
 
+        // Built over the whole discovery, not per scan root: the ancestor test
+        // is about where content resolves, and nothing says a manager root and
+        // the skills resolving into it were found by the same pass (ADR 0026).
+        let dependents = DependentIndex::build(&discovery.skills);
+
         let skills = discovery
             .skills
             .iter()
@@ -401,7 +406,12 @@ impl ClaudeCodeAdapter {
                 // for the background pass (issue #11). No tokenization here.
                 let on_demand = self.cached_on_demand(skill);
                 let footprint = self.footprint_with_always_on(skill, always_on, on_demand);
-                SkillReport::from_parts(skill, &footprint, usage_index.for_skill(skill))
+                SkillReport::from_parts(
+                    skill,
+                    &footprint,
+                    usage_index.for_skill(skill),
+                    dependents.for_skill(skill),
+                )
             })
             .collect();
         let warnings = discovery
@@ -1006,6 +1016,53 @@ mod tests {
         assert_eq!(root_of("vercel-react"), None, "a skill owning its own content has no manager root");
     }
 
+    /// The reference machine's most destructive row, end to end (issue #30):
+    /// `~/.claude/skills/gstack` is a skill in its own right AND the checkout
+    /// every shim resolves into. `manager_root: None` and `provides_for: 2` have
+    /// to reach the panel together -- either alone describes the row as harmless
+    /// (ADR 0026), and removing it is a tool uninstall, not a skill removal
+    /// (ADR 0027).
+    #[test]
+    #[cfg(unix)]
+    fn scan_all_counts_the_shims_resolving_into_a_checkout_that_is_itself_a_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_home = tmp.path().join(".claude");
+        let skills = claude_home.join("skills");
+        fs::create_dir_all(&skills).unwrap();
+
+        // The checkout sits in the scan root, so it is discovered as a skill of
+        // its own -- and its content is genuinely its own, so it is unmanaged.
+        let checkout = skills.join("gstack");
+        write_skill(&checkout, "gstack");
+        // Nested a directory deeper than the shims' entries, which is what makes
+        // this the ancestor test and not path equality.
+        for shim_name in ["ship", "review"] {
+            let real = checkout.join("skills").join("engineering").join(shim_name);
+            write_skill(&real, shim_name);
+            fs::create_dir_all(skills.join(shim_name)).unwrap();
+            std::os::unix::fs::symlink(real.join("SKILL.md"), skills.join(shim_name).join("SKILL.md")).unwrap();
+        }
+        // A skill that resolves nowhere near the checkout, so the count is a
+        // count and not just "every other row".
+        write_skill(&skills.join("vercel-react"), "vercel-react");
+
+        let adapter = ClaudeCodeAdapter::for_discovery_only(claude_home);
+        let report = adapter.scan_all(false);
+
+        let row = |name: &str| {
+            report
+                .skills
+                .iter()
+                .find(|s| s.id.name() == name)
+                .unwrap_or_else(|| panic!("{name} was not discovered"))
+        };
+
+        assert_eq!(row("gstack").provides_for, 2);
+        assert_eq!(row("gstack").manager_root, None, "the checkout owns its own content");
+        assert_eq!(row("ship").provides_for, 0, "a shim is nobody's manager root");
+        assert_eq!(row("vercel-react").provides_for, 0);
+    }
+
     #[test]
     fn batched_scan_all_resolves_native_always_on_like_the_per_skill_path() {
         use crate::domain::footprint::AlwaysOnTextKind;
@@ -1395,8 +1452,9 @@ mod tests {
     }
 
     /// Reports how this machine's real `~/.claude` breaks down by always-on
-    /// text kind (issue #24) and manager root (issue #25) -- the CLAUDE.md
-    /// verification bar for both, which unit tests over tempdirs cannot meet.
+    /// text kind (issue #24), manager root (issue #25), and dependents (issue
+    /// #30) -- the CLAUDE.md verification bar for each, which unit tests over
+    /// tempdirs cannot meet.
     /// The populations are printed rather than asserted, being one developer's
     /// disk rather than an invariant; what *is* asserted is the per-skill
     /// invariant #24 turns on, which holds on any machine. Run by hand:
@@ -1424,6 +1482,36 @@ mod tests {
             names.sort_unstable();
             eprintln!("  {:>3}  {}", names.len(), root);
             eprintln!("       e.g. {}", names.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
+        }
+
+        // Issue #30's half of the pair: which rows other rows resolve into. The
+        // count is what makes an unmanaged row's removal a tool uninstall rather
+        // than a skill removal (ADR 0027), so it is walked over real symlinks
+        // here, not just tempdir ones.
+        let dependents = DependentIndex::build(&discovery.skills);
+        eprintln!("\n=== dependents (issue #30) ===");
+        let mut providers: Vec<(&DiscoveredSkill, u32)> = discovery
+            .skills
+            .iter()
+            .map(|s| (s, dependents.for_skill(s)))
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        providers.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        if providers.is_empty() {
+            eprintln!("  no skill on this machine is a manager root for another");
+        }
+        for (skill, count) in &providers {
+            eprintln!("  {:>3}  {}  ({})", count, skill.directory_name(), skill.canonical_dir.display());
+        }
+        for skill in &discovery.skills {
+            // True on any machine, and the guard against the one shape that
+            // would break it: an entry whose SKILL.md resolves inside its own
+            // directory would otherwise count itself.
+            assert!(
+                (dependents.for_skill(skill) as usize) < discovery.skills.len().max(1),
+                "{} cannot provide for every discovered skill including itself",
+                skill.directory_name()
+            );
         }
 
         let never_listed: Vec<&str> = discovery
@@ -1474,7 +1562,7 @@ mod tests {
         let mut managed = 0usize;
         let mut mismatched: Vec<(String, String)> = Vec::new();
         for skill in &discovery.skills {
-            let report = SkillReport::from_parts(skill, &adapter.compute_footprint(skill), None);
+            let report = SkillReport::from_parts(skill, &adapter.compute_footprint(skill), None, 0);
 
             assert_eq!(
                 SkillId::from(report.id.clone()),

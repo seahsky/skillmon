@@ -182,13 +182,28 @@ pub struct SkillReport {
     /// tool's manifest to do better.
     ///
     /// `None` means unmanaged, which is **not** the same as safe to remove: the
-    /// row other skills resolve into is itself unmanaged. That question needs
-    /// the dependent count, which lands with the column it feeds (issue #30).
+    /// row other skills resolve into is itself unmanaged. Read it with
+    /// `provides_for`, never alone (ADR 0026).
     pub manager_root: Option<String>,
+    /// How many discovered skills resolve into this one's directory (CONTEXT.md
+    /// "Dependent skill"). The other half of the pair `manager_root` must never
+    /// be collapsed into: unmanaged **and** `provides_for: 46` is the single
+    /// most destructive row on a real machine, and either fact alone describes
+    /// it as harmless (ADR 0026).
+    ///
+    /// A **floor**, never a total: only discovered skills are counted, and
+    /// skillmon scans Claude Code's paths alone (ADR 0027). The panel must not
+    /// present it as exhaustive.
+    pub provides_for: u32,
 }
 
 impl SkillReport {
-    pub fn from_parts(skill: &DiscoveredSkill, footprint: &Footprint, usage: Option<UsageReport>) -> Self {
+    pub fn from_parts(
+        skill: &DiscoveredSkill,
+        footprint: &Footprint,
+        usage: Option<UsageReport>,
+        provides_for: u32,
+    ) -> Self {
         SkillReport {
             id: SkillRef::from(&skill.id),
             live: skill.live,
@@ -200,6 +215,7 @@ impl SkillReport {
             declared_name: skill.frontmatter.declared_name.clone(),
             name_mismatch: skill.name_mismatch(),
             manager_root: skill.manager_root.as_ref().map(|p| p.display().to_string()),
+            provides_for,
         }
     }
 }
@@ -343,6 +359,7 @@ mod tests {
         DiscoveredSkill {
             id,
             dir_path: PathBuf::from("/tmp/x"),
+            canonical_dir: PathBuf::from("/tmp/x"),
             skill_md_path: PathBuf::from("/tmp/x/SKILL.md"),
             frontmatter: Frontmatter {
                 // Matches the directory name, so the default fixture is an
@@ -373,7 +390,7 @@ mod tests {
     #[test]
     fn personal_skill_report_carries_only_a_name_as_its_identity() {
         let skill = skill_with_id(SkillId::Personal { name: "grilling".to_string() });
-        let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
+        let report = SkillReport::from_parts(&skill, &sample_footprint(), None, 0);
 
         assert_eq!(report.id, SkillRef::Personal { name: "grilling".to_string() });
         assert_eq!(report.id.name(), "grilling");
@@ -389,7 +406,7 @@ mod tests {
             plugin: "superpowers".to_string(),
             name: "brainstorming".to_string(),
         });
-        let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
+        let report = SkillReport::from_parts(&skill, &sample_footprint(), None, 0);
 
         assert_eq!(
             report.id,
@@ -407,7 +424,7 @@ mod tests {
             repo_path: PathBuf::from("/home/me/repo"),
             name: "deploy".to_string(),
         });
-        let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
+        let report = SkillReport::from_parts(&skill, &sample_footprint(), None, 0);
 
         assert_eq!(
             report.id,
@@ -489,7 +506,7 @@ mod tests {
     #[test]
     fn manager_root_crosses_as_a_path_and_is_null_when_unmanaged() {
         let unmanaged = skill_with_id(SkillId::Personal { name: "vercel-react".to_string() });
-        let report = SkillReport::from_parts(&unmanaged, &sample_footprint(), None);
+        let report = SkillReport::from_parts(&unmanaged, &sample_footprint(), None, 0);
         assert_eq!(report.manager_root, None);
         assert_eq!(serde_json::to_value(&report).unwrap()["managerRoot"], serde_json::Value::Null);
 
@@ -500,12 +517,29 @@ mod tests {
             manager_root: Some(PathBuf::from("/home/me/.claude/skills/gstack")),
             ..skill_with_id(SkillId::Personal { name: "ship".to_string() })
         };
-        let report = SkillReport::from_parts(&managed, &sample_footprint(), None);
+        let report = SkillReport::from_parts(&managed, &sample_footprint(), None, 0);
         assert_eq!(report.manager_root.as_deref(), Some("/home/me/.claude/skills/gstack"));
         assert_eq!(
             serde_json::to_value(&report).unwrap()["managerRoot"],
             "/home/me/.claude/skills/gstack"
         );
+    }
+
+    /// The pair ADR 0026 refuses to collapse, on the row where collapsing it is
+    /// dangerous: gstack is unmanaged *and* the thing 46 skills resolve into, so
+    /// a panel reading `managerRoot: null` alone would call the most destructive
+    /// entry on disk safe to delete.
+    #[test]
+    fn provides_for_crosses_beside_manager_root_and_is_zero_for_an_ordinary_skill() {
+        let ordinary = skill_with_id(SkillId::Personal { name: "vercel-react".to_string() });
+        let report = SkillReport::from_parts(&ordinary, &sample_footprint(), None, 0);
+        assert_eq!(serde_json::to_value(&report).unwrap()["providesFor"], 0);
+
+        let checkout = skill_with_id(SkillId::Personal { name: "gstack".to_string() });
+        let report = SkillReport::from_parts(&checkout, &sample_footprint(), None, 46);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["providesFor"], 46);
+        assert_eq!(json["managerRoot"], serde_json::Value::Null);
     }
 
     /// The real divergence on the reference machine: a directory named
@@ -515,7 +549,7 @@ mod tests {
     fn a_declared_name_that_diverges_from_the_directory_crosses_flagged() {
         let mut skill = skill_with_id(SkillId::Personal { name: "connect-chrome".to_string() });
         skill.frontmatter.declared_name = "open-gstack-browser".to_string();
-        let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
+        let report = SkillReport::from_parts(&skill, &sample_footprint(), None, 0);
 
         assert_eq!(report.id.name(), "connect-chrome");
         assert_eq!(report.declared_name, "open-gstack-browser");
@@ -529,7 +563,7 @@ mod tests {
     #[test]
     fn an_agreeing_declared_name_is_not_flagged_as_a_mismatch() {
         let skill = skill_with_id(SkillId::Personal { name: "grilling".to_string() });
-        let report = SkillReport::from_parts(&skill, &sample_footprint(), None);
+        let report = SkillReport::from_parts(&skill, &sample_footprint(), None, 0);
 
         assert_eq!(report.declared_name, "grilling");
         assert!(!report.name_mismatch);
@@ -539,7 +573,7 @@ mod tests {
     fn usage_none_serializes_null_and_some_serializes_camel_case() {
         let skill = skill_with_id(SkillId::Personal { name: "grilling".to_string() });
 
-        let without = SkillReport::from_parts(&skill, &sample_footprint(), None);
+        let without = SkillReport::from_parts(&skill, &sample_footprint(), None, 0);
         assert_eq!(serde_json::to_value(&without).unwrap()["usage"], serde_json::Value::Null);
 
         let usage = UsageReport {
@@ -548,7 +582,7 @@ mod tests {
             cache_read: 35154,
             attribution_source: AttributionSource::Native,
         };
-        let with = SkillReport::from_parts(&skill, &sample_footprint(), Some(usage));
+        let with = SkillReport::from_parts(&skill, &sample_footprint(), Some(usage), 0);
         let json = serde_json::to_value(&with).unwrap();
         assert_eq!(json["usage"]["work"], 1229);
         assert_eq!(json["usage"]["cacheWrite"], 13781);
@@ -563,7 +597,7 @@ mod tests {
             cache_read: 0,
             attribution_source: AttributionSource::Reconstructed,
         };
-        let with_recon = SkillReport::from_parts(&skill, &sample_footprint(), Some(reconstructed));
+        let with_recon = SkillReport::from_parts(&skill, &sample_footprint(), Some(reconstructed), 0);
         let recon_json = serde_json::to_value(&with_recon).unwrap();
         assert_eq!(recon_json["usage"]["attributionSource"], "reconstructed");
     }
@@ -583,7 +617,7 @@ mod tests {
             on_invoke: LayerCount { tokens: 20, source: TokenSource::Estimate },
             on_demand: None,
         };
-        let report = SkillReport::from_parts(&skill, &footprint, None);
+        let report = SkillReport::from_parts(&skill, &footprint, None, 0);
         let json = serde_json::to_value(&report).unwrap();
 
         assert_eq!(json["onDemand"], serde_json::Value::Null);
