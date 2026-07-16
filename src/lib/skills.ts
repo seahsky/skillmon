@@ -77,8 +77,13 @@ export interface SkillReport {
    * into a product name.
    *
    * `null` means unmanaged, NOT "safe to remove" — the row other skills resolve
-   * into is itself unmanaged. That needs the dependent count (issue #30). */
+   * into is itself unmanaged. Read it with `providesFor`, never alone. */
   managerRoot: string | null;
+  /** How many discovered skills resolve into this one's directory. A floor,
+   * never a total: skillmon counts only what it discovers, and it scans Claude
+   * Code's paths alone (ADR 0027), so nothing rendered from this may claim to
+   * be exhaustive. */
+  providesFor: number;
 }
 
 /** Mirrors `ScanReport`. */
@@ -315,6 +320,76 @@ export function coResidentAlwaysOn(skills: readonly SkillReport[], activeRepoPat
     if (!skill.alwaysOn.exact) exact = false;
   }
   return { tokens, exact };
+}
+
+/**
+ * How much of a manager-root path the row shows before it elides.
+ *
+ * Sized to the sub-line's own full-row width (376px at the panel's 400px, at
+ * 10px type), which is what the line spans the row to buy: a real manager root
+ * is `…/skills/gstack/skills/engineering`-shaped, and squeezed into the name
+ * column's ~112px there is no budget that keeps the segment naming the manager.
+ * At this width the paths on a real machine fit whole and nothing elides at all.
+ */
+const MANAGER_ROOT_BUDGET = 64;
+
+/**
+ * A manager-root path, shortened only if it cannot fit the row (ADR 0026 shows
+ * the path, never an invented product name).
+ *
+ * Elides whole leading segments and marks the elision with `…/`, so what's left
+ * is a truncation of the path rather than a rule that renames it. Every naming
+ * rule considered was wrong on real data: a basename gives `gstack` (right) but
+ * also `skills`, from `~/.agents/skills` (useless). A budget set too low walks
+ * into the same trap, since eliding hard enough turns
+ * `…/skills/gstack/skills/engineering` into `…/engineering`, which names a
+ * directory that is not the manager. So the fix is width, not cleverness about
+ * which part to keep. `managerRootTitle` carries the whole path a hover away
+ * regardless.
+ */
+export function managerRootDisplay(path: string): string {
+  if (path.length <= MANAGER_ROOT_BUDGET) return path;
+  const segments = path.split("/");
+  for (let i = 1; i < segments.length; i++) {
+    const tail = segments.slice(i).join("/");
+    // +2 for the "…/" marker, which is part of what has to fit.
+    if (tail.length + 2 <= MANAGER_ROOT_BUDGET) return `…/${tail}`;
+  }
+  // Even the last segment alone overflows: show it elided anyway and let the
+  // CSS ellipsis clip the rest, rather than returning a path with no marker.
+  return `…/${segments[segments.length - 1]}`;
+}
+
+/** The hover text for a manager-root line: the full path the row elides, plus
+ * what being managed actually means for removing it. The managing tool, not the
+ * user, decides whether this skill exists (ADR 0027). */
+export function managerRootTitle(path: string): string {
+  return `Content lives in ${path}. Whatever owns that directory puts this skill back when it next runs.`;
+}
+
+/**
+ * The dependent-count badge (ADR 0026): how many discovered skills resolve into
+ * this row's directory. `null` for a row nothing depends on, so the badge is
+ * absent rather than a `0` on every ordinary skill.
+ *
+ * Shown beside the name, not demoted like the manager root, because it is the
+ * fact that inverts the row's meaning: `managerRoot: null` alone reads as "safe
+ * to delete" on the one entry whose removal takes 46 skills with it.
+ */
+export function dependentsBadge(providesFor: number): string | null {
+  if (providesFor <= 0) return null;
+  return providesFor === 1 ? "1 dependent" : `${providesFor} dependents`;
+}
+
+/**
+ * The hover text for the dependent badge. States the floor honestly: skillmon
+ * counts only the skills it discovers, and it scans Claude Code's paths alone,
+ * so a managing tool's entries for other agents are real dependents it cannot
+ * see (ADR 0027). Never claims the count is exhaustive.
+ */
+export function dependentsTitle(providesFor: number): string {
+  const skills = providesFor === 1 ? "1 skill resolves" : `${providesFor} skills resolve`;
+  return `${skills} into this directory, so removing it removes them too. At least that many: skillmon counts only the skills it can see.`;
 }
 
 /** The last path segment of a repo path — the name the user recognizes. */

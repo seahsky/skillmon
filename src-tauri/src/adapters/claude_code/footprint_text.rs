@@ -452,6 +452,7 @@ mod tests {
         DiscoveredSkill {
             id: SkillId::Personal { name: dir_name.to_string() },
             dir_path: PathBuf::from(format!("/tmp/{dir_name}")),
+            canonical_dir: PathBuf::from(format!("/tmp/{dir_name}")),
             skill_md_path: PathBuf::from(format!("/tmp/{dir_name}/SKILL.md")),
             frontmatter: Frontmatter {
                 declared_name: dir_name.to_string(),

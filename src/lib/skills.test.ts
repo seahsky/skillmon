@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   coResidentAlwaysOn,
+  dependentsBadge,
+  dependentsTitle,
   estimatedLayerCount,
   formatTokens,
+  managerRootDisplay,
+  managerRootTitle,
   groupByPlugin,
   groupProjectsByRepo,
   layerDisplay,
@@ -43,6 +47,7 @@ function makeSkill({
     declaredName: name,
     nameMismatch: false,
     managerRoot: null,
+    providesFor: 0,
     ...overrides,
   };
 }
@@ -513,5 +518,97 @@ describe("scannedPaths", () => {
       "~/.claude/plugins/cache",
       "/repo/active/.claude/skills",
     ]);
+  });
+});
+
+describe("managerRootDisplay", () => {
+  it("shows a path that fits verbatim", () => {
+    expect(managerRootDisplay("/opt/tools")).toBe("/opt/tools");
+  });
+
+  it("shows the manager roots on a real machine whole, at the length the backend sends", () => {
+    // Absolute, home not collapsed: the exact strings that cross IPC.
+    expect(managerRootDisplay("/Users/kyseah/.claude/skills/gstack")).toBe(
+      "/Users/kyseah/.claude/skills/gstack",
+    );
+    expect(managerRootDisplay("/Users/kyseah/.agents/skills")).toBe("/Users/kyseah/.agents/skills");
+  });
+
+  it("shows a NESTED manager root whole, including the segment that names the manager", () => {
+    // A manager root is the parent of the *resolved* skill dir, so a tool that
+    // keeps its skills below the checkout root produces this shape, which is the
+    // one the Rust integration test builds. Elide it hard and it reads
+    // "…/engineering", naming a directory that is not the manager: the same
+    // useless answer the basename rule gives, and the reason ADR 0026 shows
+    // paths at all.
+    expect(managerRootDisplay("/Users/kyseah/.claude/skills/gstack/skills/engineering")).toBe(
+      "/Users/kyseah/.claude/skills/gstack/skills/engineering",
+    );
+  });
+
+  it("elides whole leading segments, and marks it, when a path cannot fit", () => {
+    const deep = "/Users/kyseah/Documents/GitHub/some-org/a-long-checkout-name/skills/engineering";
+    const shown = managerRootDisplay(deep);
+
+    expect(shown.startsWith("…/")).toBe(true);
+    // Never the leading half: "/Users/kyseah/Doc…" is the same string for every
+    // row on the machine, so a left-anchored clip would say nothing at all.
+    expect(shown.endsWith("/skills/engineering")).toBe(true);
+    expect(shown.length).toBeLessThanOrEqual(64);
+  });
+
+  it("still marks the elision when even the last segment overflows", () => {
+    const long = `/a/${"x".repeat(80)}`;
+    // No budget can fit it, so the marker stays and the CSS ellipsis clips the
+    // rest, rather than returning a bare segment that reads as a whole path.
+    expect(managerRootDisplay(long)).toBe(`…/${"x".repeat(80)}`);
+  });
+
+  it("never invents a name: what it shows is always a suffix of the real path", () => {
+    for (const path of [
+      "/Users/kyseah/.claude/skills/gstack",
+      "/Users/kyseah/.agents/skills",
+      "/Users/kyseah/.claude/skills/gstack/skills/engineering",
+      "/very/deeply/nested/somewhere/else/entirely/that/keeps/going/and/going/skills",
+    ]) {
+      expect(path.endsWith(managerRootDisplay(path).replace(/^…\//, ""))).toBe(true);
+    }
+  });
+});
+
+describe("managerRootTitle", () => {
+  it("carries the full path the row elided", () => {
+    expect(managerRootTitle("/Users/kyseah/.claude/skills/gstack")).toContain(
+      "/Users/kyseah/.claude/skills/gstack",
+    );
+  });
+});
+
+describe("dependentsBadge", () => {
+  it("is absent for a row nothing resolves into", () => {
+    expect(dependentsBadge(0)).toBeNull();
+  });
+
+  it("counts, and agrees with itself on the singular", () => {
+    expect(dependentsBadge(1)).toBe("1 dependent");
+    expect(dependentsBadge(46)).toBe("46 dependents");
+  });
+});
+
+describe("dependentsTitle", () => {
+  it("says removing the row takes the dependents with it", () => {
+    expect(dependentsTitle(46)).toContain("46 skills resolve");
+    expect(dependentsTitle(46)).toContain("removing it removes them too");
+  });
+
+  it("frames the count as a floor, never a total (ADR 0027)", () => {
+    // skillmon scans Claude Code's paths alone, so a managing tool's entries for
+    // other agents are dependents it cannot see. The tooltip must not claim
+    // otherwise.
+    expect(dependentsTitle(46)).toContain("At least");
+  });
+
+  it("agrees with itself on the singular", () => {
+    expect(dependentsTitle(1)).toContain("1 skill resolves");
   });
 });
