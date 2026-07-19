@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  alwaysOnDisplay,
   coResidentAlwaysOn,
   dependentsBadge,
   dependentsTitle,
@@ -18,6 +19,7 @@ import {
   skillKey,
   skillNameTitle,
   sortSkills,
+  toggleInSet,
   usageDisplay,
   usageTitle,
   type ScanReport,
@@ -208,6 +210,56 @@ describe("skillKey", () => {
     });
 
     expect(skillKey(before)).toBe(skillKey(after));
+  });
+});
+
+describe("alwaysOnDisplay", () => {
+  it("renders a not-listed skill as a certain 0 with no estimate/reconstructed framing", () => {
+    const s = makeSkill({ name: "x", alwaysOnText: "notListed", alwaysOn: { tokens: 0, exact: true } });
+    expect(alwaysOnDisplay(s)).toEqual({ text: "0", estimate: false, reconstructed: false, notListed: true });
+  });
+
+  it("marks an estimate with a ~ figure and the estimate flag", () => {
+    const s = makeSkill({ name: "x", alwaysOnText: "native", alwaysOn: { tokens: 1234, exact: false } });
+    expect(alwaysOnDisplay(s)).toEqual({ text: "~1,234", estimate: true, reconstructed: false, notListed: false });
+  });
+
+  it("flags always-on text reconstructed from frontmatter", () => {
+    const s = makeSkill({ name: "x", alwaysOnText: "reconstructed", alwaysOn: { tokens: 500, exact: true } });
+    expect(alwaysOnDisplay(s)).toEqual({ text: "500", estimate: false, reconstructed: true, notListed: false });
+  });
+
+  it("renders an exact native figure plainly", () => {
+    const s = makeSkill({ name: "x", alwaysOnText: "native", alwaysOn: { tokens: 4200, exact: true } });
+    expect(alwaysOnDisplay(s)).toEqual({ text: "4,200", estimate: false, reconstructed: false, notListed: false });
+  });
+});
+
+describe("toggleInSet", () => {
+  it("adds a key that is absent", () => {
+    expect(toggleInSet(new Set(), "a")).toEqual(new Set(["a"]));
+  });
+
+  it("removes a key that is present", () => {
+    expect(toggleInSet(new Set(["a", "b"]), "a")).toEqual(new Set(["b"]));
+  });
+
+  it("does not mutate the input set", () => {
+    const before = new Set(["a"]);
+    toggleInSet(before, "b");
+    expect(before).toEqual(new Set(["a"]));
+  });
+
+  it("returns a new set instance, so a reassignment is always tracked", () => {
+    const before = new Set(["a"]);
+    expect(toggleInSet(before, "b")).not.toBe(before);
+  });
+
+  it("keeps independent keys open together (multi-open, not accordion)", () => {
+    let open = new Set<string>();
+    open = toggleInSet(open, "a");
+    open = toggleInSet(open, "b");
+    expect(open).toEqual(new Set(["a", "b"]));
   });
 });
 

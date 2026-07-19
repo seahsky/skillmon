@@ -105,8 +105,10 @@ A true `NSPopover` arrow and a system-owned Windows 11 flyout need custom native
 
 Settled in the grilling pass.
 
-1. **Footprint display** — every row shows the full three-layer breakdown: always-on, on-invoke, and on-demand. No single blended number hides where the cost lives.
-2. **Sort & grouping** — default sort is always-on footprint descending; every layer column is click-to-sort. Flat list, plugin shown as a badge with an opt-in "group by plugin" toggle.
+1. **Footprint display** — a collapsed row shows the always-on headline only; clicking it discloses the full three-layer footprint breakdown (always-on, on-invoke, on-demand), each layer named (ADR 0033, amending this decision).
+   Always-on is the headline because it is the one layer co-resident on every request; on-invoke and on-demand are situational detail, not co-equal columns.
+   Nothing is ever blended — the two disclosed layers are hidden behind a click, not merged into the headline — so no single number hides where the cost lives.
+2. **Sort & grouping** — default sort is always-on footprint descending; the list is click-to-sort by Name and Always-on (ADR 0033: on-invoke and on-demand are inspect-only detail, not list-sort keys, so they lost their sort columns; the pure sort functions still know all four keys). Flat list, plugin shown as a badge with an opt-in "group by plugin" toggle.
 3. **Attributed-usage labeling** — `~` prefix, muted, rendered below the footprint; tooltip "session tokens during this skill, not by it"; cache-read excluded from the number. Sub-agent tokens excluded by default, with an include toggle.
 4. **Toast model** — one global rolling-24h budget on attributed usage, on by default. Per-skill anomaly alerts (a skill running N× its trailing average) available but off by default. The toast names the metric as an estimate.
 5. **Project skills** — every repo's project skills are listed as collapsed per-repo inventory sections. The global always-on total counts personal + enabled-plugin skills + the **active repo's** project skills only (what is actually co-resident now); other repos' project skills are shown but not summed.

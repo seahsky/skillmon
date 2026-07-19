@@ -52,6 +52,12 @@ The basename fallback for a nameless root `SKILL.md` is documented but unreachab
 
 The "restart Claude Code to apply" nudge shipped with #31 (ADR 0007): sticky until dismissed, since a rescan does not restart anyone's session.
 
+**The row now collapses to its always-on figure** (ADR 0033): a collapsed row shows only always-on (the headline "quiet tax on every request"); clicking the row discloses the footprint breakdown — all three layers named, no total (on-demand is a ceiling, ADR 0017).
+This amended UX #1 (all three no longer always-visible; nothing is *blended*, two layers are *disclosed*) and UX #2 (list-sort dropped to Name + Always-on; `sortSkills`/`NUMERIC_VALUE` still hold all four keys, only the on-invoke/on-demand buttons are gone).
+The whole row is the click target and is itself the focusable, keyboard-operable disclosure (`aria-expanded`, Enter/Space); the caret is a visual indicator, the `⋯` stops propagation.
+Rows are multi-open via a pure `toggleInSet` shared with the repo sections, keyed by `skillKey`, pruned to live keys on each load so a reused key never resurrects a row pre-expanded.
+This crystallized the UI context glossary (`src/CONTEXT.md`: Row, Footprint breakdown, Expanded/Collapsed).
+
 **Next up**: plugin *removal* is still unbuilt — it goes through the `claude plugin` CLI rather than an entry move (ADR 0007), so it shares no code with #31's path, and the panel's plugin rows carry a disabled affordance explaining the lock. Windows and signing remain out of MVP.
 
 ## Commands
