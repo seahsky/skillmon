@@ -6,7 +6,10 @@
     disable as autostartDisable,
     isEnabled as autostartIsEnabled,
   } from "@tauri-apps/plugin-autostart";
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
+  import { fly, fade, slide } from "svelte/transition";
+  import { flip } from "svelte/animate";
+  import { cubicOut } from "svelte/easing";
   import {
     coResidentAlwaysOn,
     DEFAULT_SORT,
@@ -133,6 +136,46 @@
   let autostartOn = $state(false);
   let autostartLoading = $state(false);
 
+  // Motion (ADR 0032). The CSS-driven transitions are gated by the media query
+  // in the stylesheet; the JS-driven ones (view-swap fly, details slide, sort
+  // flip, number settle) read `reducedMotion` so a single signal governs both.
+  // Reduced motion does not mean no feedback (§14): opacity-based transitions
+  // shorten to REDUCED_MS rather than vanishing, while transform-based ones
+  // (the sort flip) drop entirely.
+  const CALM_MS = 200;
+  const REDUCED_MS = 120;
+  let reducedMotion = $state(false);
+  let mounted = $state(false);
+  const motionDur = $derived(reducedMotion ? REDUCED_MS : CALM_MS);
+
+  // View-swaps are an iOS push/pop (ADR 0032). Direction is a property of the
+  // element, not of which way we navigated: the deeper pane always enters from
+  // and exits to the right; the root table always from and to the left. So a
+  // push recedes the table left while the pane slides in from the right, and a
+  // pop reverses it, with nothing to track. reduced-motion collapses the travel
+  // to a cross-fade (x: 0, fade opacity).
+  const swipe = (side: number) => ({
+    x: reducedMotion ? 0 : side,
+    opacity: reducedMotion ? 0 : 1,
+    duration: motionDur,
+    easing: cubicOut,
+  });
+
+  // Sort re-order is the one user-caused list motion that animates (ADR 0032):
+  // `flipMs` is the calm duration during a sort click and 0 at every other time,
+  // so a background rescan (which also reorders the keyed list) stays instant.
+  let flipMs = $state(0);
+
+  // Repo sections are a controlled disclosure rather than a native details
+  // element so their height can slide open (ADR 0032). Seeded with the active
+  // repo once.
+  let expandedRepos = $state<Set<string>>(new Set());
+  let seededRepos = false;
+
+  // Measured height of the sticky top chrome, so the table's own sticky column
+  // header parks directly beneath it however the controls bar wraps.
+  let chromeH = $state(0);
+
   const apiKeyPresent = $derived(report?.apiKeyPresent ?? false);
   const trimmedKey = $derived(normalizeApiKey(keyInput));
   const estimatedLayers = $derived(report ? estimatedLayerCount(report) : 0);
@@ -165,8 +208,17 @@
   async function load() {
     loading = true;
     error = null;
+    // A rescan reorders the same keyed list, but only a user sort should animate
+    // (ADR 0032): force flip off before the report swaps in.
+    flipMs = 0;
     try {
       report = await invoke<ScanReport>("list_skills", { includeSubagents, usageWindowHours: windowHours });
+      // Open the active repo's section by default, but only the first time we see
+      // one, so a later rescan never re-opens a section the user collapsed.
+      if (report?.activeRepoPath && !seededRepos) {
+        expandedRepos = new Set([report.activeRepoPath]);
+        seededRepos = true;
+      }
     } catch (e) {
       error = String(e);
     } finally {
@@ -295,11 +347,29 @@
   // Toggle sort: same column flips direction; a new column starts descending
   // for numbers (heaviest first) and ascending for the name (A→Z).
   function onSort(column: SortColumn) {
+    // Arm the FLIP for this one reorder, then disarm it after the DOM flush so no
+    // later reorder (a rescan, a future client-side re-sort) animates un-caused
+    // motion (ADR 0032). The flip captures its duration when it triggers during
+    // this flush, so resetting on the next tick cannot cut the running animation.
+    // A transform-based move, so reduced motion drops it rather than shortening.
+    flipMs = reducedMotion ? 0 : CALM_MS;
     if (sort.column === column) {
       sort = { column, direction: sort.direction === "asc" ? "desc" : "asc" };
     } else {
       sort = { column, direction: column === "name" ? "asc" : "desc" };
     }
+    tick().then(() => (flipMs = 0));
+  }
+
+  function isRepoOpen(path: string): boolean {
+    return expandedRepos.has(path);
+  }
+
+  function toggleRepo(path: string) {
+    const next = new Set(expandedRepos);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
+    expandedRepos = next;
   }
 
   function ariaSort(column: SortColumn): "ascending" | "descending" | "none" {
@@ -403,7 +473,8 @@
     loadAutostart();
   }
 
-  function closeSettings() {
+  // Both sub-views pop back to the table (ADR 0032).
+  function backToTable() {
     view = "table";
   }
 
@@ -433,6 +504,14 @@
 
   onMount(() => {
     load();
+    // Honor prefers-reduced-motion live (ADR 0032). `mounted` gates the
+    // number-settle intro so it never fires on the first paint, only when a
+    // pending ceiling later resolves.
+    const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    reducedMotion = motionQuery.matches;
+    const onMotionChange = () => (reducedMotion = motionQuery.matches);
+    motionQuery.addEventListener("change", onMotionChange);
+    mounted = true;
     // The registry watcher (ADR 0019) fires this when a skill/plugin surface
     // changes; re-scan so the list doesn't go stale. Enablement is read at
     // session start, so this is a freshness nudge, not a live-state mirror.
@@ -441,14 +520,25 @@
     // the pending ceilings; re-scan so the "…" cells resolve to real numbers.
     const unlistenOnDemand = listen("on-demand-ready", () => load());
     return () => {
+      motionQuery.removeEventListener("change", onMotionChange);
       unlistenRegistry.then((off) => off());
       unlistenOnDemand.then((off) => off());
     };
   });
 </script>
 
-{#snippet layerCell(layer: LayerReport, title: string, reconstructed = false)}
-  <div class="col num" role="cell" class:estimate={!layer.exact} class:reconstructed title={title}>
+{#snippet layerCell(layer: LayerReport, title: string, reconstructed = false, settle = false)}
+  <!-- `settle` fades a resolved figure in (ADR 0032), used only by the on-demand
+       cell so the fade marks a pending "…" turning into a number and nothing
+       else. Gated on `mounted` too, so it never plays on the first data paint. -->
+  <div
+    class="col num"
+    role="cell"
+    class:estimate={!layer.exact}
+    class:reconstructed
+    title={title}
+    in:fade={{ duration: settle && mounted ? motionDur : 0 }}
+  >
     {layerDisplay(layer)}
   </div>
 {/snippet}
@@ -462,7 +552,7 @@
 {/snippet}
 
 {#snippet tableHeader()}
-  <div class="row header" role="row">
+  <div class="row header" role="row" style="top: {chromeH}px">
     <div class="col name colhead" role="columnheader" aria-sort={ariaSort("name")}>
       <button class="sort-btn" class:sorted={sort.column === "name"} onclick={() => onSort("name")}>
         Skill{#if sort.column === "name"}<span class="ind">{sort.direction === "desc" ? "▼" : "▲"}</span>{/if}
@@ -524,7 +614,7 @@
       {#if skill.onDemand === null}
         <div class="col num pending" role="cell" title={onDemandTitle(null)}>…</div>
       {:else}
-        {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand))}
+        {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand), false, true)}
       {/if}
       <div class="col actions" role="cell">
         {#if skill.id.kind === "plugin"}
@@ -568,11 +658,14 @@
 
 <main>
   {#if view === "settings"}
-    <header class="topbar">
-      <button class="icon-btn back" onclick={closeSettings} aria-label="Back to skills" title="Back">‹</button>
-      <h1>Settings</h1>
-      <span class="spacer"></span>
-    </header>
+    <div class="view-branch pane" in:fly={swipe(360)} out:fly={swipe(360)}>
+      <div class="chrome-top">
+        <header class="topbar">
+          <button class="icon-btn back" onclick={backToTable} aria-label="Back to skills" title="Back">‹</button>
+          <h1>Settings</h1>
+          <span class="spacer"></span>
+        </header>
+      </div>
 
     <section class="settings">
       <h2 class="settings-heading">API key</h2>
@@ -672,12 +765,16 @@
         Toggle the panel from anywhere with <kbd>⌘⇧K</kbd>.
       </p>
     </section>
+    </div>
   {:else if view === "removed"}
-    <header class="topbar">
-      <button class="icon-btn back" onclick={() => (view = "table")} aria-label="Back to skills" title="Back">‹</button>
-      <h1>Removed</h1>
-      <span class="spacer"></span>
-    </header>
+    <div class="view-branch pane" in:fly={swipe(360)} out:fly={swipe(360)}>
+      <div class="chrome-top">
+        <header class="topbar">
+          <button class="icon-btn back" onclick={backToTable} aria-label="Back to skills" title="Back">‹</button>
+          <h1>Removed</h1>
+          <span class="spacer"></span>
+        </header>
+      </div>
 
     <section class="settings removed-pane">
       {#if removedError}
@@ -758,8 +855,11 @@
         </p>
       {/if}
     </section>
+    </div>
   {:else}
-    <header class="topbar">
+    <div class="view-branch root" in:fly={swipe(-360)} out:fly={swipe(-360)}>
+      <div class="chrome-top" bind:clientHeight={chromeH}>
+        <header class="topbar">
       <h1>Skills</h1>
       <div class="topbar-right">
         <button class="rescan" onclick={openRemoved} title="Skills you have disabled or removed">
@@ -818,6 +918,7 @@
         <span class="active-repo" title={activeRepoPath}>active: {repoBasename(activeRepoPath)}</span>
       {/if}
     </div>
+      </div>
 
     {#if restartNudge}
       <!-- Every mutation applies to new sessions only: Claude Code reads
@@ -875,12 +976,16 @@
             {#each pluginGroups as group (group.key)}
               <div class="group-label" role="row"><span role="cell">{group.label}</span></div>
               {#each group.skills as skill (skillKey(skill))}
-                {@render skillRow(skill)}
+                <div class="flip-item" role="presentation" animate:flip={{ duration: flipMs, easing: cubicOut }}>
+                  {@render skillRow(skill)}
+                </div>
               {/each}
             {/each}
           {:else}
             {#each mainRows as skill (skillKey(skill))}
-              {@render skillRow(skill)}
+              <div class="flip-item" role="presentation" animate:flip={{ duration: flipMs, easing: cubicOut }}>
+                {@render skillRow(skill)}
+              </div>
             {/each}
           {/if}
         </div>
@@ -889,18 +994,34 @@
       {#if repoSections.length}
         <section class="repo-sections" aria-label="Project skills by repo">
           {#each repoSections as repo (repo.repoPath)}
-            <details class="repo-section" open={repo.isActive}>
-              <summary>
+            <!-- A controlled disclosure rather than a native details element, so
+                 the section height can slide open/closed (ADR 0032). aria-expanded
+                 on the summary button keeps it a real disclosure for assistive tech. -->
+            <div class="repo-section" class:open={isRepoOpen(repo.repoPath)}>
+              <button
+                class="repo-summary"
+                aria-expanded={isRepoOpen(repo.repoPath)}
+                onclick={() => toggleRepo(repo.repoPath)}
+              >
                 <span class="repo-summary-name" title={repo.repoPath}>{repo.repoName}</span>
                 <span class="repo-count">{repo.skills.length} {repo.skills.length === 1 ? "skill" : "skills"}</span>
                 {#if repo.isActive}<span class="badge project">active</span>{/if}
-              </summary>
-              <div class="table" role="table" aria-label={`Project skills in ${repo.repoName}`}>
-                {#each repo.skills as skill (skillKey(skill))}
-                  {@render skillRow(skill, true)}
-                {/each}
-              </div>
-            </details>
+              </button>
+              {#if isRepoOpen(repo.repoPath)}
+                <div
+                  class="table"
+                  role="table"
+                  aria-label={`Project skills in ${repo.repoName}`}
+                  transition:slide={{ duration: motionDur, easing: cubicOut }}
+                >
+                  {#each repo.skills as skill (skillKey(skill))}
+                    <div class="flip-item" role="presentation" animate:flip={{ duration: flipMs, easing: cubicOut }}>
+                      {@render skillRow(skill, true)}
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+            </div>
           {/each}
         </section>
       {/if}
@@ -922,12 +1043,17 @@
         <span>On-demand is a ceiling.</span>
       </footer>
     {/if}
+    </div>
   {/if}
 </main>
 
 {#if planLoading || plan || planError}
   <!-- The removal dialog. A modal, unlike the settings view-swap, because it asks
        one question about one row's files and must not be wandered away from. -->
+  <!-- The sheet materializes up from its bottom anchor and dims the panel behind
+       it (ADR 0032, §12). Svelte's transitions reverse from the live value when
+       the sheet is dismissed mid-open, which is the interruptibility §3 asked
+       for. reduced-motion drops the travel (y: 0) and the scrim just fades. -->
   <div
     class="scrim"
     role="button"
@@ -935,8 +1061,15 @@
     aria-label="Cancel"
     onclick={closeRemoval}
     onkeydown={(e) => e.key === "Escape" && closeRemoval()}
+    transition:fade={{ duration: motionDur }}
   ></div>
-  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="removal-title">
+  <div
+    class="dialog"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="removal-title"
+    transition:fly={{ y: reducedMotion ? 0 : 400, opacity: reducedMotion ? 0 : 1, duration: motionDur, easing: cubicOut }}
+  >
     {#if planLoading}
       <p class="hint">Working out what this removes…</p>
     {:else if plan}
@@ -1013,6 +1146,21 @@
     --accent: #396cd8;
     --badge-bg: #ececef;
     --estimate-fg: #8a6d00;
+    /* Motion (ADR 0032): one calm, critically-damped-feeling curve for every
+       discrete transition. This is ease-out-cubic, the CSS twin of the JS
+       `cubicOut` the Svelte transitions use, so markup and stylesheet share one
+       curve. No overshoot token exists on purpose, since nothing here carries
+       momentum (§4). --dur is the calm duration; --dur-fast is the shorter
+       press/hover feedback that must feel instant (§1). */
+    --ease-calm: cubic-bezier(0.33, 1, 0.68, 1);
+    --dur: 200ms;
+    --dur-fast: 120ms;
+    /* Translucent chrome material over the vibrancy window (ADR 0032, §12). The
+       content grid stays on solid --bg; only the floating chrome frosts. */
+    --chrome-bg: rgba(247, 247, 248, 0.72);
+    --chrome-blur: saturate(180%) blur(20px);
+    /* The soft scroll-edge under the sticky chrome, replacing a hard 1px rule. */
+    --edge-fade: rgba(0, 0, 0, 0.06);
     font-family:
       -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
     font-size: 13px;
@@ -1023,9 +1171,50 @@
   main {
     background: var(--bg);
     min-height: 100vh;
-    padding: 8px 0 0;
     display: flex;
     flex-direction: column;
+  }
+
+  /* Each view is a fixed, self-scrolling surface so the three can overlap during
+     a push/pop slide (ADR 0032). The deeper pane sits above the root table, so a
+     push shows the pane arriving over the table and a pop shows it leaving to
+     reveal the table beneath. That is iOS layering with a static z-index. */
+  .view-branch {
+    position: fixed;
+    inset: 0;
+    z-index: 1;
+    background: var(--bg);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+  .view-branch.pane {
+    z-index: 2;
+  }
+
+  /* The sticky top chrome (topbar + controls): a translucent material the
+     content scrolls under (ADR 0032, §12). Its height is measured into
+     `chromeH` so the table's own column header can park directly below it. */
+  .chrome-top {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    padding-top: 8px;
+    background: var(--chrome-bg);
+    backdrop-filter: var(--chrome-blur);
+    -webkit-backdrop-filter: var(--chrome-blur);
+  }
+  /* Scroll-edge fade instead of a hard divider (ADR 0032, §12): a short gradient
+     where the chrome meets the content below it. */
+  .chrome-top::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -6px;
+    height: 6px;
+    background: linear-gradient(to bottom, var(--edge-fade), transparent);
+    pointer-events: none;
   }
 
   .topbar {
@@ -1034,13 +1223,21 @@
     justify-content: space-between;
     gap: 8px;
     padding: 0 12px 8px;
-    border-bottom: 1px solid var(--line);
   }
 
+  /* Headings take slightly negative tracking and tighter leading; body stays at
+     0 with its 1.4 line-height (ADR 0032, §15: both tracking and leading are
+     size-specific, and larger text reads too loose at the body's values). */
   h1 {
     font-size: 14px;
     font-weight: 600;
+    letter-spacing: -0.01em;
+    line-height: 1.2;
     margin: 0;
+  }
+  h2 {
+    letter-spacing: -0.01em;
+    line-height: 1.2;
   }
 
   .topbar-right {
@@ -1057,7 +1254,6 @@
     align-items: center;
     gap: 8px;
     padding: 6px 12px;
-    border-bottom: 1px solid var(--line);
   }
   .controls-spacer {
     flex: 1 1 auto;
@@ -1122,10 +1318,18 @@
     border-radius: 6px;
     padding: 3px 8px;
     cursor: pointer;
+    transition:
+      border-color var(--dur-fast) var(--ease-calm),
+      color var(--dur-fast) var(--ease-calm),
+      transform var(--dur-fast) var(--ease-calm);
   }
   button:hover:not(:disabled) {
     border-color: var(--accent);
     color: var(--accent);
+  }
+  /* Respond on the press, not the release (ADR 0032, §1). */
+  button:active:not(:disabled) {
+    transform: scale(0.97);
   }
   button:disabled {
     color: var(--faint);
@@ -1213,6 +1417,9 @@
   /* Hover and liveness belong to the skill, not to one of the rows it renders
      as: a managed skill is a row plus its manager-root row, and highlighting or
      dimming half of one would read as two unrelated things. */
+  .skill-group {
+    transition: background var(--dur-fast) var(--ease-calm);
+  }
   .skill-group:hover {
     background: rgba(57, 108, 216, 0.06);
   }
@@ -1400,27 +1607,35 @@
   .repo-section {
     border-bottom: 1px solid var(--line);
   }
-  .repo-section > summary {
+  /* The disclosure summary is a full-width button now, not a <summary>, so its
+     section height can animate (ADR 0032). Button chrome is reset to keep the
+     original summary look. */
+  .repo-summary {
     display: flex;
     align-items: center;
     gap: 8px;
+    width: 100%;
     padding: 7px 12px;
+    border: none;
+    border-radius: 0;
+    background: none;
+    text-align: left;
     cursor: pointer;
     font-size: 11px;
     color: var(--muted);
-    list-style: none;
     user-select: none;
   }
-  .repo-section > summary::-webkit-details-marker {
-    display: none;
+  .repo-summary:hover:not(:disabled) {
+    color: var(--muted);
   }
-  .repo-section > summary::before {
+  .repo-summary::before {
     content: "▸";
     font-size: 9px;
     color: var(--faint);
+    transition: transform var(--dur) var(--ease-calm);
   }
-  .repo-section[open] > summary::before {
-    content: "▾";
+  .repo-section.open .repo-summary::before {
+    transform: rotate(90deg);
   }
   .repo-summary-name {
     font-weight: 600;
@@ -1434,7 +1649,14 @@
     flex: none;
   }
 
+  /* The always-on total is a bottom chrome layer the content scrolls under
+     (ADR 0032, §12), so it stays visible down a long list. `margin-top: auto`
+     keeps it pinned to the bottom when the list is short. */
   .legend {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    margin-top: auto;
     display: flex;
     flex-wrap: wrap;
     gap: 12px;
@@ -1442,6 +1664,20 @@
     padding: 8px 12px 10px;
     color: var(--faint);
     font-size: 10px;
+    background: var(--chrome-bg);
+    backdrop-filter: var(--chrome-blur);
+    -webkit-backdrop-filter: var(--chrome-blur);
+  }
+  /* Scroll-edge fade above the sticky legend (mirror of the top chrome). */
+  .legend::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: -6px;
+    height: 6px;
+    background: linear-gradient(to top, var(--edge-fade), transparent);
+    pointer-events: none;
   }
   .total {
     color: var(--muted);
@@ -1590,6 +1826,11 @@
     opacity: 0;
     line-height: 1;
     cursor: pointer;
+    /* Fade in on hover/focus rather than snapping (ADR 0032, §1). */
+    transition:
+      opacity var(--dur) var(--ease-calm),
+      color var(--dur-fast) var(--ease-calm),
+      transform var(--dur-fast) var(--ease-calm);
   }
   .skill-group:hover .row-btn,
   .row-btn:focus-visible {
@@ -1734,11 +1975,16 @@
     color: var(--fg);
   }
 
-  /* The removal dialog. */
+  /* The removal dialog. Its z-index clears the view-branches (max z-index 2), so
+     the sheet always sits above the panel behind it. The scrim dims and softly
+     blurs that panel to focus attention on the sheet (ADR 0032, §12). */
   .scrim {
     position: fixed;
     inset: 0;
+    z-index: 10;
     background: rgba(0, 0, 0, 0.28);
+    backdrop-filter: blur(2px);
+    -webkit-backdrop-filter: blur(2px);
     border: none;
     padding: 0;
   }
@@ -1747,9 +1993,12 @@
     inset: 12px;
     top: auto;
     bottom: 12px;
+    z-index: 11;
     max-height: calc(100vh - 24px);
     overflow-y: auto;
-    background: var(--bg);
+    background: var(--chrome-bg);
+    backdrop-filter: var(--chrome-blur);
+    -webkit-backdrop-filter: var(--chrome-blur);
     border: 1px solid var(--line);
     border-radius: 10px;
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
@@ -1920,6 +2169,8 @@
       --accent: #6ea0ff;
       --badge-bg: #2c2c30;
       --estimate-fg: #e0b64a;
+      --chrome-bg: rgba(30, 30, 32, 0.72);
+      --edge-fade: rgba(0, 0, 0, 0.3);
     }
     .warnings {
       background: #2a2610;
@@ -1963,6 +2214,66 @@
     .settings button.danger {
       color: #ff9a90;
       border-color: #5a3a37;
+    }
+  }
+
+  /* Reduced-motion baseline (ADR 0032, §14). Reduced motion is a gentler
+     equivalent, not the absence of feedback: the JS transitions shorten to
+     REDUCED_MS via `reducedMotion`, and here the CSS-driven fades cap at the same
+     120ms while the transform-based bits (the press scale, the disclosure marker
+     rotation) drop out entirely. */
+  @media (prefers-reduced-motion: reduce) {
+    button,
+    .skill-group,
+    .row-btn,
+    .repo-summary::before {
+      transition-duration: 120ms !important;
+    }
+    button:active:not(:disabled) {
+      transform: none;
+    }
+    .repo-section.open .repo-summary::before {
+      transform: none;
+    }
+  }
+
+  /* Reduced-transparency baseline (ADR 0032, §14): the frosted chrome goes solid.
+     The scrim keeps its dim but drops the blur. */
+  @media (prefers-reduced-transparency: reduce) {
+    .chrome-top,
+    .legend,
+    .dialog {
+      background: var(--bg);
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+    }
+    .scrim {
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+    }
+  }
+
+  /* Increased-contrast baseline (ADR 0032, §14): near-solid surfaces with a
+     firmer border so chrome and content stay clearly separated. */
+  @media (prefers-contrast: more) {
+    :root {
+      --line: #9a9aa0;
+    }
+    .chrome-top,
+    .legend {
+      background: var(--bg);
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+    }
+    .chrome-top {
+      border-bottom: 1px solid var(--line);
+    }
+    .chrome-top::after,
+    .legend::before {
+      display: none;
+    }
+    .legend {
+      border-top: 1px solid var(--line);
     }
   }
 </style>
