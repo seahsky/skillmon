@@ -11,6 +11,7 @@
   import { flip } from "svelte/animate";
   import { cubicOut } from "svelte/easing";
   import {
+    alwaysOnDisplay,
     coResidentAlwaysOn,
     DEFAULT_SORT,
     dependentsBadge,
@@ -28,6 +29,7 @@
     skillKey,
     skillNameTitle,
     sortSkills,
+    toggleInSet,
     usageDisplay,
     usageTitle,
     type LayerReport,
@@ -137,15 +139,14 @@
   let autostartLoading = $state(false);
 
   // Motion (ADR 0032). The CSS-driven transitions are gated by the media query
-  // in the stylesheet; the JS-driven ones (view-swap fly, details slide, sort
-  // flip, number settle) read `reducedMotion` so a single signal governs both.
+  // in the stylesheet; the JS-driven ones (view-swap fly, details/breakdown
+  // slide, sort flip) read `reducedMotion` so a single signal governs both.
   // Reduced motion does not mean no feedback (§14): opacity-based transitions
   // shorten to REDUCED_MS rather than vanishing, while transform-based ones
   // (the sort flip) drop entirely.
   const CALM_MS = 200;
   const REDUCED_MS = 120;
   let reducedMotion = $state(false);
-  let mounted = $state(false);
   const motionDur = $derived(reducedMotion ? REDUCED_MS : CALM_MS);
 
   // View-swaps are an iOS push/pop (ADR 0032). Direction is a property of the
@@ -171,6 +172,13 @@
   // repo once.
   let expandedRepos = $state<Set<string>>(new Set());
   let seededRepos = false;
+
+  // Per-row footprint breakdown (ADR 0033). A collapsed row shows only the
+  // always-on headline; expanding it discloses all three layers. Multi-open, and
+  // keyed by `skillKey` so the state survives a rescan (the keyed list re-renders
+  // but a row that is still present keeps its open/closed state, and a vanished
+  // skill simply drops its key) — the same Set semantics as `expandedRepos`.
+  let expandedSkills = $state<Set<string>>(new Set());
 
   // Measured height of the sticky top chrome, so the table's own sticky column
   // header parks directly beneath it however the controls bar wraps.
@@ -219,6 +227,12 @@
         expandedRepos = new Set([report.activeRepoPath]);
         seededRepos = true;
       }
+      // Drop expansion state for skills the scan no longer returns (ADR 0033):
+      // otherwise a later reused skillKey (disable→re-enable) would resurrect a
+      // row pre-expanded, against the all-collapsed default. A still-present row
+      // keeps its state, since its key survives the intersection.
+      const liveKeys = new Set((report?.skills ?? []).map(skillKey));
+      expandedSkills = new Set([...expandedSkills].filter((k) => liveKeys.has(k)));
     } catch (e) {
       error = String(e);
     } finally {
@@ -366,10 +380,15 @@
   }
 
   function toggleRepo(path: string) {
-    const next = new Set(expandedRepos);
-    if (next.has(path)) next.delete(path);
-    else next.add(path);
-    expandedRepos = next;
+    expandedRepos = toggleInSet(expandedRepos, path);
+  }
+
+  function isSkillOpen(skill: SkillReport): boolean {
+    return expandedSkills.has(skillKey(skill));
+  }
+
+  function toggleSkill(skill: SkillReport) {
+    expandedSkills = toggleInSet(expandedSkills, skillKey(skill));
   }
 
   function ariaSort(column: SortColumn): "ascending" | "descending" | "none" {
@@ -504,14 +523,11 @@
 
   onMount(() => {
     load();
-    // Honor prefers-reduced-motion live (ADR 0032). `mounted` gates the
-    // number-settle intro so it never fires on the first paint, only when a
-    // pending ceiling later resolves.
+    // Honor prefers-reduced-motion live (ADR 0032).
     const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
     reducedMotion = motionQuery.matches;
     const onMotionChange = () => (reducedMotion = motionQuery.matches);
     motionQuery.addEventListener("change", onMotionChange);
-    mounted = true;
     // The registry watcher (ADR 0019) fires this when a skill/plugin surface
     // changes; re-scan so the list doesn't go stale. Enablement is read at
     // session start, so this is a freshness nudge, not a live-state mirror.
@@ -527,30 +543,6 @@
   });
 </script>
 
-{#snippet layerCell(layer: LayerReport, title: string, reconstructed = false, settle = false)}
-  <!-- `settle` fades a resolved figure in (ADR 0032), used only by the on-demand
-       cell so the fade marks a pending "…" turning into a number and nothing
-       else. Gated on `mounted` too, so it never plays on the first data paint. -->
-  <div
-    class="col num"
-    role="cell"
-    class:estimate={!layer.exact}
-    class:reconstructed
-    title={title}
-    in:fade={{ duration: settle && mounted ? motionDur : 0 }}
-  >
-    {layerDisplay(layer)}
-  </div>
-{/snippet}
-
-{#snippet numHeader(column: SortColumn, label: string)}
-  <div class="col num colhead" role="columnheader" aria-sort={ariaSort(column)}>
-    <button class="sort-btn" class:sorted={sort.column === column} onclick={() => onSort(column)}>
-      {#if sort.column === column}<span class="ind">{sort.direction === "desc" ? "▼" : "▲"}</span>{/if}{label}
-    </button>
-  </div>
-{/snippet}
-
 {#snippet tableHeader()}
   <div class="row header" role="row" style="top: {chromeH}px">
     <div class="col name colhead" role="columnheader" aria-sort={ariaSort("name")}>
@@ -558,24 +550,55 @@
         Skill{#if sort.column === "name"}<span class="ind">{sort.direction === "desc" ? "▼" : "▲"}</span>{/if}
       </button>
     </div>
-    {@render numHeader("alwaysOn", "Always-on")}
-    {@render numHeader("onInvoke", "On-invoke")}
-    {@render numHeader("onDemand", "On-demand")}
-    <!-- Unlabeled and unsortable: it holds each row's remove affordance, and a
-         header over it would read as a fifth sortable figure. Present rather
-         than omitted so the grid's columns line up with the rows'. -->
-    <div class="col actions colhead" role="columnheader"></div>
+    <!-- The always-on column keeps its sort control but drops its label (ADR
+         0033): the number is the list's one headline figure and the drawer names
+         it in full, so the header carries only the sort chevron. It shows the
+         active direction when sorted and a neutral ↕ otherwise, so the control is
+         always visible even when the list is sorted by name. -->
+    <div class="col num colhead" role="columnheader" aria-sort={ariaSort("alwaysOn")}>
+      <button
+        class="sort-btn"
+        class:sorted={sort.column === "alwaysOn"}
+        onclick={() => onSort("alwaysOn")}
+        title="Sort by always-on footprint"
+        aria-label="Sort by always-on footprint"
+      >
+        {#if sort.column === "alwaysOn"}<span class="ind">{sort.direction === "desc" ? "▼" : "▲"}</span>{:else}<span class="ind neutral">↕</span>{/if}
+      </button>
+    </div>
+    <!-- Unlabeled and unsortable: it holds each row's caret and remove
+         affordance. Present rather than omitted so the grid's columns line up
+         with the rows'. -->
+    <div class="col controls colhead" role="columnheader"></div>
   </div>
 {/snippet}
 
 {#snippet skillRow(skill: SkillReport, inRepoSection = false)}
   {@const dependents = dependentsBadge(skill.providesFor)}
+  {@const ao = alwaysOnDisplay(skill)}
   <!-- A managed skill renders as two rows (itself, then its manager root), and
        `rowgroup` is what ties them together: it keeps the path from reading as a
        standalone row to a screen reader, and gives hover one element to light up
        instead of highlighting half a skill. -->
   <div class="skill-group" role="rowgroup" class:inactive={!skill.live}>
-    <div class="row" role="row" class:has-manager={!!skill.managerRoot}>
+    <!-- The whole row is the disclosure control for its footprint breakdown (ADR
+         0033): clickable, focusable, and keyboard-operable (Enter/Space), with
+         aria-expanded on the row itself; the caret is a visual indicator only.
+         The key guard fires only for a key event on the row itself, so the remove
+         button's own activation bubbles up without also toggling the row. -->
+    <div
+      class="row"
+      role="row"
+      tabindex="0"
+      aria-expanded={isSkillOpen(skill)}
+      onclick={() => toggleSkill(skill)}
+      onkeydown={(e) => {
+        if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault();
+          toggleSkill(skill);
+        }
+      }}
+    >
       <div class="col name" role="cell">
         <div class="name-line">
           <span class="skill-name" title={skillNameTitle(skill)}>{skill.id.name}</span>
@@ -603,20 +626,19 @@
         {/if}
       </div>
 
-      {#if skill.alwaysOnText === "notListed"}
-        <!-- A real 0, not the "…" a pending ceiling gets nor an em dash: this
-             cost is known to be nothing, not unknown (issue #24). -->
-        <div class="col num not-listed" role="cell" title={alwaysOnTitle(skill)}>0</div>
-      {:else}
-        {@render layerCell(skill.alwaysOn, alwaysOnTitle(skill), skill.alwaysOnText === "reconstructed")}
-      {/if}
-      {@render layerCell(skill.onInvoke, layerTitle(skill.onInvoke))}
-      {#if skill.onDemand === null}
-        <div class="col num pending" role="cell" title={onDemandTitle(null)}>…</div>
-      {:else}
-        {@render layerCell(skill.onDemand, onDemandTitle(skill.onDemand), false, true)}
-      {/if}
-      <div class="col actions" role="cell">
+      <!-- The one figure a collapsed row shows (ADR 0033). A not-listed skill's
+           `0` is a certain zero, not the "…" a pending ceiling gets (issue #24);
+           `alwaysOnDisplay` decides the value and flags once so this cell and the
+           breakdown line below cannot drift. -->
+      <div
+        class="col num"
+        role="cell"
+        class:estimate={ao.estimate}
+        class:reconstructed={ao.reconstructed}
+        class:not-listed={ao.notListed}
+        title={alwaysOnTitle(skill)}
+      >{ao.text}</div>
+      <div class="col controls" role="cell">
         {#if skill.id.kind === "plugin"}
           <!-- Plugin-locked: you cannot remove one skill, only the whole plugin
                (DESIGN.md), and that goes through the `claude plugin` CLI rather
@@ -631,22 +653,63 @@
         {:else}
           <button
             class="row-btn"
-            onclick={() => openRemoval(skill)}
+            onclick={(e) => { e.stopPropagation(); openRemoval(skill); }}
             aria-label={`Remove ${skill.id.name}`}
             title="Disable or remove this skill"
           >⋯</button>
         {/if}
+        <!-- Visual indicator only: the row is the real disclosure control, so the
+             caret is aria-hidden and carries no separate click of its own. -->
+        <span class="caret" class:open={isSkillOpen(skill)} aria-hidden="true">{isSkillOpen(skill) ? "▾" : "▸"}</span>
       </div>
     </div>
 
+    {#if isSkillOpen(skill)}
+      <!-- The footprint breakdown (ADR 0033): the collapsed row shows always-on
+           only; expanding discloses all three layers, each named so the breakdown
+           is a complete card. No total — on-demand is a ceiling that never folds
+           into the headline (ADR 0017), so the three do not sum. Sits directly
+           under the row it describes, above the manager-root footer. -->
+      <div class="breakdown" role="row" transition:slide={{ duration: motionDur, easing: cubicOut }}>
+        <div class="bd" role="cell">
+          <div class="bd-line">
+            <span class="bd-label">Always-on</span>
+            <span
+              class="bd-value"
+              class:estimate={ao.estimate}
+              class:reconstructed={ao.reconstructed}
+              class:not-listed={ao.notListed}
+              title={alwaysOnTitle(skill)}
+            >{ao.text}</span>
+          </div>
+          <div class="bd-line">
+            <span class="bd-label">On-invoke</span>
+            <span class="bd-value" class:estimate={!skill.onInvoke.exact} title={layerTitle(skill.onInvoke)}>
+              {layerDisplay(skill.onInvoke)}
+            </span>
+          </div>
+          <div class="bd-line">
+            <span class="bd-label">On-demand <span class="bd-gloss">ceiling</span></span>
+            {#if skill.onDemand === null}
+              <span class="bd-value pending" title={onDemandTitle(null)}>…</span>
+            {:else}
+              <span class="bd-value" class:estimate={!skill.onDemand.exact} title={onDemandTitle(skill.onDemand)}>
+                {layerDisplay(skill.onDemand)}
+              </span>
+            {/if}
+          </div>
+        </div>
+      </div>
+    {/if}
+
     {#if skill.managerRoot}
       <!-- The path, elided but never renamed: no basename rule survives a real
-           machine (ADR 0026). A row of its own, rather than a fifth cell or a
+           machine (ADR 0026). A row of its own, rather than an extra cell or a
            line inside the name cell: a real manager root is a deep path, the
            name column cannot hold one without eliding away the very segment that
-           names the manager, and a fifth cell would make the row ragged against
-           a four-column header. "in" because a bare path under a row named
-           `ship` would read as `ship`'s own directory, which it is not. -->
+           names the manager, and an extra cell would make the row ragged against
+           the header. "in" because a bare path under a row named `ship` would
+           read as `ship`'s own directory, which it is not. -->
       <div class="manager-row" role="row">
         <span class="manager" role="cell" title={managerRootTitle(skill.managerRoot)}>
           in {managerRootDisplay(skill.managerRoot)}
@@ -1393,15 +1456,21 @@
 
   .row {
     display: grid;
-    /* The trailing 22px is the remove affordance's column. Fixed, and narrow
-       enough that it costs the name column almost nothing: the three figures are
-       what the panel is for, and an action column that pushed them around would
-       be paying for a button with the data. */
-    grid-template-columns: minmax(0, 1fr) 84px 84px 84px 22px;
+    /* Only the always-on headline shows in a collapsed row (ADR 0033); the other
+       two layers move into the breakdown, which frees the name column ~160px on
+       the 400px panel. The trailing 46px holds the caret and the hover remove
+       affordance. */
+    grid-template-columns: minmax(0, 1fr) 72px 46px;
     align-items: center;
     gap: 4px;
     padding: 5px 12px;
-    border-bottom: 1px solid var(--line);
+    cursor: pointer;
+  }
+  /* The row is the focusable disclosure control (ADR 0033), so keyboard focus
+     has to be visible. Inset so the ring never clips at the panel's edge. */
+  .row:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
   .row.header {
     position: sticky;
@@ -1413,11 +1482,20 @@
     font-size: 11px;
     font-weight: 600;
     z-index: 1;
+    cursor: default;
+    /* The header is not inside a skill-group, so it draws its own separator
+       (skill rows get theirs from the group). */
+    border-bottom: 1px solid var(--line);
   }
   /* Hover and liveness belong to the skill, not to one of the rows it renders
      as: a managed skill is a row plus its manager-root row, and highlighting or
      dimming half of one would read as two unrelated things. */
   .skill-group {
+    /* The separator belongs to the whole skill, not to any one of the rows it
+       renders as (ADR 0033): a skill is its row plus, when open, the breakdown,
+       plus, when managed, the manager-root row. One border under the group keeps
+       those reading as one unit, with no rule drawn between them. */
+    border-bottom: 1px solid var(--line);
     transition: background var(--dur-fast) var(--ease-calm);
   }
   .skill-group:hover {
@@ -1484,19 +1562,12 @@
     max-width: 100%;
   }
   /* The manager root's continuation row: the path gets the whole row's width
-     instead of the name column's ~112px. The width IS the design: at this size
-     a real manager root fits whole, and nothing has to guess which of its
-     segments identifies the manager. It carries the border its row gave up, so
-     the two read as one row and no rule is drawn between a skill and its path. */
+     instead of the name column's width. The width IS the design: at this size a
+     real manager root fits whole, and nothing has to guess which of its segments
+     identifies the manager. No border of its own — the skill-group draws the one
+     separator under the whole unit. */
   .manager-row {
     padding: 0 12px 5px;
-    border-bottom: 1px solid var(--line);
-  }
-  /* The border moves to the manager row, so no rule is drawn between a skill and
-     its own path. Gated on the same condition that renders that row, so the two
-     cannot disagree. */
-  .row.has-manager {
-    border-bottom: none;
   }
   .manager {
     display: block;
@@ -1506,6 +1577,79 @@
     font-variant-numeric: tabular-nums;
     font-feature-settings: "tnum";
     white-space: nowrap;
+  }
+
+  /* The trailing controls cell: the hover-revealed remove affordance and, at the
+     row's edge, the persistent disclosure caret (ADR 0033). */
+  .col.controls {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 3px;
+  }
+  /* The disclosure caret. A visual indicator only (the row is the control), but
+     persistent — unlike the remove button — so every row advertises that it
+     expands and shows its open/closed state at rest. */
+  .caret {
+    flex: none;
+    width: 14px;
+    font-size: 10px;
+    line-height: 1;
+    text-align: center;
+    color: var(--faint);
+    transition: color var(--dur-fast) var(--ease-calm);
+  }
+  .skill-group:hover .caret {
+    color: var(--muted);
+  }
+
+  /* The footprint breakdown (ADR 0033): the three layers named in full, disclosed
+     under the row. Roomy — name space no longer competes — so labels sit left and
+     the tabular figures right. */
+  .breakdown {
+    padding: 0 12px;
+  }
+  .bd {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 1px 0 6px;
+  }
+  .bd-line {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 11px;
+    line-height: 1.45;
+  }
+  .bd-label {
+    color: var(--muted);
+    font-weight: 500;
+  }
+  .bd-gloss {
+    color: var(--faint);
+    font-weight: 400;
+  }
+  .bd-value {
+    flex: none;
+    color: var(--fg);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+    white-space: nowrap;
+  }
+  .bd-value.estimate {
+    color: var(--estimate-fg);
+  }
+  .bd-value.pending {
+    color: var(--faint);
+  }
+  .bd-value.reconstructed {
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+  }
+  .bd-value.not-listed {
+    color: var(--faint);
   }
 
   /* Sortable column headers: the whole header cell is a button (DESIGN.md UX #2). */
@@ -1540,6 +1684,12 @@
   .ind {
     font-size: 9px;
     color: var(--accent);
+  }
+  /* The always-on sort control carries no label (ADR 0033), so its inactive state
+     shows a neutral up-down glyph rather than vanishing — the control stays
+     visible even when the list is sorted by name. */
+  .ind.neutral {
+    color: var(--faint);
   }
 
   .badge {
@@ -1818,10 +1968,12 @@
      figures are what the panel is for. Focus reveals it too, so it is reachable
      by keyboard without a mouse ever being involved. */
   .row-btn {
+    flex: none;
     border: none;
     background: none;
     padding: 0;
-    width: 100%;
+    width: 18px;
+    text-align: center;
     color: var(--faint);
     opacity: 0;
     line-height: 1;

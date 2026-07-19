@@ -6,7 +6,7 @@ Read the context relevant to what you are working on.
 ## Contexts
 
 - [Domain](./src-tauri/CONTEXT.md) — skills, plugins, footprint, attributed usage, and the mutations skillmon performs. Owns the harness-adapter trait and, for now, the Claude Code adapter's vocabulary.
-- UI (`./src/CONTEXT.md`, planned) — the tray panel's presentation language (rows, columns, sort/group, badges, toasts, onboarding). Created lazily when panel-specific terms crystallize.
+- [UI](./src/CONTEXT.md) — the tray panel's presentation language (rows, the footprint breakdown, disclosure state, sort/group, badges, toasts, onboarding). Seeded when the per-row disclosure crystallized its first terms (ADR 0033); grows a term at a time.
 
 ## Relationships
 

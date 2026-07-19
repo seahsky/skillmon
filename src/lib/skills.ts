@@ -192,6 +192,21 @@ export function skillKey(skill: SkillReport): string {
 }
 
 /**
+ * Toggle a key's membership in a set, returning a NEW set — the input is never
+ * mutated (a pure function must not touch its argument, and Svelte tracks the
+ * reassignment rather than an in-place edit). Backs both of the panel's
+ * disclosures with one multi-open semantics: the per-repo project sections
+ * (`expandedRepos`) and the per-row footprint breakdown (`expandedSkills`, ADR
+ * 0033). Keys are `repoPath` for repos and `skillKey(skill)` for rows.
+ */
+export function toggleInSet(set: ReadonlySet<string>, key: string): Set<string> {
+  const next = new Set(set);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  return next;
+}
+
+/**
  * The hover text for a row's name. A skill whose frontmatter `name:` diverges
  * from its directory name is known to the user by either, so both are shown
  * rather than the panel silently picking one (CONTEXT.md "Declared name"). The
@@ -438,6 +453,31 @@ export function layerDisplay(layer: LayerReport): string {
  */
 export function onDemandDisplay(layer: LayerReport | null): string {
   return layer === null ? "…" : layerDisplay(layer);
+}
+
+/** The always-on layer's rendered state, in one place so the collapsed row cell
+ * and the breakdown line (ADR 0033) cannot drift. A not-listed skill shows a
+ * certain `0` with none of the exact/estimate framing — the cost is known to be
+ * nothing, not an imprecise count (issue #24); otherwise the figure renders like
+ * any layer, carrying whether it is an estimate (`~`, ADR 0003) and whether its
+ * always-on text was reconstructed from frontmatter rather than read from a
+ * transcript (ADR 0016). */
+export interface AlwaysOnDisplay {
+  text: string;
+  estimate: boolean;
+  reconstructed: boolean;
+  notListed: boolean;
+}
+export function alwaysOnDisplay(skill: SkillReport): AlwaysOnDisplay {
+  if (skill.alwaysOnText === "notListed") {
+    return { text: "0", estimate: false, reconstructed: false, notListed: true };
+  }
+  return {
+    text: layerDisplay(skill.alwaysOn),
+    estimate: !skill.alwaysOn.exact,
+    reconstructed: skill.alwaysOnText === "reconstructed",
+    notListed: false,
+  };
 }
 
 /**
